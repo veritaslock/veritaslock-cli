@@ -31,3 +31,6 @@ packages = ["src/vl"]
 strict = true
 python_version = "3.11"
 files = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

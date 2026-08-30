@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import typer
 
-from vl.commands import events, user
+from vl.commands import env, events, user
 
 app = typer.Typer(
     name="vl",
@@ -17,11 +17,12 @@ app = typer.Typer(
 )
 
 # Noun groups that are implemented today.
+app.add_typer(env.app, name="env")
 app.add_typer(user.app, name="user")
 app.add_typer(events.app, name="events")
 
 # Noun groups not yet built — uncomment and add the module under
-# vl/commands/ as each is implemented. The mount pattern matches the two above.
+# vl/commands/ as each is implemented. The mount pattern matches the ones above.
 # from vl.commands import svc_account
 # app.add_typer(svc_account.app, name="svc-account")
 # from vl.commands import org

@@ -36,6 +36,25 @@ Configuration is read from the environment (see `vl/lib/config.py`):
 | `VL_KAFKA_BOOTSTRAP` | Kafka bootstrap servers for `vl events`   | `localhost:9092`         |
 | `VL_OUTPUT`          | Output format: `table` or `json`          | `table`                  |
 
+## Local store
+
+`vl` keeps environment definitions (and, in later phases, credentials) in a
+local SQLite store at `~/.config/vl/store.db` (override with `VL_STORE_PATH`).
+It is created on first use with a `local` environment already seeded, so
+`vl env` works with zero setup.
+
+```bash
+vl env list                       # local is there by default
+vl env add dev --idp-url http://idp:8080 --cp-url http://cp:8082 --di-url http://di:8083
+vl env use dev                    # make dev the default
+vl env update dev --cp-url http://cp:9082
+vl env show dev
+vl env delete dev                 # refused while dev is the default
+```
+
+Environment resolution for other commands, most to least specific: `--env <name>`
+on the command, then the store's default environment (`vl env use`).
+
 ## Usage
 
 ```bash
@@ -59,9 +78,11 @@ vl events send --file ./payload.json --org acme --count 5
 src/vl/
 ├── app.py            root Typer app; mounts noun sub-apps
 ├── commands/         one module per noun group
+│   ├── env.py        vl env add | list | show | use | update | delete
 │   ├── user.py       vl user add | show
 │   └── events.py     vl events send
 └── lib/              shared helpers used across commands
-    ├── config.py     env/cluster config loading
+    ├── config.py     env-var config loading (legacy fallback)
+    ├── store.py      local SQLite store (environments; credentials later)
     └── output.py     table/json output rendering
 ```
