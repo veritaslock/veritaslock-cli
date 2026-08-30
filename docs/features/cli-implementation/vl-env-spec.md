@@ -1,7 +1,7 @@
-# veritaslock-cli (`vl`) — Phase 1a: `vl env`
+# veritaslock-cli (`vl`) — Phase 1: `vl env`
 
 **Status:** Draft for implementation
-**Part of:** the larger `vl-cli-phase1-crud-spec.md` effort, broken out as its own standalone document so it can be implemented and tested in isolation. `vl env` is the foundation everything else in Phase 1 depends on.
+**Part of:** the larger `vl-cli-phase1-crud-spec.md` effort, broken out as its own standalone document so it can be implemented and tested in isolation. `vl env` is the foundation everything else depends on.
 **Builds on:** the existing `veritaslock-cli` scaffold (Typer/Rich, `src/vl/` layout, noun-verb commands, `vl.lib.config`).
 
 ---
