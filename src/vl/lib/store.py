@@ -1,9 +1,16 @@
 """Local SQLite store for `vl`.
 
-Phase 1 covers only the ``environment`` table and its helpers. Later phases add
-``identity``, ``token_cache``, etc. to the same ``store.db``; each bumps
-``SCHEMA_VERSION`` (§8 of the ``vl env`` spec) so a code/schema mismatch is caught
-explicitly at store-open time rather than failing confusingly later.
+Schema grows one phase at a time, each adding a forward migration to ``_MIGRATIONS``
+and bumping ``SCHEMA_VERSION`` (§8 of the ``vl env`` spec):
+
+* v1 — ``environment`` table + ``vl env`` (Phase 1).
+* v2 — ``organization`` cache table + ``vl org`` (Phase 2).
+* v3 — ``identity`` / ``user_credential`` / ``org_membership`` / ``token_cache``
+  + ``vl identity`` and ``vl user`` (Phase 3).
+
+On open, every migration between the store's ``PRAGMA user_version`` and
+``SCHEMA_VERSION`` is applied in order; a store from a *newer* `vl` is rejected
+rather than used against a schema this code doesn't understand.
 
 Everything here is local-only: no network calls, no authentication.
 """
@@ -15,12 +22,89 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Literal
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
+
+# Treat a cached token as expired this many seconds before its real expiry, to
+# avoid handing a command a token that dies mid-request.
+_TOKEN_SKEW_SECONDS = 30
 
 DEFAULT_STORE_PATH = Path.home() / ".config" / "vl" / "store.db"
+
+# Forward migrations, one per schema version. _MIGRATIONS[i] takes the store from
+# version i to version i + 1; a fresh store (user_version 0) runs them all.
+_MIGRATIONS: tuple[str, ...] = (
+    # 0 -> 1: environment table (Phase 1).
+    """
+    CREATE TABLE IF NOT EXISTS environment (
+        name             TEXT PRIMARY KEY,
+        idp_base_url     TEXT NOT NULL,
+        cp_base_url      TEXT NOT NULL,
+        di_base_url      TEXT NOT NULL,
+        kafka_bootstrap  TEXT,
+        is_default       INTEGER NOT NULL DEFAULT 0
+                         CHECK (is_default IN (0, 1)),
+        created_at       TEXT NOT NULL
+    );
+    """,
+    # 1 -> 2: organization cache, scoped per environment (Phase 2).
+    """
+    CREATE TABLE IF NOT EXISTS organization (
+        environment_name  TEXT NOT NULL
+                          REFERENCES environment(name)
+                          ON UPDATE CASCADE ON DELETE RESTRICT,
+        name              TEXT NOT NULL,
+        server_org_id     TEXT NOT NULL,
+        display_name      TEXT NOT NULL,
+        active            INTEGER NOT NULL CHECK (active IN (0, 1)),
+        synced_at         TEXT NOT NULL,
+        PRIMARY KEY (environment_name, name)
+    );
+    """,
+    # 2 -> 3: identities, their USER credentials, org memberships, token cache (Phase 3).
+    """
+    CREATE TABLE IF NOT EXISTS identity (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        environment_name  TEXT NOT NULL
+                          REFERENCES environment(name)
+                          ON UPDATE CASCADE ON DELETE RESTRICT,
+        kind              TEXT NOT NULL CHECK (kind IN ('USER', 'SERVICE_ACCOUNT')),
+        server_id         TEXT NOT NULL,
+        principal_name    TEXT NOT NULL,
+        label             TEXT NOT NULL,
+        is_default        INTEGER NOT NULL DEFAULT 0 CHECK (is_default IN (0, 1)),
+        created_at        TEXT NOT NULL,
+        UNIQUE (environment_name, label)
+    );
+    CREATE TABLE IF NOT EXISTS user_credential (
+        identity_id         INTEGER PRIMARY KEY
+                            REFERENCES identity(id) ON DELETE CASCADE,
+        password_plaintext  TEXT
+    );
+    CREATE TABLE IF NOT EXISTS org_membership (
+        identity_id       INTEGER NOT NULL
+                          REFERENCES identity(id) ON DELETE CASCADE,
+        environment_name  TEXT NOT NULL,
+        org_name          TEXT NOT NULL,
+        role              TEXT NOT NULL,
+        synced_at         TEXT NOT NULL,
+        PRIMARY KEY (identity_id, environment_name, org_name),
+        FOREIGN KEY (environment_name, org_name)
+            REFERENCES organization(environment_name, name)
+            ON UPDATE CASCADE ON DELETE RESTRICT
+    );
+    CREATE TABLE IF NOT EXISTS token_cache (
+        identity_id  INTEGER PRIMARY KEY
+                     REFERENCES identity(id) ON DELETE CASCADE,
+        token        TEXT NOT NULL,
+        issued_at    TEXT NOT NULL,
+        expires_at   TEXT NOT NULL
+    );
+    """,
+)
 
 # Auto-seeded on first store-open so a fresh install works with zero setup (§4).
 _LOCAL_SEED = {
@@ -56,6 +140,22 @@ class SchemaVersionError(StoreError):
     """store.db was written by a newer (or otherwise incompatible) `vl`."""
 
 
+class OrganizationNotFoundError(StoreError):
+    """Named organization is not in the local cache."""
+
+
+class IdentityNotFoundError(StoreError):
+    """No stored identity with that label in the environment."""
+
+
+class IdentityExistsError(StoreError):
+    """An identity with that label already exists in the environment."""
+
+
+class NoResolvedIdentityError(StoreError):
+    """No ``--as`` / ``VL_IDENTITY`` / default identity to run an authed command as."""
+
+
 @dataclass(frozen=True)
 class Environment:
     """A resolved environment definition."""
@@ -67,6 +167,61 @@ class Environment:
     kafka_bootstrap: str | None
     is_default: bool
     created_at: str
+
+
+@dataclass(frozen=True)
+class Organization:
+    """A cached organization row (local mirror of the server's, not a source of truth)."""
+
+    environment_name: str
+    name: str
+    server_org_id: str
+    display_name: str
+    active: bool
+    synced_at: str
+
+
+@dataclass(frozen=True)
+class Identity:
+    """A stored identity `vl` can act as."""
+
+    id: int
+    environment_name: str
+    kind: str
+    server_id: str
+    principal_name: str
+    label: str
+    is_default: bool
+    created_at: str
+
+
+@dataclass(frozen=True)
+class UserCredential:
+    """USER-kind extension of an identity. ``password_plaintext`` None == tier 2 (§7)."""
+
+    identity_id: int
+    password_plaintext: str | None
+
+
+@dataclass(frozen=True)
+class OrgMembership:
+    """A cached org membership for a stored identity."""
+
+    identity_id: int
+    environment_name: str
+    org_name: str
+    role: str
+    synced_at: str
+
+
+@dataclass(frozen=True)
+class Token:
+    """A cached, still-valid JWT for a stored identity."""
+
+    identity_id: int
+    token: str
+    issued_at: str
+    expires_at: str
 
 
 # --------------------------------------------------------------------------- #
@@ -108,31 +263,17 @@ def _store() -> Iterator[sqlite3.Connection]:
 def _init_schema(conn: sqlite3.Connection) -> None:
     version = int(conn.execute("PRAGMA user_version").fetchone()[0])
 
-    if version == 0:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS environment (
-                name             TEXT PRIMARY KEY,
-                idp_base_url     TEXT NOT NULL,
-                cp_base_url      TEXT NOT NULL,
-                di_base_url      TEXT NOT NULL,
-                kafka_bootstrap  TEXT,
-                is_default       INTEGER NOT NULL DEFAULT 0
-                                 CHECK (is_default IN (0, 1)),
-                created_at       TEXT NOT NULL
-            );
-            """
-        )
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        conn.commit()
-        version = SCHEMA_VERSION
-
-    if version != SCHEMA_VERSION:
+    if version > SCHEMA_VERSION:
         raise SchemaVersionError(
-            f"store.db is at schema version {version}, but this `vl` supports "
-            f"version {SCHEMA_VERSION}. Upgrade `vl`, or point VL_STORE_PATH at a "
-            f"different store."
+            f"store.db is at schema version {version}, but this `vl` only "
+            f"supports up to version {SCHEMA_VERSION}. Upgrade `vl`, or point "
+            f"VL_STORE_PATH at a different store."
         )
+
+    for current in range(version, SCHEMA_VERSION):
+        conn.executescript(_MIGRATIONS[current])
+        conn.execute(f"PRAGMA user_version = {current + 1}")
+        conn.commit()
 
     _seed_local(conn)
 
@@ -331,3 +472,365 @@ def delete_environment(name: str) -> None:
                 f"Environment {name!r} still has resources referencing it. Remove "
                 f"those first, then delete the environment."
             ) from exc
+
+
+# --------------------------------------------------------------------------- #
+# Public API — organization cache (Phase 2)
+# --------------------------------------------------------------------------- #
+
+
+def _row_to_org(row: sqlite3.Row) -> Organization:
+    return Organization(
+        environment_name=row["environment_name"],
+        name=row["name"],
+        server_org_id=row["server_org_id"],
+        display_name=row["display_name"],
+        active=bool(row["active"]),
+        synced_at=row["synced_at"],
+    )
+
+
+def upsert_organization(
+    environment_name: str,
+    name: str,
+    server_org_id: str,
+    display_name: str,
+    active: bool,
+) -> Organization:
+    """Insert or refresh a cached organization row, stamping ``synced_at``.
+
+    The cache is a local mirror, never a source of truth — callers upsert it as a
+    side effect of a successful `vl org` call against the server.
+    """
+    with _store() as conn:
+        conn.execute(
+            """
+            INSERT INTO organization (environment_name, name, server_org_id,
+                                      display_name, active, synced_at)
+            VALUES (:environment_name, :name, :server_org_id, :display_name,
+                    :active, :synced_at)
+            ON CONFLICT (environment_name, name) DO UPDATE SET
+                server_org_id = excluded.server_org_id,
+                display_name  = excluded.display_name,
+                active        = excluded.active,
+                synced_at     = excluded.synced_at
+            """,
+            {
+                "environment_name": environment_name,
+                "name": name,
+                "server_org_id": server_org_id,
+                "display_name": display_name,
+                "active": 1 if active else 0,
+                "synced_at": _now(),
+            },
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM organization WHERE environment_name = ? AND name = ?",
+            (environment_name, name),
+        ).fetchone()
+        assert row is not None  # just upserted
+        return _row_to_org(row)
+
+
+def get_organization(environment_name: str, name: str) -> Organization:
+    """A cached organization, or ``OrganizationNotFoundError``."""
+    with _store() as conn:
+        row = conn.execute(
+            "SELECT * FROM organization WHERE environment_name = ? AND name = ?",
+            (environment_name, name),
+        ).fetchone()
+        if row is None:
+            raise OrganizationNotFoundError(
+                f"No cached organization {name!r} in environment "
+                f"{environment_name!r}. Run `vl org show {name}` first."
+            )
+        return _row_to_org(row)
+
+
+def list_organizations(environment_name: str) -> list[Organization]:
+    """All cached organizations for an environment, ordered by name."""
+    with _store() as conn:
+        rows = conn.execute(
+            "SELECT * FROM organization WHERE environment_name = ? ORDER BY name",
+            (environment_name,),
+        ).fetchall()
+        return [_row_to_org(row) for row in rows]
+
+
+# --------------------------------------------------------------------------- #
+# Public API — identities, credentials, memberships, token cache (Phase 3)
+# --------------------------------------------------------------------------- #
+
+IdentityKind = Literal["USER", "SERVICE_ACCOUNT"]
+
+
+def _row_to_identity(row: sqlite3.Row) -> Identity:
+    return Identity(
+        id=row["id"],
+        environment_name=row["environment_name"],
+        kind=row["kind"],
+        server_id=row["server_id"],
+        principal_name=row["principal_name"],
+        label=row["label"],
+        is_default=bool(row["is_default"]),
+        created_at=row["created_at"],
+    )
+
+
+def _identity_row(
+    conn: sqlite3.Connection, environment: str, label: str
+) -> sqlite3.Row | None:
+    row: sqlite3.Row | None = conn.execute(
+        "SELECT * FROM identity WHERE environment_name = ? AND label = ?",
+        (environment, label),
+    ).fetchone()
+    return row
+
+
+def add_identity(
+    environment: str,
+    kind: IdentityKind,
+    server_id: str,
+    principal_name: str,
+    label: str,
+) -> Identity:
+    """Create an identity row. Does not make it the environment's default."""
+    with _store() as conn:
+        if _identity_row(conn, environment, label) is not None:
+            raise IdentityExistsError(
+                f"Identity {label!r} already exists in environment "
+                f"{environment!r}. Pick another --label."
+            )
+        cursor = conn.execute(
+            """
+            INSERT INTO identity (environment_name, kind, server_id,
+                                  principal_name, label, is_default, created_at)
+            VALUES (?, ?, ?, ?, ?, 0, ?)
+            """,
+            (environment, kind, server_id, principal_name, label, _now()),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM identity WHERE id = ?", (cursor.lastrowid,)
+        ).fetchone()
+        assert row is not None  # just inserted
+        return _row_to_identity(row)
+
+
+def get_identity(environment: str, label: str) -> Identity:
+    """A stored identity by label, or ``IdentityNotFoundError``."""
+    with _store() as conn:
+        row = _identity_row(conn, environment, label)
+        if row is None:
+            raise IdentityNotFoundError(
+                f"No identity {label!r} in environment {environment!r}. Run "
+                f"`vl identity list` to see what's stored."
+            )
+        return _row_to_identity(row)
+
+
+def get_identity_by_server_id(
+    environment: str, server_id: str, kind: IdentityKind
+) -> Identity | None:
+    """A stored identity by its server-assigned id, or ``None``."""
+    with _store() as conn:
+        row = conn.execute(
+            "SELECT * FROM identity "
+            "WHERE environment_name = ? AND server_id = ? AND kind = ?",
+            (environment, server_id, kind),
+        ).fetchone()
+        return _row_to_identity(row) if row is not None else None
+
+
+def get_identity_by_principal(
+    environment: str, principal_name: str, kind: IdentityKind
+) -> Identity | None:
+    """A stored identity by principal (username / client id), or ``None``.
+
+    Used by ``vl identity login`` to reuse an existing row regardless of label.
+    """
+    with _store() as conn:
+        row = conn.execute(
+            "SELECT * FROM identity "
+            "WHERE environment_name = ? AND principal_name = ? AND kind = ?",
+            (environment, principal_name, kind),
+        ).fetchone()
+        return _row_to_identity(row) if row is not None else None
+
+
+def list_identities(
+    environment: str, kind: IdentityKind | None = None
+) -> list[Identity]:
+    """Stored identities for an environment, ordered by label."""
+    with _store() as conn:
+        if kind is None:
+            rows = conn.execute(
+                "SELECT * FROM identity WHERE environment_name = ? ORDER BY label",
+                (environment,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM identity "
+                "WHERE environment_name = ? AND kind = ? ORDER BY label",
+                (environment, kind),
+            ).fetchall()
+        return [_row_to_identity(row) for row in rows]
+
+
+def delete_identity(environment: str, label: str) -> None:
+    """Delete an identity (cascades to credential, memberships, cached token)."""
+    with _store() as conn:
+        row = _identity_row(conn, environment, label)
+        if row is None:
+            raise IdentityNotFoundError(
+                f"No identity {label!r} in environment {environment!r}."
+            )
+        conn.execute("DELETE FROM identity WHERE id = ?", (row["id"],))
+        conn.commit()
+
+
+def set_default_identity(environment: str, label: str) -> None:
+    """Make ``label`` the sole default identity for its environment."""
+    with _store() as conn:
+        if _identity_row(conn, environment, label) is None:
+            raise IdentityNotFoundError(
+                f"No identity {label!r} in environment {environment!r}."
+            )
+        conn.execute(
+            "UPDATE identity SET is_default = CASE WHEN label = :label THEN 1 ELSE 0 END "
+            "WHERE environment_name = :env",
+            {"label": label, "env": environment},
+        )
+        conn.commit()
+
+
+def resolve_identity(environment: str, explicit_label: str | None) -> Identity:
+    """Resolve the identity a command runs as (§8.3): ``--as`` > ``VL_IDENTITY`` > default."""
+    label = explicit_label or os.environ.get("VL_IDENTITY") or None
+    with _store() as conn:
+        if label is not None:
+            row = _identity_row(conn, environment, label)
+            if row is None:
+                source = "--as" if explicit_label else "VL_IDENTITY"
+                raise IdentityNotFoundError(
+                    f"No identity {label!r} in environment {environment!r} "
+                    f"(from {source}). Run `vl identity list`."
+                )
+            return _row_to_identity(row)
+
+        row = conn.execute(
+            "SELECT * FROM identity WHERE environment_name = ? AND is_default = 1",
+            (environment,),
+        ).fetchone()
+        if row is None:
+            raise NoResolvedIdentityError(
+                f"No identity selected for environment {environment!r}. Pass "
+                f"`--as <label>`, set VL_IDENTITY, or run `vl identity use <label>`."
+            )
+        return _row_to_identity(row)
+
+
+def set_user_credential(identity_id: int, password_plaintext: str | None) -> None:
+    """Set (or clear) the stored password for a USER identity. ``None`` == tier 2."""
+    with _store() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_credential (identity_id, password_plaintext)
+            VALUES (?, ?)
+            ON CONFLICT (identity_id) DO UPDATE SET
+                password_plaintext = excluded.password_plaintext
+            """,
+            (identity_id, password_plaintext),
+        )
+        conn.commit()
+
+
+def get_user_credential(identity_id: int) -> UserCredential | None:
+    with _store() as conn:
+        row = conn.execute(
+            "SELECT * FROM user_credential WHERE identity_id = ?", (identity_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return UserCredential(row["identity_id"], row["password_plaintext"])
+
+
+def upsert_org_membership(
+    identity_id: int, environment: str, org_name: str, role: str
+) -> None:
+    """Insert or refresh a cached org membership, stamping ``synced_at``."""
+    with _store() as conn:
+        conn.execute(
+            """
+            INSERT INTO org_membership (identity_id, environment_name, org_name,
+                                        role, synced_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (identity_id, environment_name, org_name) DO UPDATE SET
+                role = excluded.role,
+                synced_at = excluded.synced_at
+            """,
+            (identity_id, environment, org_name, role, _now()),
+        )
+        conn.commit()
+
+
+def list_org_memberships(identity_id: int) -> list[OrgMembership]:
+    with _store() as conn:
+        rows = conn.execute(
+            "SELECT * FROM org_membership WHERE identity_id = ? ORDER BY org_name",
+            (identity_id,),
+        ).fetchall()
+        return [
+            OrgMembership(
+                identity_id=row["identity_id"],
+                environment_name=row["environment_name"],
+                org_name=row["org_name"],
+                role=row["role"],
+                synced_at=row["synced_at"],
+            )
+            for row in rows
+        ]
+
+
+def get_cached_token(identity_id: int) -> Token | None:
+    """A cached token for the identity — ``None`` if absent or (near) expired."""
+    with _store() as conn:
+        row = conn.execute(
+            "SELECT * FROM token_cache WHERE identity_id = ?", (identity_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    expires_at = datetime.fromisoformat(row["expires_at"])
+    if expires_at <= datetime.now(timezone.utc) + timedelta(
+        seconds=_TOKEN_SKEW_SECONDS
+    ):
+        return None
+    return Token(row["identity_id"], row["token"], row["issued_at"], row["expires_at"])
+
+
+def set_cached_token(
+    identity_id: int, token: str, issued_at: datetime, expires_at: datetime
+) -> None:
+    with _store() as conn:
+        conn.execute(
+            """
+            INSERT INTO token_cache (identity_id, token, issued_at, expires_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (identity_id) DO UPDATE SET
+                token = excluded.token,
+                issued_at = excluded.issued_at,
+                expires_at = excluded.expires_at
+            """,
+            (identity_id, token, issued_at.isoformat(), expires_at.isoformat()),
+        )
+        conn.commit()
+
+
+def clear_cached_token(identity_id: int) -> None:
+    """Drop any cached token — used after a mid-command ``401`` (§7 step 4)."""
+    with _store() as conn:
+        conn.execute(
+            "DELETE FROM token_cache WHERE identity_id = ?", (identity_id,)
+        )
+        conn.commit()

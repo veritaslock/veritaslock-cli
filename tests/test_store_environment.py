@@ -222,24 +222,11 @@ def test_delete_nonexistent_raises(isolated_store: Path) -> None:
 def test_delete_referenced_environment_raises_typed_error(
     isolated_store: Path,
 ) -> None:
-    """The store's contract: a FK restriction surfaces as EnvironmentInUseError,
-    never a raw sqlite3.IntegrityError. Simulated here with a stand-in child
-    table until a real referencing table lands in the `vl identity` phase.
+    """A FK restriction (here: a cached organization row) surfaces as
+    EnvironmentInUseError, never a raw sqlite3.IntegrityError.
     """
     store.add_environment("dev", "http://i", "http://c", "http://d")
-    with _open_raw(isolated_store) as conn:
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute(
-            """
-            CREATE TABLE _ref (
-                id INTEGER PRIMARY KEY,
-                environment_name TEXT REFERENCES environment(name)
-                    ON UPDATE CASCADE ON DELETE RESTRICT
-            )
-            """
-        )
-        conn.execute("INSERT INTO _ref (environment_name) VALUES ('dev')")
-        conn.commit()
+    store.upsert_organization("dev", "globo", "org-1", "Globo", active=True)
 
     with pytest.raises(store.EnvironmentInUseError):
         store.delete_environment("dev")

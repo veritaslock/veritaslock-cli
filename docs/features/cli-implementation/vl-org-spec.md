@@ -1,0 +1,122 @@
+# veritaslock-cli (`vl`) — Phase 2: `vl org`
+
+**Status:** Draft for implementation
+**Part of:** the larger `vl-cli-phase1-crud-spec.md` effort, broken out as its own standalone document. Depends only on `vl-env-spec.md` (Phase 1) — deliberately sequenced before the identity/user document (Phase 3), which depends on this one for its `org_membership` join table; see §5 for how write commands authenticate without needing Phase 3's identity store.
+**Builds on:** the `environment` table and `vl env` commands from Phase 1; the live organization endpoints on the IdP (`getById`, `getByName`, `create`, `addMember`, `patch`, `patchByName`), plus three new endpoints specced separately for a server-side session in `idp-org-membership-endpoints-spec.md`: list all orgs, list an org's members, and remove an org member.
+**Supersedes:** the `vl org` section of `vl-cli-phase1-crud-spec.md` (§8 in that document) — this is the authoritative version going forward.
+
+---
+
+## 1. Scope
+
+This document covers:
+- A standalone local `organization` cache table (per-environment, no local secrets — orgs have nothing to keep confidential).
+- The `vl org` command group: `add`, `show`, `list`, `update`, `members add`, `members list`, `members remove`. No `delete` (destructive, cascading, deliberately out of scope).
+
+**Deferred to the `vl identity`/`vl user` document (Phase 3):** the `org_membership` join table (mirroring the IdP's own `organization` + `user_org_role` split), which will FK against both this document's `organization` table and that document's `identity` table. That document also retrofits `members add` (below) to write into it once it exists, so `members add`'s implementation should expect a small follow-up change when Phase 3 lands — see that document's §9.6.
+
+**Deferred generally:** `vl org delete`, and upgrading write commands to accept `--as <label>` once a local identity store exists (§5).
+
+---
+
+## 2. Storage
+
+Same `store.db` as Phase 1. This document adds one table.
+
+## 3. Schema: `organization`
+
+| Field | Type | Notes |
+|---|---|---|
+| environment_name | text | `REFERENCES environment(name) ON UPDATE CASCADE ON DELETE RESTRICT` |
+| name | text | canonical lowercase name, matches the server's `organization.name` |
+| server_org_id | text | the id IdP assigned |
+| display_name | text | |
+| active | integer | 0/1 |
+| synced_at | text | ISO8601 — updated every time this row is touched by a successful `vl org` call |
+
+`PRIMARY KEY (environment_name, name)`. Scoped per environment rather than globally, because `local` and `dev` (and later `test`/`stage`/`prod`/`demo`) are separate IdP instances — an org named `globo` in two different environments is two different orgs with two different `server_org_id` values, even though the name happens to match.
+
+This is a **local cache, not a source of truth** — same principle as everywhere else in this store. It's populated/refreshed as a side effect of `vl org` commands touching the server, not maintained independently. There is no dedicated `vl org sync` command in this phase; every `add`/`show`/`list`/`update` upserts the relevant row(s) with fresh data and a new `synced_at`, so the cache is "as current as your last command" without extra ceremony.
+
+---
+
+## 4. Commands
+
+### 4.1 `vl org add <name> --display-name <text> --auth-user <username> [--auth-password <password>] [--initial-admin <server-user-id>] [--env <env>]`
+1. If `--auth-password` omitted, prompt interactively (hidden input).
+2. `POST /auth/user/login` with the given credentials to obtain a token, scoped to this single call — not cached (§5).
+3. `POST /v1/organizations` with `{id: <generated uuid>, name, displayName, initialAdminUserId: <optional>}`. Whether `vl` must derive `name` from `display-name` client-side or the server already does it remains open (§6.1, carried over from the master spec).
+4. On success, upsert the local `organization` row.
+
+`--initial-admin`, if supplied, must reference a user that **already exists** — the server grants that user `ORG_ADMIN` and `owner` at creation instead of the caller. This only works for an existing user; it cannot be used to bootstrap a brand-new dedicated admin in the same call, since a user can't be created referencing an org that doesn't exist yet. For that case (the common one — a new org getting its own dedicated admin, e.g. `anchorpoint` + `anchorpoint_admin`), see §4.8, the bootstrap sequence.
+
+If `--initial-admin` is omitted and the authenticating user holds `PLATFORM_ADMIN`, the new org is created with `owner` pointing at that `PLATFORM_ADMIN` and **zero real `ORG_ADMIN` rows** — a deliberate, short-lived state, not an error, meant to be closed immediately via §4.8.
+
+### 4.2 `vl org show <name> [--env <env>]`
+Unauthenticated — `GET /v1/organizations?name=`. The `SecurityConfig` gap that previously blocked this (`idp-org-membership-endpoints-spec.md` §5a) has been fixed and confirmed landed. Upserts the local cache row on success, then displays.
+
+### 4.3 `vl org list [--active <bool>] [--env <env>]`
+`GET /v1/organizations?active=&page=&limit=&sortBy=&sortOrder=`, matching the `User`/`ServiceAccount` controllers' pagination convention (page-number `nextCursor`). Upserts the local cache for every row returned. Unauthenticated, same as `show` — the endpoint and its `SecurityConfig` carve-out are both confirmed live.
+
+### 4.4 `vl org update <name> [--active <bool>] [--owner <server-user-id>] --auth-user <username> [--auth-password <password>] [--env <env>]`
+Same one-off auth flow as `add`. `PATCH /v1/organizations?name=` (or `/{orgId}` if resolving id first is simpler). Upserts the local cache row on success.
+
+`--owner` is subject to server-side preconditions, not pre-checked by `vl` (per the governing principle — §2 of the master spec): the target must already hold `ORG_ADMIN` on this org, **and** must have both `email` and `phoneNumber` set on their user record. `vl` doesn't validate any of this locally — it sends the request and surfaces whatever the server rejects it with (e.g. a clear error if the target lacks a phone number). This is the final step of the bootstrap sequence in §4.8.
+
+### 4.5 `vl org members add <org> --user-id <server-user-id> --role <ORG_ADMIN|USER|PLATFORM_ADMIN> --auth-user <username> [--auth-password <password>] [--env <env>]`
+Same one-off auth flow. `POST /v1/organizations/{orgId}/members`.
+
+`--user-id` takes a raw server-side user id, not a local store label — this document has no local identity store to resolve a label against yet (§1). Once `vl identity`/`vl user` land, this command should be revisited to additionally accept `--user <label>` as a convenience, resolved locally and translated to the underlying server id — that upgrade is out of scope here.
+
+`vl` does not pre-validate whether `--role PLATFORM_ADMIN` makes sense for the target org (per the governing principle — §2 of the master spec) — the server enforces that `PLATFORM_ADMIN` may only be granted within VeritasLock's own org and rejects it otherwise; `vl` just sends the request and surfaces whatever the server returns.
+
+### 4.6 `vl org members list <org> --auth-user <username> [--auth-password <password>] [--env <env>]` *(new endpoint — see `idp-org-membership-endpoints-spec.md`)*
+`GET /v1/organizations/{orgId}/members` → renders `orgId, userId, role, addedAt` per row. Requires auth server-side (org member or `PLATFORM_ADMIN`) per that spec's §3 — same one-off auth flow as the other write commands here, even though this one is technically a read, since the endpoint isn't public.
+
+### 4.7 `vl org members remove <org> --user-id <server-user-id> --auth-user <username> [--auth-password <password>] [--env <env>]` *(new endpoint — see `idp-org-membership-endpoints-spec.md`)*
+`DELETE /v1/organizations/{orgId}/members/{userId}`. The server enforces (per that spec's §4) that this fails with `409` if it would leave the target user with zero org memberships — `vl` does not pre-check this locally, it just surfaces the server's response.
+
+*No `vl org delete`.*
+
+### 4.8 Bootstrapping a new organization with a dedicated admin
+
+The common real-world case — standing up a brand-new org (e.g. `anchorpoint`) with its own dedicated admin account (e.g. `anchorpoint_admin`), rather than one that already exists as a user — can't be done in a single `vl org add` call (§4.1's `--initial-admin` requires an existing user, and a user can't be created referencing an org that doesn't exist yet). It's a three-command sequence instead:
+
+```
+# 1. Create the org, authenticating as a PLATFORM_ADMIN (e.g. admin).
+#    owner temporarily points at admin; zero real ORG_ADMIN rows on the new org — expected, closed by steps 2-3.
+vl org add anchorpoint --display-name "AnchorPoint" --auth-user admin
+
+# 2. Create the dedicated admin, granting ORG_ADMIN on the org just created.
+#    Use the admin's real name/email/phone -- these aren't placeholders. A phone number is
+#    required before this account can become owner in step 3 (see §4.4, idp-org-admin-safety-spec.md §2.7).
+vl user add <First> <Last> --org anchorpoint --role ORG_ADMIN --phone <number> --auth-user admin
+
+# 3. Hand ownership to the new admin, correcting the temporary state from step 1.
+vl org update anchorpoint --owner <new user's server id> --auth-user admin
+```
+
+Step 2's `--phone` flag depends on `vl-identity-user-spec.md`'s `vl user add`/`vl user update` being extended to accept it — noted as a required follow-up there (see that document's phone-number addendum), not yet built as of this document.
+
+This mirrors exactly how V20 (the seed-data migration) handles the pre-existing `globo`/`globo_admin` pair — two independently-created records, deliberately stitched together — just performed through the live API instead of a migration, for any org created going forward.
+
+---
+
+## 5. Authentication for write commands (no identity-store dependency)
+
+`vl org add`, `update`, `members add`, `members list`, and `members remove` all require a genuine user-token caller server-side, but this document is deliberately sequenced before the identity/token-cache machinery exists. Rather than block on that dependency, these commands take credentials directly:
+
+- `--auth-user <username>` (required) and `--auth-password <password>` (prompted, hidden input, if omitted).
+- A single `POST /auth/user/login` call obtains a token used for that one request only. Nothing is cached to disk, and no `identity`/`user_credential` row is created — this is intentionally the same "re-authenticate every invocation" behavior the existing `create_user.sh`/`provision_service_account.sh` bash scripts already have, not a regression.
+
+This is explicitly an interim design, not a permanent one: once the identity document (Phase 3) lands, these same commands should gain a `--as <label>` option that resolves a stored/cached identity instead of requiring `--auth-user`/`--auth-password` every time. That upgrade is out of scope for this document — noted here so it isn't forgotten (§6.3).
+
+---
+
+## 6. Open Items
+
+1. **`vl org add` — client-side vs. server-side `name` derivation:** confirm whether IdP derives `name` from `displayName` server-side, or whether `vl` must replicate the strip/lowercase logic before sending `name` explicitly. (Carried over from the master spec, still unresolved.)
+2. ~~`vl org show`/`vl org list` blocked by `SecurityConfig` gap~~ — **Resolved:** fix confirmed landed. Both commands are unauthenticated and functional server-side.
+3. **`vl org members add`'s local-write behavior changes once Phase 3 lands:** as originally specced here, this command has no local write. Phase 3 (`vl-identity-user-spec.md` §9.6) retrofits it to also upsert `org_membership` when `--user-id` matches a locally known identity — that retrofit is now scoped and owned by the Phase 3 document, not left as an unowned future item.
+4. ~~`members list`/`members remove` depend on `idp-org-membership-endpoints-spec.md` landing first~~ — **Resolved:** confirmed implemented, committed, and pushed.
+5. ~~§4.8's bootstrap sequence and §4.1's `--initial-admin`/§4.4's `--owner` preconditions depend on `idp-org-admin-safety-spec.md` landing~~ — **Resolved:** confirmed implemented, committed, and pushed. `CreateOrganizationRequest.initialAdminUserId`, the `create` auto-grant/gap fix, `patch`'s phone/email precondition on `ownerId`, and the `phoneNumber` field are all live server-side.

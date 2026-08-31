@@ -55,20 +55,77 @@ vl env delete dev                 # refused while dev is the default
 Environment resolution for other commands, most to least specific: `--env <name>`
 on the command, then the store's default environment (`vl env use`).
 
-## Usage
+## Organizations
 
 ```bash
-vl --help
+vl org show globo                      # unauthenticated read; caches the result
+vl org list --active                   # unauthenticated read
+vl org add globo --display-name "Globo Corp" --auth-user alice
+vl org update globo --no-active --auth-user alice
+vl org members add globo --user-id <server-user-id> --role ORG_ADMIN --auth-user alice
+vl org members list globo --auth-user alice
+vl org members remove globo --user-id <server-user-id> --auth-user alice
 ```
 
+Write commands (and `members list`) authenticate with a one-off
+`POST /auth/user/login` — pass `--auth-user`, and `--auth-password` is prompted
+if omitted. Nothing is cached. `vl org` keeps a local per-environment cache of the
+orgs it has seen (`organization` table), refreshed on every successful call.
+
+Standing up a new org with its own dedicated admin is a three-step bootstrap
+(the admin account can't exist until the org does):
+
 ```bash
-# Create a user in an org (stubbed)
-vl user add alice --org acme
+vl org add anchorpoint --display-name "AnchorPoint" --auth-user admin
+vl user add Ana Reyes --org anchorpoint --role ORG_ADMIN --phone +15555550123 --auth-user admin
+vl org update anchorpoint --owner <new user's server id> --auth-user admin
+```
 
-# Show a user (stubbed)
-vl user show alice
+If the intended admin is an *existing* user, `vl org add … --initial-admin <user-id>`
+does it in one call instead.
 
-# Send events from a payload file (stubbed; will replace send_events.sh)
+## Identities
+
+`vl` stores the identities it authenticates as, per environment. Two tiers:
+
+- **tier 1** — password stored locally (`vl identity import`, `vl user add`); `vl`
+  re-authenticates silently as needed.
+- **tier 2** — password used once for a token, never written (`vl identity login`);
+  when the cached token expires `vl` re-prompts (and fails clearly if there's no TTY).
+
+```bash
+# Bootstrap: adopt a pre-existing server account into a reusable tier-1 identity
+vl identity import --username admin --org globo --role ORG_ADMIN --label root
+vl identity use root                 # make it the default for this environment
+
+vl identity login alice             # tier-2: authenticate as yourself, no stored password
+vl identity list
+vl identity show root --reveal-secret
+```
+
+Command identity resolution, most to least specific: `--as <label>`, then
+`VL_IDENTITY`, then the environment's default identity (`vl identity use`).
+
+## Users
+
+```bash
+vl user add John Doe --org globo --role USER      # generates + prints a password once
+vl user add Ana Reyes --org globo --role ORG_ADMIN --email ana@acme.com --phone +15555550123
+vl user show jdoe
+vl user list --status ACTIVE
+vl user update jdoe --display-name "John Doe" --phone +15555550123 --rotate-password
+vl user delete jdoe
+```
+
+Every `vl user` command authenticates as the resolved identity (which must be a
+`USER`). Passwords are bcrypt-hashed client-side — the server only ever sees the
+hash. `--email` defaults to a `first.last@example.com` placeholder; set a real one
+(and `--phone`) for any account that may later become an org's owner — the server
+requires both before `vl org update --owner` will accept it.
+
+## Events (stubbed)
+
+```bash
 vl events send --file ./payload.json --org acme --count 5
 ```
 
@@ -79,10 +136,16 @@ src/vl/
 ├── app.py            root Typer app; mounts noun sub-apps
 ├── commands/         one module per noun group
 │   ├── env.py        vl env add | list | show | use | update | delete
-│   ├── user.py       vl user add | show
+│   ├── identity.py   vl identity list | show | use | import | login
+│   ├── org.py        vl org add | show | list | update | members ...
+│   ├── user.py       vl user add | show | list | update | delete
 │   └── events.py     vl events send
 └── lib/              shared helpers used across commands
     ├── config.py     env-var config loading (legacy fallback)
-    ├── store.py      local SQLite store (environments; credentials later)
+    ├── store.py      local SQLite store (environments, orgs, identities, tokens)
+    ├── api.py        httpx client for the IdP API + problem+json errors
+    ├── auth.py       token acquisition / caching for authed commands
+    ├── passwords.py  client-side password generation + bcrypt hashing
+    ├── roles.py      shared role enums
     └── output.py     table/json output rendering
 ```
