@@ -15,25 +15,29 @@ runner = CliRunner()
 IDP = "http://localhost:8080"
 
 ORG_DTO = {"id": "org-1", "name": "globo", "displayName": "Globo", "active": True}
+SA_DTO = {"id": "sa-1", "displayName": "sys", "role": "SYSTEM", "status": "ACTIVE", "keyVersion": 3, "orgId": "org-1"}
 
 
 @respx.mock
-def test_import_validates_then_persists_tier1(monkeypatch) -> None:
+def test_import_user_populates_memberships_from_token(monkeypatch) -> None:
     monkeypatch.setattr("typer.prompt", lambda *a, **k: "pw")
-    respx.get(f"{IDP}/v1/organizations", params={"name": "globo"}).mock(
-        return_value=httpx.Response(200, json=ORG_DTO)
-    )
     login = respx.post(f"{IDP}/auth/user/login").mock(
-        return_value=httpx.Response(200, json={"accessToken": fake_jwt("u-7"), "expiresIn": 900})
+        return_value=httpx.Response(
+            200,
+            json={
+                "accessToken": fake_jwt(
+                    "u-7", orgs=[{"orgId": "org-1", "role": "ORG_ADMIN"}]
+                ),
+                "expiresIn": 900,
+            },
+        )
+    )
+    respx.get(f"{IDP}/v1/organizations/org-1").mock(
+        return_value=httpx.Response(200, json=ORG_DTO)
     )
 
     result = runner.invoke(
-        app,
-        [
-            "identity", "import",
-            "--username", "admin", "--org", "globo",
-            "--role", "ORG_ADMIN", "--label", "root",
-        ],
+        app, ["identity", "import", "--username", "admin", "--label", "root"]
     )
 
     assert result.exit_code == 0, result.stdout
@@ -41,27 +45,36 @@ def test_import_validates_then_persists_tier1(monkeypatch) -> None:
     ident = store.get_identity("local", "root")
     assert ident.server_id == "u-7"
     assert store.get_user_acct(ident.id).password_plaintext == "pw"
-    assert store.list_org_memberships(ident.id)[0].role == "ORG_ADMIN"
+    # org + role come from the JWT `orgs` claim, not a flag
+    membership = store.list_org_memberships(ident.id)[0]
+    assert (membership.org_name, membership.role) == ("globo", "ORG_ADMIN")
     assert store.get_organization("local", "globo").server_org_id == "org-1"
+
+
+@respx.mock
+def test_import_user_with_no_orgs_claim(monkeypatch) -> None:
+    monkeypatch.setattr("typer.prompt", lambda *a, **k: "pw")
+    respx.post(f"{IDP}/auth/user/login").mock(
+        return_value=httpx.Response(200, json={"accessToken": fake_jwt("u-7"), "expiresIn": 900})
+    )
+
+    result = runner.invoke(
+        app, ["identity", "import", "--username", "admin", "--label", "root"]
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert store.list_org_memberships(store.get_identity("local", "root").id) == []
 
 
 @respx.mock
 def test_import_bad_credentials_stores_nothing(monkeypatch) -> None:
     monkeypatch.setattr("typer.prompt", lambda *a, **k: "wrong")
-    respx.get(f"{IDP}/v1/organizations", params={"name": "globo"}).mock(
-        return_value=httpx.Response(200, json=ORG_DTO)
-    )
     respx.post(f"{IDP}/auth/user/login").mock(
         return_value=httpx.Response(401, json={"detail": "Bad credentials.", "errorCode": "UNAUTHORIZED"})
     )
 
     result = runner.invoke(
-        app,
-        [
-            "identity", "import",
-            "--username", "admin", "--org", "globo",
-            "--role", "USER", "--label", "root",
-        ],
+        app, ["identity", "import", "--username", "admin", "--label", "root"]
     )
 
     assert result.exit_code == 1
@@ -69,48 +82,58 @@ def test_import_bad_credentials_stores_nothing(monkeypatch) -> None:
     assert store.list_identities("local") == []
 
 
-SA_DTO = {"id": "sa-1", "displayName": "sys", "role": "SYSTEM", "status": "ACTIVE", "keyVersion": 3}
+@respx.mock
+def test_import_refuses_duplicate_account(monkeypatch) -> None:
+    monkeypatch.setattr("typer.prompt", lambda *a, **k: "pw")
+    store.ensure_local_environment_seeded()
+    store.add_identity("local", "USER", "u-7", "admin", "root")  # already imported
+    respx.post(f"{IDP}/auth/user/login").mock(
+        return_value=httpx.Response(200, json={"accessToken": fake_jwt("u-7"), "expiresIn": 900})
+    )
+
+    result = runner.invoke(
+        app, ["identity", "import", "--username", "admin", "--label", "globo_admin"]
+    )
+
+    assert result.exit_code == 1
+    assert "already imported as 'root'" in result.stdout
+    assert [i.label for i in store.list_identities("local")] == ["root"]
 
 
 @respx.mock
-def test_import_service_account_validates_then_persists() -> None:
-    respx.get(f"{IDP}/v1/organizations", params={"name": "globo"}).mock(
-        return_value=httpx.Response(200, json=ORG_DTO)
-    )
+def test_import_service_account_validates_and_resolves_org() -> None:
     token = respx.post(f"{IDP}/auth/service-account/token").mock(
         return_value=httpx.Response(200, json={"accessToken": "sa-jwt", "expiresIn": 900})
     )
     respx.get(f"{IDP}/v1/service-accounts/sa-1").mock(
         return_value=httpx.Response(200, json=SA_DTO)
     )
+    respx.get(f"{IDP}/v1/organizations/org-1").mock(
+        return_value=httpx.Response(200, json=ORG_DTO)
+    )
 
     result = runner.invoke(
         app,
         [
             "identity", "import", "--kind", "SERVICE_ACCOUNT",
-            "--client-id", "sa-1", "--secret", "shh",
-            "--role", "SYSTEM", "--org", "globo", "--label", "sys",
+            "--client-id", "sa-1", "--secret", "shh", "--label", "sys",
         ],
     )
 
     assert result.exit_code == 0, result.stdout
     assert token.called
     ident = store.get_identity("local", "sys")
-    assert ident.kind == "SERVICE_ACCOUNT"
-    assert ident.server_id == "sa-1"
+    assert ident.kind == "SERVICE_ACCOUNT" and ident.server_id == "sa-1"
     cred = store.get_svc_acct(ident.id)
     assert cred is not None
     assert cred.client_secret_plaintext == "shh"
-    assert cred.org_name == "globo"
-    assert cred.key_version == 3  # read from the server, not assumed 1
+    assert cred.org_name == "globo"  # resolved from sa_dto.orgId, not a flag
+    assert cred.key_version == 3
     assert store.list_org_memberships(ident.id) == []  # no org_membership for SA
 
 
 @respx.mock
 def test_import_service_account_bad_secret_stores_nothing() -> None:
-    respx.get(f"{IDP}/v1/organizations", params={"name": "globo"}).mock(
-        return_value=httpx.Response(200, json=ORG_DTO)
-    )
     respx.post(f"{IDP}/auth/service-account/token").mock(
         return_value=httpx.Response(401, json={"detail": "Bad secret.", "errorCode": "UNAUTHORIZED"})
     )
@@ -119,8 +142,7 @@ def test_import_service_account_bad_secret_stores_nothing() -> None:
         app,
         [
             "identity", "import", "--kind", "SERVICE_ACCOUNT",
-            "--client-id", "sa-1", "--secret", "wrong",
-            "--role", "SYSTEM", "--org", "globo", "--label", "sys",
+            "--client-id", "sa-1", "--secret", "wrong", "--label", "sys",
         ],
     )
 
@@ -131,27 +153,16 @@ def test_import_service_account_bad_secret_stores_nothing() -> None:
 
 def test_import_service_account_missing_flags_errors() -> None:
     result = runner.invoke(
-        app,
-        [
-            "identity", "import", "--kind", "SERVICE_ACCOUNT",
-            "--role", "SYSTEM", "--org", "globo", "--label", "sys",
-        ],
+        app, ["identity", "import", "--kind", "SERVICE_ACCOUNT", "--label", "sys"]
     )
     assert result.exit_code != 0
     assert "client-id" in result.output.lower()
 
 
-def test_import_wrong_role_enum_for_kind_errors() -> None:
-    result = runner.invoke(
-        app,
-        [
-            "identity", "import", "--kind", "SERVICE_ACCOUNT",
-            "--client-id", "sa-1", "--secret", "shh",
-            "--role", "ORG_ADMIN", "--org", "globo", "--label", "sys",
-        ],
-    )
+def test_import_user_missing_username_errors() -> None:
+    result = runner.invoke(app, ["identity", "import", "--label", "root"])
     assert result.exit_code != 0
-    assert "ACCOUNT" in result.output  # lists the valid SA roles
+    assert "username" in result.output.lower()
 
 
 @respx.mock

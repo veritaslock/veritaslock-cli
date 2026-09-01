@@ -12,13 +12,12 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 
 from vl.lib import api, store
 from vl.lib.output import console, render
-from vl.lib.roles import OrgRole, ServiceAccountRole
 
 app = typer.Typer(
     help="Manage the identities vl authenticates as.", no_args_is_help=True
@@ -183,26 +182,38 @@ def _cache_org(environment_name: str, org_dto: dict[str, object]) -> str:
     return str(org_dto["name"])
 
 
-def _validated_role(value: str, choices: type[Enum]) -> str:
+def _fetch_org_by_id(base_url: str, org_id: str) -> dict[str, Any] | None:
+    """`GET /v1/organizations/{id}` (public). ``None`` if it can't be resolved."""
     try:
-        return choices(value.upper()).value  # type: ignore[no-any-return]
-    except ValueError:
-        allowed = ", ".join(c.value for c in choices)
-        raise typer.BadParameter(f"{value!r} — allowed: {allowed}", param_hint="--role")
+        with api.IdpClient(base_url) as client:
+            dto: dict[str, Any] = client.get(f"/v1/organizations/{org_id}")
+        return dto
+    except api.ApiError:
+        return None
+
+
+def _orgs_claim(claims: dict[str, Any]) -> list[dict[str, Any]]:
+    orgs = claims.get("orgs")
+    if not isinstance(orgs, list):
+        return []
+    return [
+        e for e in orgs if isinstance(e, dict) and e.get("orgId") and e.get("role")
+    ]
+
+
+def _refuse_duplicate(environment_name: str, server_id: str, kind: str) -> None:
+    existing = store.get_identity_by_server_id(environment_name, server_id, kind)  # type: ignore[arg-type]
+    if existing is not None:
+        raise store.IdentityExistsError(
+            f"That {kind} account is already imported as {existing.label!r} in "
+            f"environment {environment_name!r}. Use that label, or "
+            f"`vl identity forget {existing.label}` first."
+        )
 
 
 @app.command("import")
 def import_(
     label: Annotated[str, typer.Option("--label", help="Local label for this identity.")],
-    org: Annotated[str, typer.Option("--org", help="Organization name.")],
-    role: Annotated[
-        str,
-        typer.Option(
-            "--role",
-            help="USER: ORG_ADMIN|USER|PLATFORM_ADMIN. "
-            "SERVICE_ACCOUNT: ACCOUNT|NODE|SYSTEM|INGEST_CLIENT.",
-        ),
-    ],
     kind: Annotated[
         IdentityKind, typer.Option("--kind", help="Identity kind.")
     ] = IdentityKind.USER,
@@ -239,45 +250,55 @@ def import_(
     ] = None,
     env: EnvOption = None,
 ) -> None:
-    """Adopt an existing server-side identity into the local store."""
+    """Adopt an existing server-side identity into the local store.
+
+    Authenticates *as the account being imported* — you need that account's own
+    credential. Org memberships are read from the login response, not supplied.
+    """
     if kind is IdentityKind.USER:
-        _import_user(label, org, role, username, password, env)
+        _import_user(label, username, password, env)
     else:
         _import_service_account(
-            label, org, role, client_id, secret, private_key_path, public_key_path, env
+            label, client_id, secret, private_key_path, public_key_path, env
         )
 
 
 def _import_user(
-    label: str,
-    org: str,
-    role: str,
-    username: str | None,
-    password: str | None,
-    env: str | None,
+    label: str, username: str | None, password: str | None, env: str | None
 ) -> None:
     if username is None:
         raise typer.BadParameter("--username is required for --kind USER")
-    org_role = _validated_role(role, OrgRole)
 
     with _report_errors():
         environment = store.get_environment(env)
         if password is None:
             password = typer.prompt("Password", hide_input=True)
 
-        with api.IdpClient(environment.idp_base_url) as client:
-            org_dto = client.get("/v1/organizations", params={"name": org})
-        org_name = _cache_org(environment.name, org_dto)
-
-        # Validate the credential before storing anything.
+        # Validate the credential (and resolve the account) before storing anything.
         result = api.login(environment.idp_base_url, username, password)
-        server_id = str(api.decode_jwt_payload(result.access_token).get("sub", ""))
+        claims = api.decode_jwt_payload(result.access_token)
+        server_id = str(claims.get("sub", ""))
+        _refuse_duplicate(environment.name, server_id, "USER")
 
         identity = store.add_identity(
             environment.name, "USER", server_id, username, label
         )
         store.set_user_acct(identity.id, password)
-        store.upsert_org_membership(identity.id, environment.name, org_name, org_role)
+
+        # Real org memberships come from the token's `orgs` claim, not a flag.
+        for entry in _orgs_claim(claims):
+            org_dto = _fetch_org_by_id(
+                environment.idp_base_url, str(entry["orgId"])
+            )
+            if org_dto is None:
+                console.print(
+                    f"[dim]note: could not cache org {entry['orgId']}[/dim]"
+                )
+                continue
+            org_name = _cache_org(environment.name, org_dto)
+            store.upsert_org_membership(
+                identity.id, environment.name, org_name, str(entry["role"])
+            )
 
     console.print(
         f"Imported [bold]{label}[/bold] (tier 1 — password stored). "
@@ -287,8 +308,6 @@ def _import_user(
 
 def _import_service_account(
     label: str,
-    org: str,
-    role: str,
     client_id: str | None,
     secret: str | None,
     private_key_path: Path | None,
@@ -299,23 +318,27 @@ def _import_service_account(
         raise typer.BadParameter(
             "--client-id and --secret are required for --kind SERVICE_ACCOUNT"
         )
-    _validated_role(role, ServiceAccountRole)  # validated, not stored (no OrgRole)
 
     with _report_errors():
         environment = store.get_environment(env)
-
-        with api.IdpClient(environment.idp_base_url) as client:
-            org_dto = client.get("/v1/organizations", params={"name": org})
-        org_name = _cache_org(environment.name, org_dto)
+        _refuse_duplicate(environment.name, client_id, "SERVICE_ACCOUNT")
 
         # Validate the secret before storing anything.
         token = api.service_account_token(
             environment.idp_base_url, client_id, secret
         ).access_token
-        # Read the account's actual current keyVersion — an adopted account may
+        # Read the account's actual keyVersion and org — an adopted account may
         # already have been rotated server-side.
         with api.IdpClient(environment.idp_base_url, token=token) as client:
             sa_dto = client.get(f"/v1/service-accounts/{client_id}")
+
+        org_dto = _fetch_org_by_id(environment.idp_base_url, str(sa_dto["orgId"]))
+        if org_dto is None:
+            raise store.OrganizationNotFoundError(
+                f"Could not resolve the service account's organization "
+                f"({sa_dto['orgId']})."
+            )
+        org_name = _cache_org(environment.name, org_dto)
 
         identity = store.add_identity(
             environment.name, "SERVICE_ACCOUNT", client_id, client_id, label

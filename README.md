@@ -97,12 +97,11 @@ does it in one call instead.
 
 ```bash
 # Bootstrap: adopt a pre-existing server account into a reusable tier-1 identity
-vl identity import --username admin --org globo --role ORG_ADMIN --label root
+vl identity import --username admin --label root
 vl identity use root                 # make it the default for this environment
 
 # Adopt an existing service account (e.g. SYSTEM) — replaces the VL_SYSTEM_* env vars
-vl identity import --kind SERVICE_ACCOUNT --client-id <id> --secret <secret> \
-  --role SYSTEM --org veritaslock --label system
+vl identity import --kind SERVICE_ACCOUNT --client-id <id> --secret <secret> --label system
 
 vl identity login alice             # tier-2: authenticate as yourself, no stored password
 vl identity list
@@ -110,8 +109,11 @@ vl identity show root --reveal-secret
 vl identity forget aanderson        # local-only removal; server account untouched
 ```
 
-`import` authenticates **as the account being imported** — you need that account's
-own password (or client secret). It does not act on behalf of another identity.
+`import` authenticates **as the account being imported** — you pass *that
+account's* own password / client secret, not a caller's, and you can only import
+an account whose credential you have. Org memberships are read from the login
+response (real data), not supplied; re-importing the same account under a new
+label is refused.
 
 Service-account identities have no tier-2 mode — the client secret is always
 stored, and `vl` acquires their tokens via `/auth/service-account/token` silently.

@@ -61,8 +61,8 @@ No `org_id`/`org_name` columns on this table — an identity's org relationship(
 `FOREIGN KEY (environment_name, org_name) REFERENCES organization(environment_name, name) ON UPDATE CASCADE ON DELETE RESTRICT`.
 
 Same caching principle as `organization` itself (Phase 2 §3): this is populated as a side effect of `vl` commands that already know the membership, not queried independently, since there is currently no "list orgs for user X" endpoint to sync against. Populated by:
-- **`vl user add`** (§9.1) — the org(s) supplied at creation time are known exactly, no ambiguity.
-- **`vl identity import`** (§8.4) — the org supplied is known, but the actual `role` isn't verified by any API call in this document (no endpoint returns it); stored as best-effort from what the caller asserts, `synced_at` reflects when it was asserted, not verified.
+- **`vl user add`** (§9.1) — the org and role supplied at creation time are known exactly, no ambiguity.
+- **`vl identity import`** (§8.4) — read from the login token's `orgs` claim (`[{orgId, role}]`, the user's real server-side memberships baked in at login), not from a flag. `synced_at` reflects the import time; the data is accurate as of then.
 
 `vl org members add` (Phase 2) does not populate this table on its own as originally specced — but as part of this document's scope, it's retrofitted to do so. See §9.6.
 
@@ -119,15 +119,16 @@ Sets `identity.is_default = 1` for that row within its environment, clearing any
 
 If none resolve, error clearly rather than guessing.
 
-### 8.4 `vl identity import --kind USER --username <username> --org <org> --role <ORG_ADMIN|USER|PLATFORM_ADMIN> --label <label> [--password <password>] [--env <env>]`
+### 8.4 `vl identity import --kind USER --username <username> --label <label> [--password <password>] [--env <env>]`
 Adopts an identity that already exists server-side but wasn't created by `vl` — most importantly, breaks the bootstrap chicken-and-egg: `vl user add` requires an already-resolved user-token identity, but the very first user (e.g. the `admin`/`vlspass` account the current bash scripts assume is pre-seeded) was never created through this CLI.
 
-1. Resolve `org_id` from `--org` (unauthenticated `GET /v1/organizations?name=`), and upsert the local `organization` cache row (Phase 2 §3) if this is the first time this environment/org has been touched locally.
-2. If `--password` omitted, prompt interactively (hidden input).
-3. **Validate the credential before storing it**: call `POST /auth/user/login` with the given username/password. If it fails, error clearly and store nothing.
-4. On success, create the `identity` row (`kind='USER'`), a `user_acct` row **with the password stored** (`password_plaintext` set — `import` is explicitly for building a reusable tier-1 identity), and an `org_membership` row using the `--role` supplied. As noted in §4, this role is not independently verified against the server — it's whatever the caller asserts, since there's currently no endpoint that returns a user's actual org role.
+`import` authenticates **as the account being imported** — `--username`/`--password` are that account's own credential, not a caller's. There is no `--as`. It follows that you can only import an account whose password you know.
 
-`--kind SERVICE_ACCOUNT` is not yet accepted — deferred to Phase 4, which will extend this same command.
+1. If `--password` omitted, prompt interactively (hidden input).
+2. **Validate the credential and resolve the account**: call `POST /auth/user/login`. If it fails, error clearly and store nothing. The response token's `sub` claim is the server id; its `orgs` claim (`[{orgId, role}]`) is the user's real org memberships.
+3. **Refuse a duplicate**: if an `identity` row already exists in this environment for the resolved `server_id` with `kind='USER'`, error naming its current label (`… already imported as '<label>' — use that label, or vl identity forget <label> first`) rather than creating a second row for the same account. This is the guard against "import admin again under a new label."
+4. Create the `identity` row (`kind='USER'`) and a `user_acct` row **with the password stored** (`password_plaintext` set — `import` is explicitly for building a reusable tier-1 identity).
+5. For each `{orgId, role}` in the token's `orgs` claim: `GET /v1/organizations/{orgId}` (unauthenticated, `permitAll`), upsert the local `organization` cache row, and upsert an `org_membership` row with that real role. `synced_at` = import time. If an org can't be resolved, skip it (note it) — the identity is still adopted; `org_membership` is a cosmetic cache (§4), never load-bearing. **No `--org`/`--role` flags** — the earlier draft's caller-asserted role is gone (resolves open item 4).
 
 ### 8.5 `vl identity login <username> [--env <env>]`
 The tier-2 path (§7): prompts interactively for a password (hidden input), authenticates against `/auth/user/login`.
@@ -206,6 +207,6 @@ def set_cached_token(identity_id: int, token: str, issued_at: datetime, expires_
 1. ~~Org-role enum mismatch~~ — **Resolved:** confirmed to be `provision_service_account.sh` going stale after the org-role enum was renamed during the team implementation (`ADMIN` → `ORG_ADMIN`), not a live server bug. `vl user add`/`vl identity import` sending `ORG_ADMIN`/`USER`/`PLATFORM_ADMIN` is correct as specced; this will get its first real exercise once `vl user add` actually runs against the server. Once `vl user`/`vl service-account` are both live, the stale bash scripts are good candidates for retirement rather than further patching.
 2. **`vl identity import` credential validation (§8.4 step 3):** confirm a login-attempt-before-storing is acceptable rather than storing on faith — adds one extra network call to `import` but avoids ever persisting a credential that doesn't actually work.
 3. **Command-line `--password` exposure:** `vl identity import --password <value>` puts a secret in shell history / process listing if used non-interactively. Acceptable for local dev bootstrap, but worth a documented caveat rather than silently encouraging the habit.
-4. **`org_membership.role` staleness for `import`:** since there's no endpoint to verify a user's actual role in an org, an imported identity's cached role could be wrong (typo, or genuinely changed server-side later) with nothing to catch it. Acceptable given this is explicitly a cache (§4), but worth being aware of in practice.
+4. ~~`org_membership.role` staleness for `import`~~ — **Resolved:** `import` no longer takes `--org`/`--role`. It reads memberships from the login token's `orgs` claim (real server data), so there's nothing for the caller to get wrong. The data can still go stale relative to *later* server-side changes (it's a cache with no user-role sync endpoint), but it's never *fabricated* now, and `synced_at` records exactly when it was accurate.
 5. **`vl org members add` retrofit (§9.6) needs `vl.lib.store`'s identity-lookup available at the point Phase 2's command runs:** this means Phase 2's code (built earlier, in a separate document/PR) must be revisited to import from this document's store module — worth sequencing the actual implementation work so Phase 3's `identity` table and lookup functions are in place before this retrofit is wired in, even though both land in the same document/PR.
 6. ~~`--email`/`--phone` on `vl user add`/`update` depend on `idp-org-admin-safety-spec.md` landing server-side~~ — **Resolved:** confirmed implemented, committed, and pushed.

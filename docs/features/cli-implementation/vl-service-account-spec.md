@@ -44,13 +44,14 @@ Bump `PRAGMA user_version` to `3` (from `2`, confirmed as the store's current ve
 
 Phase 3 §8.4 specified `--kind USER` only, deferring `--kind SERVICE_ACCOUNT` to this document. Full signature:
 
-`vl identity import --kind SERVICE_ACCOUNT --client-id <id> --secret <secret> --role <ACCOUNT|NODE|SYSTEM|INGEST_CLIENT> --org <org> --label <label> [--private-key-path <path>] [--public-key-path <path>] [--env <env>]`
+`vl identity import --kind SERVICE_ACCOUNT --client-id <id> --secret <secret> --label <label> [--private-key-path <path>] [--public-key-path <path>] [--env <env>]`
 
-1. Resolve `org_id` from `--org`, upsert the local `organization` cache row if needed.
-2. **Validate before storing** (same principle as the `USER` path): call `POST /auth/service-account/token` with `{clientId: <--client-id>, clientSecret: <--secret>}`. If it fails, error clearly and store nothing.
-3. `GET /v1/service-accounts/{client-id}` to confirm the account exists and to read its actual current `keyVersion` — don't assume `1`, since an adopted account may already have been rotated server-side.
-4. Create the `identity` row (`kind='SERVICE_ACCOUNT'`, `server_id` = `principal_name` = `--client-id`, `label`) and a `svc_acct` row (`org_name` from `--org`, `client_secret_plaintext` = `--secret`, `key_version` from step 3). **No `--org-role` flag, no `org_membership` row** — service accounts don't have an `OrgRole`; see §2's note.
-5. `--private-key-path`/`--public-key-path`, if supplied, are stored as-is on the `svc_acct` row — `vl` does **not** generate or copy key material during import, only references files that already exist (e.g. the ones `provision_service_account.sh` already wrote to `~/.veritaslock/service-accounts/<id>/`). If omitted, `public_key_path`/`private_key_path` stay `NULL` — `vl service-account get-assertion` (§5.7) will error clearly if invoked against an identity with no private key path recorded, rather than failing obscurely.
+1. **Validate before storing** (same principle as the `USER` path): call `POST /auth/service-account/token` with `{clientId: <--client-id>, clientSecret: <--secret>}`. If it fails, error clearly and store nothing.
+2. **Refuse a duplicate**: if an `identity` row already exists in this environment for `server_id = <--client-id>` with `kind='SERVICE_ACCOUNT'`, error naming its current label (same guard as the `USER` path, §8.4 step 3).
+3. `GET /v1/service-accounts/{client-id}` (with the token from step 1) to read the account's actual current `keyVersion` (don't assume `1`) **and its `orgId`**.
+4. `GET /v1/organizations/{orgId}` (unauthenticated, `permitAll`), upsert the local `organization` cache row. If the org can't be resolved, error and store nothing — `svc_acct.org_name` is a required FK.
+5. Create the `identity` row (`kind='SERVICE_ACCOUNT'`, `server_id` = `principal_name` = `--client-id`, `label`) and a `svc_acct` row (`org_name` from step 4, `client_secret_plaintext` = `--secret`, `key_version` from step 3). **No `--org`, no `--role` flag, no `org_membership` row** — the org comes from the server; service accounts have no `OrgRole` (see §2's note).
+6. `--private-key-path`/`--public-key-path`, if supplied, are stored as-is on the `svc_acct` row — `vl` does **not** generate or copy key material during import, only references files that already exist (e.g. the ones `provision_service_account.sh` already wrote to `~/.veritaslock/service-accounts/<id>/`). If omitted, `public_key_path`/`private_key_path` stay `NULL` — `vl service-account get-assertion` (§5.7) will error clearly if invoked against an identity with no private key path recorded, rather than failing obscurely.
 
 This is the intended path for finally bringing `SYSTEM` (and any other pre-existing service account) into the local store — closing the "continues via bash env vars" gap noted throughout Phases 2–3.
 
