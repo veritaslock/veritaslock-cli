@@ -107,7 +107,11 @@ vl identity import --kind SERVICE_ACCOUNT --client-id <id> --secret <secret> \
 vl identity login alice             # tier-2: authenticate as yourself, no stored password
 vl identity list
 vl identity show root --reveal-secret
+vl identity forget aanderson        # local-only removal; server account untouched
 ```
+
+`import` authenticates **as the account being imported** — you need that account's
+own password (or client secret). It does not act on behalf of another identity.
 
 Service-account identities have no tier-2 mode — the client secret is always
 stored, and `vl` acquires their tokens via `/auth/service-account/token` silently.
@@ -182,7 +186,7 @@ src/vl/
 ├── app.py            root Typer app; mounts noun sub-apps
 ├── commands/         one module per noun group
 │   ├── env.py             vl env add | list | show | use | update | delete
-│   ├── identity.py        vl identity list | show | use | import | login
+│   ├── identity.py        vl identity list | show | use | import | login | forget
 │   ├── org.py             vl org add | show | list | update | members ...
 │   ├── service_account.py vl service-account add | show | list | update | ...
 │   ├── team.py            vl team add | show | list | update | delete | members ... | ingest-clients ...

@@ -150,6 +150,28 @@ def use(
     )
 
 
+@app.command("forget")
+def forget(
+    label: Annotated[str, typer.Argument(help="Identity label.")],
+    env: EnvOption = None,
+) -> None:
+    """Remove a stored identity locally — no server call.
+
+    Drops the identity row and everything hanging off it (stored password or
+    client secret, cached org/team memberships, cached token). The server-side
+    account is untouched; use `vl user delete` / `vl service-account delete` for
+    that. Re-add it later with `vl identity import`.
+    """
+    with _report_errors():
+        environment = store.get_environment(env)
+        identity = store.get_identity(environment.name, label)  # 404s clearly
+        store.delete_identity(environment.name, label)
+    console.print(
+        f"Forgot {identity.kind} identity [bold]{label}[/bold] "
+        f"(principal {identity.principal_name!r}). The server account is untouched."
+    )
+
+
 def _cache_org(environment_name: str, org_dto: dict[str, object]) -> str:
     store.upsert_organization(
         environment_name,

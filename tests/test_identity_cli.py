@@ -212,3 +212,26 @@ def test_use_and_list_and_show(monkeypatch) -> None:
         app, ["identity", "show", "alice", "--reveal-secret"], env={"VL_OUTPUT": "json"}
     )
     assert "sekret" in revealed.stdout
+
+
+def test_forget_removes_identity_and_cascades_locally() -> None:
+    store.ensure_local_environment_seeded()
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    ident = store.add_identity("local", "USER", "u-1", "alice", "alice")
+    store.set_user_acct(ident.id, "sekret")
+    store.upsert_org_membership(ident.id, "local", "globo", "USER")
+
+    result = runner.invoke(app, ["identity", "forget", "alice"])
+
+    assert result.exit_code == 0, result.stdout
+    assert "server account is untouched" in result.stdout
+    assert store.list_identities("local") == []
+    assert store.get_user_acct(ident.id) is None
+    assert store.list_org_memberships(ident.id) == []
+
+
+def test_forget_unknown_label_errors() -> None:
+    store.ensure_local_environment_seeded()
+    result = runner.invoke(app, ["identity", "forget", "ghost"])
+    assert result.exit_code == 1
+    assert "No identity 'ghost'" in result.stdout

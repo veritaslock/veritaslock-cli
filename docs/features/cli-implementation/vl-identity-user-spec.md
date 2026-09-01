@@ -12,7 +12,7 @@ This document covers:
 - The common `identity` table (kind-agnostic — shared by users and, in a later document, service accounts) and its `USER`-specific extension table, `user_acct`.
 - The `org_membership` join table, mirroring the IdP's own `organization` + `user_org_role` split (per Phase 2 §1) — replaces the flat, informational `org_id`/`org_name` columns an earlier draft of this document had put directly on `identity`.
 - `token_cache`, the JWT caching layer everything authenticated depends on.
-- The `vl identity` command group: `list`, `show`, `use`, `import`, `login`.
+- The `vl identity` command group: `list`, `show`, `use`, `import`, `login`, `forget`.
 - The `vl user` command group: `add`, `show`, `list`, `update`, `delete`.
 - A small retrofit to Phase 2's `vl org members add` command (§9.6) so it upserts `org_membership` when its target matches a locally known identity — folded into this document's scope rather than left as a later cleanup, since `org_membership` doesn't exist until this phase and the retrofit is small and purely mechanical once it does.
 
@@ -135,6 +135,9 @@ The tier-2 path (§7): prompts interactively for a password (hidden input), auth
 **Reuse, not label-based:** before creating anything, check whether an `identity` row already exists in this environment with `kind='USER'` and `principal_name = username` — regardless of what label it was given (so this also catches identities set up via `vl user add` or `vl identity import`, not just prior `login` calls). If found, reuse that row: authenticate, refresh its `token_cache` entry, done. `user_acct` is **never modified** by `login` — if the found row is tier 1 (password already stored) and the password just typed differs, that's not reconciled here; if it's tier 2, it stays tier 2. If no matching row exists, create one: `label = username` (no `--label` flag on this command), `kind='USER'`, resolve `server_id` from the login response, and a `user_acct` row with `password_plaintext = NULL` (tier 2).
 
 Does **not** create an `org_membership` row — this path doesn't ask for or receive org/role information, it only establishes the ability to authenticate. If org context is needed for this identity later, use `vl identity import` instead, or extend this command in a future revision.
+
+### 8.6 `vl identity forget <label> [--env <env>]`
+Local-only removal — **no server call**. Deletes the `identity` row and everything that cascades from it (`user_acct`/`svc_acct`, `org_membership`, `team_member`, `token_cache`). The server-side account is untouched — this is the counterpart to `vl user delete` / `vl service-account delete` (which do hit the server) for the case where `vl` simply stored the wrong thing (e.g. an `import` run with the wrong `--label`/`--username`, or a fabricated `--role`). Re-add later with `vl identity import`.
 
 ---
 
