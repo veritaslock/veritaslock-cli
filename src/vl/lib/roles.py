@@ -28,3 +28,8 @@ class ServiceAccountRole(str, Enum):
     NODE = "NODE"
     SYSTEM = "SYSTEM"
     INGEST_CLIENT = "INGEST_CLIENT"
+
+
+class TeamRole(str, Enum):
+    TEAM_ADMIN = "TEAM_ADMIN"
+    TEAM_MEMBER = "TEAM_MEMBER"

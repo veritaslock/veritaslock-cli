@@ -31,7 +31,7 @@ def test_fresh_store_uses_new_table_names(isolated_store: Path) -> None:
     assert "user_credential" not in tables
     assert "service_account_credential" not in tables
     with sqlite3.connect(isolated_store) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION == 5
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
 
 
 def test_v4_store_migrates_to_v5_preserving_rows(

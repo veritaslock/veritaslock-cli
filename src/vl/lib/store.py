@@ -10,6 +10,7 @@ and bumping ``SCHEMA_VERSION`` (§8 of the ``vl env`` spec):
 * v4 — ``service_account_credential`` + ``vl service-account`` (Phase 4).
 * v5 — rename ``user_credential`` -> ``user_acct``, ``service_account_credential``
   -> ``svc_acct`` (naming-convention cleanup, no schema change).
+* v6 — ``team`` cache + ``team_member`` join + ``vl team`` (Phase 6).
 
 On open, every migration between the store's ``PRAGMA user_version`` and
 ``SCHEMA_VERSION`` is applied in order; a store from a *newer* `vl` is rejected
@@ -29,7 +30,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Treat a cached token as expired this many seconds before its real expiry, to
 # avoid handing a command a token that dies mid-request.
@@ -132,6 +133,39 @@ _MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE user_credential RENAME TO user_acct;
     ALTER TABLE service_account_credential RENAME TO svc_acct;
     """,
+    # 5 -> 6: team cache + team_member join, mirroring organization / org_membership
+    # (Phase 6). Additive only.
+    """
+    CREATE TABLE IF NOT EXISTS team (
+        environment_name  TEXT NOT NULL
+                          REFERENCES environment(name)
+                          ON UPDATE CASCADE ON DELETE RESTRICT,
+        org_name          TEXT NOT NULL,
+        name              TEXT NOT NULL,
+        description       TEXT,
+        server_team_id    TEXT NOT NULL,
+        created_by        TEXT,
+        created_at        TEXT NOT NULL,
+        synced_at         TEXT NOT NULL,
+        PRIMARY KEY (environment_name, org_name, name),
+        FOREIGN KEY (environment_name, org_name)
+            REFERENCES organization(environment_name, name)
+            ON UPDATE CASCADE ON DELETE RESTRICT
+    );
+    CREATE TABLE IF NOT EXISTS team_member (
+        identity_id       INTEGER NOT NULL
+                          REFERENCES identity(id) ON DELETE CASCADE,
+        environment_name  TEXT NOT NULL,
+        org_name          TEXT NOT NULL,
+        team_name         TEXT NOT NULL,
+        role              TEXT NOT NULL,
+        synced_at         TEXT NOT NULL,
+        PRIMARY KEY (identity_id, environment_name, org_name, team_name),
+        FOREIGN KEY (environment_name, org_name, team_name)
+            REFERENCES team(environment_name, org_name, name)
+            ON DELETE CASCADE
+    );
+    """,
 )
 
 # Auto-seeded on first store-open so a fresh install works with zero setup (§4).
@@ -182,6 +216,10 @@ class IdentityExistsError(StoreError):
 
 class NoResolvedIdentityError(StoreError):
     """No ``--as`` / ``VL_IDENTITY`` / default identity to run an authed command as."""
+
+
+class TeamNotFoundError(StoreError):
+    """Named team is not in the local cache."""
 
 
 @dataclass(frozen=True)
@@ -263,6 +301,32 @@ class SvcAcct:
     public_key_path: str | None
     private_key_path: str | None
     key_version: int | None
+
+
+@dataclass(frozen=True)
+class Team:
+    """A cached team row (local mirror of the server's, not a source of truth)."""
+
+    environment_name: str
+    org_name: str
+    name: str
+    description: str | None
+    server_team_id: str
+    created_by: str | None
+    created_at: str
+    synced_at: str
+
+
+@dataclass(frozen=True)
+class TeamMember:
+    """A cached team membership for a stored identity."""
+
+    identity_id: int
+    environment_name: str
+    org_name: str
+    team_name: str
+    role: str
+    synced_at: str
 
 
 # --------------------------------------------------------------------------- #
@@ -965,5 +1029,195 @@ def update_svc_acct_keys(
              WHERE identity_id = ?
             """,
             (public_key_path, private_key_path, key_version, identity_id),
+        )
+        conn.commit()
+
+
+def update_svc_acct_secret(
+    identity_id: int, client_secret_plaintext: str, key_version: int | None
+) -> None:
+    """Refresh a SERVICE_ACCOUNT credential's symmetric secret (used after rotate)."""
+    with _store() as conn:
+        conn.execute(
+            """
+            UPDATE svc_acct
+               SET client_secret_plaintext = ?, key_version = ?
+             WHERE identity_id = ?
+            """,
+            (client_secret_plaintext, key_version, identity_id),
+        )
+        conn.commit()
+
+
+# --------------------------------------------------------------------------- #
+# Public API — team cache + team memberships (Phase 6)
+# --------------------------------------------------------------------------- #
+
+
+def _row_to_team(row: sqlite3.Row) -> Team:
+    return Team(
+        environment_name=row["environment_name"],
+        org_name=row["org_name"],
+        name=row["name"],
+        description=row["description"],
+        server_team_id=row["server_team_id"],
+        created_by=row["created_by"],
+        created_at=row["created_at"],
+        synced_at=row["synced_at"],
+    )
+
+
+def upsert_team(
+    environment_name: str,
+    org_name: str,
+    name: str,
+    server_team_id: str,
+    *,
+    description: str | None = None,
+    created_by: str | None = None,
+    created_at: str | None = None,
+) -> Team:
+    """Insert or refresh a cached team row, stamping ``synced_at``."""
+    with _store() as conn:
+        conn.execute(
+            """
+            INSERT INTO team (environment_name, org_name, name, description,
+                              server_team_id, created_by, created_at, synced_at)
+            VALUES (:environment_name, :org_name, :name, :description,
+                    :server_team_id, :created_by,
+                    COALESCE(:created_at, :now), :now)
+            ON CONFLICT (environment_name, org_name, name) DO UPDATE SET
+                description    = excluded.description,
+                server_team_id = excluded.server_team_id,
+                created_by     = COALESCE(excluded.created_by, team.created_by),
+                created_at     = COALESCE(excluded.created_at, team.created_at),
+                synced_at      = excluded.synced_at
+            """,
+            {
+                "environment_name": environment_name,
+                "org_name": org_name,
+                "name": name,
+                "description": description,
+                "server_team_id": server_team_id,
+                "created_by": created_by,
+                "created_at": created_at,
+                "now": _now(),
+            },
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM team WHERE environment_name = ? AND org_name = ? AND name = ?",
+            (environment_name, org_name, name),
+        ).fetchone()
+        assert row is not None  # just upserted
+        return _row_to_team(row)
+
+
+def get_team(environment_name: str, org_name: str, name: str) -> Team:
+    """A cached team, or ``TeamNotFoundError``."""
+    team = get_team_or_none(environment_name, org_name, name)
+    if team is None:
+        raise TeamNotFoundError(
+            f"No cached team {name!r} in {org_name!r} (environment "
+            f"{environment_name!r}). Run `vl team show {org_name} {name}` first."
+        )
+    return team
+
+
+def get_team_or_none(
+    environment_name: str, org_name: str, name: str
+) -> Team | None:
+    with _store() as conn:
+        row = conn.execute(
+            "SELECT * FROM team WHERE environment_name = ? AND org_name = ? AND name = ?",
+            (environment_name, org_name, name),
+        ).fetchone()
+        return _row_to_team(row) if row is not None else None
+
+
+def list_teams(
+    environment_name: str, org_name: str | None = None
+) -> list[Team]:
+    """Cached teams for an environment, optionally scoped to one org."""
+    with _store() as conn:
+        if org_name is None:
+            rows = conn.execute(
+                "SELECT * FROM team WHERE environment_name = ? "
+                "ORDER BY org_name, name",
+                (environment_name,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM team WHERE environment_name = ? AND org_name = ? "
+                "ORDER BY name",
+                (environment_name, org_name),
+            ).fetchall()
+        return [_row_to_team(row) for row in rows]
+
+
+def delete_team(environment_name: str, org_name: str, name: str) -> None:
+    """Drop a cached team (cascades to its ``team_member`` rows)."""
+    with _store() as conn:
+        cursor = conn.execute(
+            "DELETE FROM team WHERE environment_name = ? AND org_name = ? AND name = ?",
+            (environment_name, org_name, name),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            raise TeamNotFoundError(
+                f"No cached team {name!r} in {org_name!r} (environment "
+                f"{environment_name!r})."
+            )
+
+
+def upsert_team_member(
+    identity_id: int,
+    environment_name: str,
+    org_name: str,
+    team_name: str,
+    role: str,
+) -> None:
+    """Insert or refresh a cached team membership, stamping ``synced_at``."""
+    with _store() as conn:
+        conn.execute(
+            """
+            INSERT INTO team_member (identity_id, environment_name, org_name,
+                                     team_name, role, synced_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (identity_id, environment_name, org_name, team_name)
+            DO UPDATE SET role = excluded.role, synced_at = excluded.synced_at
+            """,
+            (identity_id, environment_name, org_name, team_name, role, _now()),
+        )
+        conn.commit()
+
+
+def list_team_memberships(identity_id: int) -> list[TeamMember]:
+    with _store() as conn:
+        rows = conn.execute(
+            "SELECT * FROM team_member WHERE identity_id = ? ORDER BY org_name, team_name",
+            (identity_id,),
+        ).fetchall()
+        return [
+            TeamMember(
+                identity_id=row["identity_id"],
+                environment_name=row["environment_name"],
+                org_name=row["org_name"],
+                team_name=row["team_name"],
+                role=row["role"],
+                synced_at=row["synced_at"],
+            )
+            for row in rows
+        ]
+
+
+def delete_team_member(
+    identity_id: int, environment_name: str, org_name: str, team_name: str
+) -> None:
+    with _store() as conn:
+        conn.execute(
+            "DELETE FROM team_member WHERE identity_id = ? AND environment_name = ? "
+            "AND org_name = ? AND team_name = ?",
+            (identity_id, environment_name, org_name, team_name),
         )
         conn.commit()

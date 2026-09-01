@@ -2,11 +2,9 @@
 
 `vl` — the unified admin CLI for VeritasLock.
 
-Structured like `git`/`kubectl` with noun-verb subcommands (`vl user add`,
-`vl events send`). This tool will progressively replace and consolidate the
-bash scripts currently spread across the `veritaslock-node` and
-`veritaslock-services` repos (starting with `send_events`, later
-`start_test_harness.sh` broken into command groups).
+Structured like `git`/`kubectl` with noun-verb subcommands (`vl org add`,
+`vl user add`). This tool progressively replaces and consolidates the bash
+scripts spread across the `veritaslock-node` and `veritaslock-services` repos.
 
 ## Install
 
@@ -27,14 +25,14 @@ mypy
 
 ## Configuration
 
-Configuration is read from the environment (see `vl/lib/config.py`):
+| Variable         | Purpose                                        | Default                 |
+| ---------------- | --------------------------------------------- | ----------------------- |
+| `VL_STORE_PATH`  | Path to the local SQLite store                 | `~/.config/vl/store.db` |
+| `VL_IDENTITY`    | Default identity label (see identity resolution) | —                       |
+| `VL_OUTPUT`      | Output format: `table` or `json`               | `table`                 |
 
-| Variable             | Purpose                                   | Default                  |
-| -------------------- | ----------------------------------------- | ------------------------ |
-| `VL_ENV`             | Target environment name                   | `local`                  |
-| `VL_API_BASE_URL`    | IdP / Control-Plane API base URL          | `http://localhost:8080`  |
-| `VL_KAFKA_BOOTSTRAP` | Kafka bootstrap servers for `vl events`   | `localhost:9092`         |
-| `VL_OUTPUT`          | Output format: `table` or `json`          | `table`                  |
+Everything else — environments, credentials — lives in the local store, not the
+environment.
 
 ## Local store
 
@@ -151,10 +149,30 @@ and an Ed25519 keypair, written to `<store dir>/keys/<id>/` (`private.key` 600,
 `public.key` 644). `get-assertion` prints an EdDSA JWT (300 s) for use elsewhere,
 e.g. node-side authentication — it isn't part of `vl`'s internal auth flow.
 
-## Events (stubbed)
+## Teams
 
 ```bash
-vl events send --file ./payload.json --org acme --count 5
+vl team add globo ingest --description "Ingest team"   # creator becomes TEAM_ADMIN
+vl team show globo ingest
+vl team list globo
+vl team update globo ingest --name ingestion
+vl team members add globo ingestion --user-id <id> --role TEAM_ADMIN
+vl team members set-role globo ingestion <id> --role TEAM_MEMBER
+vl team members list globo ingestion
+vl team members remove globo ingestion <id>
+vl team delete globo ingestion
+```
+
+Teams are addressed by `<org> <team-name>`; `vl` resolves the server team id via
+its local `team` cache, falling back to `GET /v1/teams?orgId=&name=`. Team ingest
+clients are created as normal local `SERVICE_ACCOUNT` identities (symmetric secret
+only — no keypair, so `get-assertion` won't work on them):
+
+```bash
+vl team ingest-clients add globo ingestion "edge-01"   # prints the secret once
+vl team ingest-clients list globo ingestion
+vl team ingest-clients rotate globo ingestion <service-account-id>
+vl team ingest-clients delete globo ingestion <service-account-id>
 ```
 
 ## Layout
@@ -167,11 +185,10 @@ src/vl/
 │   ├── identity.py        vl identity list | show | use | import | login
 │   ├── org.py             vl org add | show | list | update | members ...
 │   ├── service_account.py vl service-account add | show | list | update | ...
-│   ├── user.py            vl user add | show | list | update | delete
-│   └── events.py          vl events send
+│   ├── team.py            vl team add | show | list | update | delete | members ... | ingest-clients ...
+│   └── user.py            vl user add | show | list | update | delete
 └── lib/              shared helpers used across commands
-    ├── config.py     env-var config loading (legacy fallback)
-    ├── store.py      local SQLite store (environments, orgs, identities, tokens)
+    ├── store.py      local SQLite store (environments, orgs, identities, teams, tokens)
     ├── api.py        httpx client for the IdP API + problem+json errors
     ├── auth.py       token acquisition / caching for authed commands
     ├── passwords.py  client-side password generation + bcrypt hashing
