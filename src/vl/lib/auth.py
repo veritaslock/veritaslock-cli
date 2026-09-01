@@ -34,6 +34,22 @@ def _persist(identity: store.Identity, result: api.TokenResult) -> str:
 def _reauthenticate(
     identity: store.Identity, idp_base_url: str, *, allow_prompt: bool | None
 ) -> str:
+    if identity.kind == "SERVICE_ACCOUNT":
+        sa = store.get_service_account_credential(identity.id)
+        if sa is None:
+            raise AuthError(
+                f"identity '{identity.label}' has no stored client secret — "
+                f"re-import it with `vl identity import --kind SERVICE_ACCOUNT`"
+            )
+        # No tier-2 case for this kind (spec §1): the secret is always stored,
+        # so this is unconditionally silent.
+        return _persist(
+            identity,
+            api.service_account_token(
+                idp_base_url, identity.principal_name, sa.client_secret_plaintext
+            ),
+        )
+
     credential = store.get_user_credential(identity.id)
     if credential is not None and credential.password_plaintext is not None:
         password = credential.password_plaintext  # tier 1 — silent

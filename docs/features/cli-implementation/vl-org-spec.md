@@ -4,6 +4,7 @@
 **Part of:** the larger `vl-cli-phase1-crud-spec.md` effort, broken out as its own standalone document. Depends only on `vl-env-spec.md` (Phase 1) — deliberately sequenced before the identity/user document (Phase 3), which depends on this one for its `org_membership` join table; see §5 for how write commands authenticate without needing Phase 3's identity store.
 **Builds on:** the `environment` table and `vl env` commands from Phase 1; the live organization endpoints on the IdP (`getById`, `getByName`, `create`, `addMember`, `patch`, `patchByName`), plus three new endpoints specced separately for a server-side session in `idp-org-membership-endpoints-spec.md`: list all orgs, list an org's members, and remove an org member.
 **Supersedes:** the `vl org` section of `vl-cli-phase1-crud-spec.md` (§8 in that document) — this is the authoritative version going forward.
+**See also:** `vl-org-keys-spec.md` (Phase 5) — org event-encryption keys, a separate command group (`vl org keys ...`) discovered after this document was written; §4.8 below references it as the final bootstrap step.
 
 ---
 
@@ -63,12 +64,14 @@ Same one-off auth flow as `add`. `PATCH /v1/organizations?name=` (or `/{orgId}` 
 
 `--owner` is subject to server-side preconditions, not pre-checked by `vl` (per the governing principle — §2 of the master spec): the target must already hold `ORG_ADMIN` on this org, **and** must have both `email` and `phoneNumber` set on their user record. `vl` doesn't validate any of this locally — it sends the request and surfaces whatever the server rejects it with (e.g. a clear error if the target lacks a phone number). This is the final step of the bootstrap sequence in §4.8.
 
-### 4.5 `vl org members add <org> --user-id <server-user-id> --role <ORG_ADMIN|USER|PLATFORM_ADMIN> --auth-user <username> [--auth-password <password>] [--env <env>]`
+### 4.5 `vl org members add <org> --user-id <server-user-id> --role <ORG_ADMIN|USER|PLATFORM_ADMIN|KEY_READER> --auth-user <username> [--auth-password <password>] [--env <env>]`
 Same one-off auth flow. `POST /v1/organizations/{orgId}/members`.
+
+`--role KEY_READER` depends on `idp-org-key-rbac-spec.md` landing server-side (the `OrgRole` enum widening) — not usable until then. Once it is, this is also how a designated key-reader account gets set up for `vl org keys` (`vl-org-keys-spec.md`) — no separate command needed, per that document's open item 5.
 
 `--user-id` takes a raw server-side user id, not a local store label — this document has no local identity store to resolve a label against yet (§1). Once `vl identity`/`vl user` land, this command should be revisited to additionally accept `--user <label>` as a convenience, resolved locally and translated to the underlying server id — that upgrade is out of scope here.
 
-`vl` does not pre-validate whether `--role PLATFORM_ADMIN` makes sense for the target org (per the governing principle — §2 of the master spec) — the server enforces that `PLATFORM_ADMIN` may only be granted within VeritasLock's own org and rejects it otherwise; `vl` just sends the request and surfaces whatever the server returns.
+`vl` does not pre-validate whether a given `--role` makes sense for the target org (per the governing principle — §2 of the master spec) — the server enforces role-specific rules (e.g. `PLATFORM_ADMIN` only within VeritasLock's own org) and rejects otherwise; `vl` just sends the request and surfaces whatever the server returns.
 
 ### 4.6 `vl org members list <org> --auth-user <username> [--auth-password <password>] [--env <env>]` *(new endpoint — see `idp-org-membership-endpoints-spec.md`)*
 `GET /v1/organizations/{orgId}/members` → renders `orgId, userId, role, addedAt` per row. Requires auth server-side (org member or `PLATFORM_ADMIN`) per that spec's §3 — same one-off auth flow as the other write commands here, even though this one is technically a read, since the endpoint isn't public.
@@ -76,11 +79,14 @@ Same one-off auth flow. `POST /v1/organizations/{orgId}/members`.
 ### 4.7 `vl org members remove <org> --user-id <server-user-id> --auth-user <username> [--auth-password <password>] [--env <env>]` *(new endpoint — see `idp-org-membership-endpoints-spec.md`)*
 `DELETE /v1/organizations/{orgId}/members/{userId}`. The server enforces (per that spec's §4) that this fails with `409` if it would leave the target user with zero org memberships — `vl` does not pre-check this locally, it just surfaces the server's response.
 
+### 4.7a `vl org members set-role <org> <user-id> --role <ORG_ADMIN|USER|PLATFORM_ADMIN|KEY_READER> --auth-user <username> [--auth-password <password>] [--env <env>]` *(new endpoint — see `idp-org-member-role-update-spec.md`, confirmed shipped)*
+`PATCH /v1/organizations/{orgId}/members/{userId}`. Changes a member's existing role in place — needed because `members add` `409`s on a duplicate `(userId, orgId)` pair rather than updating it, and `members remove` + `members add` doesn't work as a substitute whenever the org is the user's only membership (blocked by the zero-orgs protection). Same one-off auth pattern as its siblings. The server enforces, and `vl` does not pre-check, the last-`ORG_ADMIN` and owner protections that also apply to `removeMember` — a `409` here can mean either "this would leave the org with no real admin" or "this user is the org's owner, reassign ownership first."
+
 *No `vl org delete`.*
 
-### 4.8 Bootstrapping a new organization with a dedicated admin
+### 4.8 Bootstrapping a new organization with a dedicated admin and its event-encryption key
 
-The common real-world case — standing up a brand-new org (e.g. `anchorpoint`) with its own dedicated admin account (e.g. `anchorpoint_admin`), rather than one that already exists as a user — can't be done in a single `vl org add` call (§4.1's `--initial-admin` requires an existing user, and a user can't be created referencing an org that doesn't exist yet). It's a three-command sequence instead:
+The common real-world case — standing up a brand-new org (e.g. `anchorpoint`) with its own dedicated admin account (e.g. `anchorpoint_admin`) and its event-encryption key, rather than an admin that already exists as a user — can't be done in a single `vl org add` call (§4.1's `--initial-admin` requires an existing user, and a user can't be created referencing an org that doesn't exist yet). It's a four-command sequence instead:
 
 ```
 # 1. Create the org, authenticating as a PLATFORM_ADMIN (e.g. admin).
@@ -94,11 +100,16 @@ vl user add <First> <Last> --org anchorpoint --role ORG_ADMIN --phone <number> -
 
 # 3. Hand ownership to the new admin, correcting the temporary state from step 1.
 vl org update anchorpoint --owner <new user's server id> --auth-user admin
+
+# 4. Create the org's event-encryption key -- the last step, per vl-org-keys-spec.md.
+#    send_events.sh and the node fetch it via the API directly; vl's role ends at creation.
+vl org keys create anchorpoint --as <the new admin's identity, or admin>
 ```
 
-Step 2's `--phone` flag depends on `vl-identity-user-spec.md`'s `vl user add`/`vl user update` being extended to accept it — noted as a required follow-up there (see that document's phone-number addendum), not yet built as of this document.
+Step 2's `--phone` flag depends on `vl-identity-user-spec.md`'s `vl user add`/`vl user update` being extended to accept it — noted as a required follow-up there (see that document's phone-number addendum), not yet built as of this document. Step 4 is specced in full in `vl-org-keys-spec.md`, a separate document — note it uses the real `--as` identity resolution (Phase 3), not the `--auth-user`/`--auth-password` one-off flow steps 1–3 use, since that document was written after Phase 3 existed and had no reason to repeat the interim pattern.
 
 This mirrors exactly how V20 (the seed-data migration) handles the pre-existing `globo`/`globo_admin` pair — two independently-created records, deliberately stitched together — just performed through the live API instead of a migration, for any org created going forward.
+
 
 ---
 

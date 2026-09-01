@@ -106,3 +106,14 @@ def test_login_bad_credentials_raises() -> None:
     )
     with pytest.raises(api.ApiError):
         api.login(BASE, "alice", "wrong")
+
+
+@respx.mock
+def test_service_account_token() -> None:
+    route = respx.post(f"{BASE}/auth/service-account/token").mock(
+        return_value=httpx.Response(200, json={"accessToken": "sa-jwt", "expiresIn": 600})
+    )
+    result = api.service_account_token(BASE, "client-1", "sekret")
+    assert result.access_token == "sa-jwt"
+    assert result.expires_in == 600
+    assert route.calls.last.request.content == b'{"clientId":"client-1","clientSecret":"sekret"}'

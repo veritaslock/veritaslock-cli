@@ -64,8 +64,12 @@ vl org add globo --display-name "Globo Corp" --auth-user alice
 vl org update globo --no-active --auth-user alice
 vl org members add globo --user-id <server-user-id> --role ORG_ADMIN --auth-user alice
 vl org members list globo --auth-user alice
+vl org members set-role globo <server-user-id> --role KEY_READER --auth-user alice
 vl org members remove globo --user-id <server-user-id> --auth-user alice
 ```
+
+Roles: `ORG_ADMIN | USER | PLATFORM_ADMIN | KEY_READER`. `set-role` changes a
+member's role in place (`add` rejects an already-member).
 
 Write commands (and `members list`) authenticate with a one-off
 `POST /auth/user/login` — pass `--auth-user`, and `--auth-password` is prompted
@@ -98,10 +102,17 @@ does it in one call instead.
 vl identity import --username admin --org globo --role ORG_ADMIN --label root
 vl identity use root                 # make it the default for this environment
 
+# Adopt an existing service account (e.g. SYSTEM) — replaces the VL_SYSTEM_* env vars
+vl identity import --kind SERVICE_ACCOUNT --client-id <id> --secret <secret> \
+  --role SYSTEM --org veritaslock --label system
+
 vl identity login alice             # tier-2: authenticate as yourself, no stored password
 vl identity list
 vl identity show root --reveal-secret
 ```
+
+Service-account identities have no tier-2 mode — the client secret is always
+stored, and `vl` acquires their tokens via `/auth/service-account/token` silently.
 
 Command identity resolution, most to least specific: `--as <label>`, then
 `VL_IDENTITY`, then the environment's default identity (`vl identity use`).
@@ -123,6 +134,23 @@ hash. `--email` defaults to a `first.last@example.com` placeholder; set a real o
 (and `--phone`) for any account that may later become an org's owner — the server
 requires both before `vl org update --owner` will accept it.
 
+## Service accounts
+
+```bash
+vl service-account add "Ingest Bot" --role ACCOUNT --org globo   # prints the secret once
+vl service-account show ingestbot --reveal-secret
+vl service-account list --role NODE
+vl service-account update ingestbot --status SUSPENDED
+vl service-account rotate-keys ingestbot                         # new Ed25519 keypair
+vl service-account get-assertion ingestbot                       # signed JWT for hand-off
+vl service-account delete ingestbot
+```
+
+Each account gets a symmetric client secret (for `vl`'s own token acquisition)
+and an Ed25519 keypair, written to `<store dir>/keys/<id>/` (`private.key` 600,
+`public.key` 644). `get-assertion` prints an EdDSA JWT (300 s) for use elsewhere,
+e.g. node-side authentication — it isn't part of `vl`'s internal auth flow.
+
 ## Events (stubbed)
 
 ```bash
@@ -135,17 +163,19 @@ vl events send --file ./payload.json --org acme --count 5
 src/vl/
 ├── app.py            root Typer app; mounts noun sub-apps
 ├── commands/         one module per noun group
-│   ├── env.py        vl env add | list | show | use | update | delete
-│   ├── identity.py   vl identity list | show | use | import | login
-│   ├── org.py        vl org add | show | list | update | members ...
-│   ├── user.py       vl user add | show | list | update | delete
-│   └── events.py     vl events send
+│   ├── env.py             vl env add | list | show | use | update | delete
+│   ├── identity.py        vl identity list | show | use | import | login
+│   ├── org.py             vl org add | show | list | update | members ...
+│   ├── service_account.py vl service-account add | show | list | update | ...
+│   ├── user.py            vl user add | show | list | update | delete
+│   └── events.py          vl events send
 └── lib/              shared helpers used across commands
     ├── config.py     env-var config loading (legacy fallback)
     ├── store.py      local SQLite store (environments, orgs, identities, tokens)
     ├── api.py        httpx client for the IdP API + problem+json errors
     ├── auth.py       token acquisition / caching for authed commands
     ├── passwords.py  client-side password generation + bcrypt hashing
+    ├── keys.py       Ed25519 keygen, key-file storage, assertion signing
     ├── roles.py      shared role enums
     └── output.py     table/json output rendering
 ```

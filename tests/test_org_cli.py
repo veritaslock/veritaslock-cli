@@ -203,6 +203,79 @@ def test_members_add_retrofit_upserts_local_membership() -> None:
 
 
 @respx.mock
+def test_members_add_accepts_key_reader_role() -> None:
+    respx.post(f"{IDP}/auth/user/login").mock(return_value=LOGIN_OK)
+    respx.get(f"{IDP}/v1/organizations", params={"name": "globo"}).mock(
+        return_value=httpx.Response(200, json=ORG_DTO)
+    )
+    add = respx.post(f"{IDP}/v1/organizations/org-1/members").mock(
+        return_value=httpx.Response(204)
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "org", "members", "add", "globo",
+            "--user-id", "u-9", "--role", "KEY_READER",
+            "--auth-user", "alice", "--auth-password", "pw",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert b'"role":"KEY_READER"' in add.calls.last.request.content
+
+
+@respx.mock
+def test_members_set_role_patches_and_syncs_local() -> None:
+    ident = store.add_identity("local", "USER", "u-9", "jdoe", "jdoe")
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    store.upsert_org_membership(ident.id, "local", "globo", "USER")
+    respx.post(f"{IDP}/auth/user/login").mock(return_value=LOGIN_OK)
+    respx.get(f"{IDP}/v1/organizations", params={"name": "globo"}).mock(
+        return_value=httpx.Response(200, json=ORG_DTO)
+    )
+    patch = respx.patch(f"{IDP}/v1/organizations/org-1/members/u-9").mock(
+        return_value=httpx.Response(200, json={"orgId": "org-1", "userId": "u-9", "role": "ORG_ADMIN"})
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "org", "members", "set-role", "globo", "u-9", "--role", "ORG_ADMIN",
+            "--auth-user", "alice", "--auth-password", "pw",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert b'"role":"ORG_ADMIN"' in patch.calls.last.request.content
+    assert store.list_org_memberships(ident.id)[0].role == "ORG_ADMIN"
+
+
+@respx.mock
+def test_members_set_role_surfaces_last_admin_409() -> None:
+    respx.post(f"{IDP}/auth/user/login").mock(return_value=LOGIN_OK)
+    respx.get(f"{IDP}/v1/organizations", params={"name": "globo"}).mock(
+        return_value=httpx.Response(200, json=ORG_DTO)
+    )
+    respx.patch(f"{IDP}/v1/organizations/org-1/members/u-9").mock(
+        return_value=httpx.Response(
+            409, json={"detail": "Would leave the organization with no admin.", "errorCode": "CONFLICT"}
+        )
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "org", "members", "set-role", "globo", "u-9", "--role", "USER",
+            "--auth-user", "alice", "--auth-password", "pw",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "no admin" in result.stdout
+
+
+@respx.mock
 def test_members_add_no_local_identity_is_not_an_error() -> None:
     respx.post(f"{IDP}/auth/user/login").mock(return_value=LOGIN_OK)
     respx.get(f"{IDP}/v1/organizations", params={"name": "globo"}).mock(

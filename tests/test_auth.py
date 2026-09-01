@@ -88,6 +88,31 @@ def test_authed_call_retries_once_on_401(isolated_store: Path) -> None:
 
 
 @respx.mock
+def test_service_account_identity_uses_symmetric_token(isolated_store: Path) -> None:
+    store.ensure_local_environment_seeded()
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    ident = store.add_identity("local", "SERVICE_ACCOUNT", "sa-1", "sa-1", "sys")
+    store.set_service_account_credential(ident.id, "local", "globo", "shh", key_version=1)
+
+    route = respx.post(f"{IDP}/auth/service-account/token").mock(
+        return_value=httpx.Response(200, json={"accessToken": "sa-jwt", "expiresIn": 600})
+    )
+
+    # allow_prompt is irrelevant for this kind — no tier-2 path.
+    assert auth.get_token(ident, IDP, allow_prompt=False) == "sa-jwt"
+    assert route.calls.last.request.content == b'{"clientId":"sa-1","clientSecret":"shh"}'
+    assert store.get_cached_token(ident.id).token == "sa-jwt"
+
+
+@respx.mock
+def test_service_account_identity_missing_credential_errors(isolated_store: Path) -> None:
+    store.ensure_local_environment_seeded()
+    ident = store.add_identity("local", "SERVICE_ACCOUNT", "sa-1", "sa-1", "sys")
+    with pytest.raises(auth.AuthError, match="client secret"):
+        auth.get_token(ident, IDP, allow_prompt=False)
+
+
+@respx.mock
 def test_authed_call_propagates_non_401(isolated_store: Path) -> None:
     ident = _identity(tier1_password="pw")
     now = datetime.now(timezone.utc)

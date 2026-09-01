@@ -11,13 +11,14 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Annotated
 
 import typer
 
 from vl.lib import api, store
 from vl.lib.output import console, render
-from vl.lib.roles import OrgRole
+from vl.lib.roles import OrgRole, ServiceAccountRole
 
 app = typer.Typer(
     help="Manage the identities vl authenticates as.", no_args_is_help=True
@@ -49,6 +50,12 @@ def _secret_cell(cred: store.UserCredential | None, reveal: bool) -> str:
     return cred.password_plaintext if reveal else "********"
 
 
+def _sa_secret_cell(cred: store.ServiceAccountCredential | None, reveal: bool) -> str:
+    if cred is None:
+        return "(not stored)"
+    return cred.client_secret_plaintext if reveal else "********"
+
+
 @app.command("list")
 def list_(env: EnvOption = None) -> None:
     """List stored identities for an environment."""
@@ -57,17 +64,26 @@ def list_(env: EnvOption = None) -> None:
         identities = store.list_identities(environment.name)
         rows = []
         for identity in identities:
-            cred = store.get_user_credential(identity.id)
-            memberships = store.list_org_memberships(identity.id)
+            if identity.kind == "SERVICE_ACCOUNT":
+                sa = store.get_service_account_credential(identity.id)
+                orgs = sa.org_name if sa is not None else "-"
+                secret = "stored"
+            else:
+                cred = store.get_user_credential(identity.id)
+                memberships = store.list_org_memberships(identity.id)
+                orgs = ", ".join(f"{m.org_name}:{m.role}" for m in memberships) or "-"
+                secret = (
+                    "stored"
+                    if cred is not None and cred.password_plaintext is not None
+                    else "no"
+                )
             rows.append(
                 {
                     "label": f"{identity.label} *" if identity.is_default else identity.label,
                     "kind": identity.kind,
                     "principal": identity.principal_name,
-                    "orgs": ", ".join(f"{m.org_name}:{m.role}" for m in memberships) or "-",
-                    "password": "stored"
-                    if cred is not None and cred.password_plaintext is not None
-                    else "no",
+                    "orgs": orgs,
+                    "secret": secret,
                 }
             )
     render(rows, title=f"Identities ({environment.name})")
@@ -85,22 +101,30 @@ def show(
     with _report_errors():
         environment = store.get_environment(env)
         identity = store.get_identity(environment.name, label)
-        cred = store.get_user_credential(identity.id)
-        memberships = store.list_org_memberships(identity.id)
-
-    render(
-        {
+        row: dict[str, object] = {
             "label": identity.label,
             "kind": identity.kind,
             "principal_name": identity.principal_name,
             "server_id": identity.server_id,
             "environment": identity.environment_name,
             "is_default": "yes" if identity.is_default else "no",
-            "password": _secret_cell(cred, reveal_secret),
             "created_at": identity.created_at,
-        },
-        title=f"Identity: {label}",
-    )
+        }
+        memberships: list[store.OrgMembership] = []
+        if identity.kind == "SERVICE_ACCOUNT":
+            sa = store.get_service_account_credential(identity.id)
+            row["org"] = sa.org_name if sa else "-"
+            row["secret"] = _sa_secret_cell(sa, reveal_secret)
+            row["private_key_path"] = (sa.private_key_path if sa else None) or "(none)"
+            row["public_key_path"] = (sa.public_key_path if sa else None) or "(none)"
+            row["key_version"] = (sa.key_version if sa else None) or "-"
+        else:
+            row["password"] = _secret_cell(
+                store.get_user_credential(identity.id), reveal_secret
+            )
+            memberships = store.list_org_memberships(identity.id)
+
+    render(row, title=f"Identity: {label}")
     if memberships:
         render(
             [
@@ -126,66 +150,166 @@ def use(
     )
 
 
+def _cache_org(environment_name: str, org_dto: dict[str, object]) -> str:
+    store.upsert_organization(
+        environment_name,
+        str(org_dto["name"]),
+        str(org_dto["id"]),
+        str(org_dto["displayName"]),
+        bool(org_dto["active"]),
+    )
+    return str(org_dto["name"])
+
+
+def _validated_role(value: str, choices: type[Enum]) -> str:
+    try:
+        return choices(value.upper()).value  # type: ignore[no-any-return]
+    except ValueError:
+        allowed = ", ".join(c.value for c in choices)
+        raise typer.BadParameter(f"{value!r} — allowed: {allowed}", param_hint="--role")
+
+
 @app.command("import")
 def import_(
-    username: Annotated[str, typer.Option("--username", help="Server-side username.")],
-    org: Annotated[str, typer.Option("--org", help="Organization name for the membership.")],
-    role: Annotated[OrgRole, typer.Option("--role", help="Asserted org role (not verified).")],
     label: Annotated[str, typer.Option("--label", help="Local label for this identity.")],
+    org: Annotated[str, typer.Option("--org", help="Organization name.")],
+    role: Annotated[
+        str,
+        typer.Option(
+            "--role",
+            help="USER: ORG_ADMIN|USER|PLATFORM_ADMIN. "
+            "SERVICE_ACCOUNT: ACCOUNT|NODE|SYSTEM|INGEST_CLIENT.",
+        ),
+    ],
     kind: Annotated[
         IdentityKind, typer.Option("--kind", help="Identity kind.")
     ] = IdentityKind.USER,
+    username: Annotated[
+        str | None, typer.Option("--username", help="USER kind: server-side username.")
+    ] = None,
     password: Annotated[
         str | None,
         typer.Option(
             "--password",
-            help=(
-                "Password (prompted if omitted). Passing it here exposes it in "
-                "shell history / process list — prefer the prompt."
-            ),
+            help="USER kind: password (prompted if omitted). Passing it here "
+            "exposes it in shell history / process list — prefer the prompt.",
+        ),
+    ] = None,
+    client_id: Annotated[
+        str | None,
+        typer.Option("--client-id", help="SERVICE_ACCOUNT kind: the client id."),
+    ] = None,
+    secret: Annotated[
+        str | None,
+        typer.Option("--secret", help="SERVICE_ACCOUNT kind: the client secret."),
+    ] = None,
+    private_key_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--private-key-path", help="SERVICE_ACCOUNT kind: existing private key file."
+        ),
+    ] = None,
+    public_key_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--public-key-path", help="SERVICE_ACCOUNT kind: existing public key file."
         ),
     ] = None,
     env: EnvOption = None,
 ) -> None:
-    """Adopt an existing server-side identity as a reusable tier-1 identity."""
-    if kind is not IdentityKind.USER:
-        console.print(
-            "[red]Error:[/red] --kind SERVICE_ACCOUNT is not supported yet "
-            "(arrives in Phase 4)."
+    """Adopt an existing server-side identity into the local store."""
+    if kind is IdentityKind.USER:
+        _import_user(label, org, role, username, password, env)
+    else:
+        _import_service_account(
+            label, org, role, client_id, secret, private_key_path, public_key_path, env
         )
-        raise typer.Exit(1)
+
+
+def _import_user(
+    label: str,
+    org: str,
+    role: str,
+    username: str | None,
+    password: str | None,
+    env: str | None,
+) -> None:
+    if username is None:
+        raise typer.BadParameter("--username is required for --kind USER")
+    org_role = _validated_role(role, OrgRole)
 
     with _report_errors():
         environment = store.get_environment(env)
         if password is None:
             password = typer.prompt("Password", hide_input=True)
 
-        # 1. Resolve the org (unauthenticated) and cache it.
         with api.IdpClient(environment.idp_base_url) as client:
             org_dto = client.get("/v1/organizations", params={"name": org})
-        store.upsert_organization(
-            environment.name,
-            org_dto["name"],
-            org_dto["id"],
-            org_dto["displayName"],
-            bool(org_dto["active"]),
-        )
+        org_name = _cache_org(environment.name, org_dto)
 
-        # 3. Validate the credential before storing anything.
+        # Validate the credential before storing anything.
         result = api.login(environment.idp_base_url, username, password)
         server_id = str(api.decode_jwt_payload(result.access_token).get("sub", ""))
 
-        # 4. Persist: identity + stored credential (tier 1) + asserted membership.
         identity = store.add_identity(
             environment.name, "USER", server_id, username, label
         )
         store.set_user_credential(identity.id, password)
-        store.upsert_org_membership(
-            identity.id, environment.name, str(org_dto["name"]), role.value
-        )
+        store.upsert_org_membership(identity.id, environment.name, org_name, org_role)
 
     console.print(
         f"Imported [bold]{label}[/bold] (tier 1 — password stored). "
+        f"Run `vl identity use {label}` to make it the default."
+    )
+
+
+def _import_service_account(
+    label: str,
+    org: str,
+    role: str,
+    client_id: str | None,
+    secret: str | None,
+    private_key_path: Path | None,
+    public_key_path: Path | None,
+    env: str | None,
+) -> None:
+    if client_id is None or secret is None:
+        raise typer.BadParameter(
+            "--client-id and --secret are required for --kind SERVICE_ACCOUNT"
+        )
+    _validated_role(role, ServiceAccountRole)  # validated, not stored (no OrgRole)
+
+    with _report_errors():
+        environment = store.get_environment(env)
+
+        with api.IdpClient(environment.idp_base_url) as client:
+            org_dto = client.get("/v1/organizations", params={"name": org})
+        org_name = _cache_org(environment.name, org_dto)
+
+        # Validate the secret before storing anything.
+        token = api.service_account_token(
+            environment.idp_base_url, client_id, secret
+        ).access_token
+        # Read the account's actual current keyVersion — an adopted account may
+        # already have been rotated server-side.
+        with api.IdpClient(environment.idp_base_url, token=token) as client:
+            sa_dto = client.get(f"/v1/service-accounts/{client_id}")
+
+        identity = store.add_identity(
+            environment.name, "SERVICE_ACCOUNT", client_id, client_id, label
+        )
+        store.set_service_account_credential(
+            identity.id,
+            environment.name,
+            org_name,
+            secret,
+            public_key_path=str(public_key_path) if public_key_path else None,
+            private_key_path=str(private_key_path) if private_key_path else None,
+            key_version=sa_dto.get("keyVersion"),
+        )
+
+    console.print(
+        f"Imported [bold]{label}[/bold] (SERVICE_ACCOUNT). "
         f"Run `vl identity use {label}` to make it the default."
     )
 

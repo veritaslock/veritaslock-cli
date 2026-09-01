@@ -297,6 +297,38 @@ def members_list(
     )
 
 
+@members_app.command("set-role")
+def members_set_role(
+    org: Annotated[str, typer.Argument(help="Organization name.")],
+    user_id: Annotated[str, typer.Argument(help="Server-side user id.")],
+    role: Annotated[OrgRole, typer.Option("--role", help="New role for the member.")],
+    auth_user: AuthUserOption,
+    auth_password: AuthPasswordOption,
+    env: EnvOption = None,
+) -> None:
+    """Change an existing member's role in place."""
+    with _report_errors():
+        environment = store.get_environment(env)
+        token = api.login(environment.idp_base_url, auth_user, auth_password).access_token
+        with api.IdpClient(environment.idp_base_url, token=token) as client:
+            org_dto = _resolve_org(client, environment.name, org)
+            client.patch(
+                f"/v1/organizations/{org_dto['id']}/members/{user_id}",
+                json={"role": role.value},
+            )
+        # Same local-cache step as `members add` (Phase 3 §9.6): keep a known
+        # identity's cached org_membership row in step with the server.
+        local = store.get_identity_by_server_id(environment.name, user_id, "USER")
+        if local is not None:
+            store.upsert_org_membership(
+                local.id, environment.name, str(org_dto["name"]), role.value
+            )
+    console.print(
+        f"Set user [bold]{user_id}[/bold]'s role in [bold]{org}[/bold] to "
+        f"{role.value}."
+    )
+
+
 @members_app.command("remove")
 def members_remove(
     org: Annotated[str, typer.Argument(help="Organization name.")],

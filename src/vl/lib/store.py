@@ -7,6 +7,7 @@ and bumping ``SCHEMA_VERSION`` (§8 of the ``vl env`` spec):
 * v2 — ``organization`` cache table + ``vl org`` (Phase 2).
 * v3 — ``identity`` / ``user_credential`` / ``org_membership`` / ``token_cache``
   + ``vl identity`` and ``vl user`` (Phase 3).
+* v4 — ``service_account_credential`` + ``vl service-account`` (Phase 4).
 
 On open, every migration between the store's ``PRAGMA user_version`` and
 ``SCHEMA_VERSION`` is applied in order; a store from a *newer* `vl` is rejected
@@ -26,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Treat a cached token as expired this many seconds before its real expiry, to
 # avoid handing a command a token that dies mid-request.
@@ -102,6 +103,24 @@ _MIGRATIONS: tuple[str, ...] = (
         token        TEXT NOT NULL,
         issued_at    TEXT NOT NULL,
         expires_at   TEXT NOT NULL
+    );
+    """,
+    # 3 -> 4: SERVICE_ACCOUNT credential extension (Phase 4). environment_name is
+    # denormalised from the parent identity so the composite FK to organization
+    # works, same pattern as org_membership.
+    """
+    CREATE TABLE IF NOT EXISTS service_account_credential (
+        identity_id              INTEGER PRIMARY KEY
+                                 REFERENCES identity(id) ON DELETE CASCADE,
+        environment_name         TEXT NOT NULL,
+        org_name                 TEXT NOT NULL,
+        client_secret_plaintext  TEXT NOT NULL,
+        public_key_path          TEXT,
+        private_key_path         TEXT,
+        key_version              INTEGER,
+        FOREIGN KEY (environment_name, org_name)
+            REFERENCES organization(environment_name, name)
+            ON UPDATE CASCADE ON DELETE RESTRICT
     );
     """,
 )
@@ -224,6 +243,19 @@ class Token:
     expires_at: str
 
 
+@dataclass(frozen=True)
+class ServiceAccountCredential:
+    """SERVICE_ACCOUNT extension of an identity. ``client_secret_plaintext`` is always set."""
+
+    identity_id: int
+    environment_name: str
+    org_name: str
+    client_secret_plaintext: str
+    public_key_path: str | None
+    private_key_path: str | None
+    key_version: int | None
+
+
 # --------------------------------------------------------------------------- #
 # Connection / schema
 # --------------------------------------------------------------------------- #
@@ -232,6 +264,11 @@ class Token:
 def _store_path() -> Path:
     override = os.environ.get("VL_STORE_PATH")
     return Path(override).expanduser() if override else DEFAULT_STORE_PATH
+
+
+def keys_root() -> Path:
+    """Directory holding per-service-account key material, beside ``store.db``."""
+    return _store_path().parent / "keys"
 
 
 def _now() -> str:
@@ -832,5 +869,92 @@ def clear_cached_token(identity_id: int) -> None:
     with _store() as conn:
         conn.execute(
             "DELETE FROM token_cache WHERE identity_id = ?", (identity_id,)
+        )
+        conn.commit()
+
+
+# --------------------------------------------------------------------------- #
+# Public API — service-account credentials (Phase 4)
+# --------------------------------------------------------------------------- #
+
+
+def _row_to_sa_credential(row: sqlite3.Row) -> ServiceAccountCredential:
+    return ServiceAccountCredential(
+        identity_id=row["identity_id"],
+        environment_name=row["environment_name"],
+        org_name=row["org_name"],
+        client_secret_plaintext=row["client_secret_plaintext"],
+        public_key_path=row["public_key_path"],
+        private_key_path=row["private_key_path"],
+        key_version=row["key_version"],
+    )
+
+
+def set_service_account_credential(
+    identity_id: int,
+    environment: str,
+    org_name: str,
+    client_secret_plaintext: str,
+    *,
+    public_key_path: str | None = None,
+    private_key_path: str | None = None,
+    key_version: int | None = None,
+) -> None:
+    """Insert or replace a SERVICE_ACCOUNT identity's credential row."""
+    with _store() as conn:
+        conn.execute(
+            """
+            INSERT INTO service_account_credential
+                (identity_id, environment_name, org_name, client_secret_plaintext,
+                 public_key_path, private_key_path, key_version)
+            VALUES (:identity_id, :environment_name, :org_name, :secret,
+                    :public_key_path, :private_key_path, :key_version)
+            ON CONFLICT (identity_id) DO UPDATE SET
+                environment_name        = excluded.environment_name,
+                org_name                = excluded.org_name,
+                client_secret_plaintext = excluded.client_secret_plaintext,
+                public_key_path         = excluded.public_key_path,
+                private_key_path        = excluded.private_key_path,
+                key_version             = excluded.key_version
+            """,
+            {
+                "identity_id": identity_id,
+                "environment_name": environment,
+                "org_name": org_name,
+                "secret": client_secret_plaintext,
+                "public_key_path": public_key_path,
+                "private_key_path": private_key_path,
+                "key_version": key_version,
+            },
+        )
+        conn.commit()
+
+
+def get_service_account_credential(
+    identity_id: int,
+) -> ServiceAccountCredential | None:
+    with _store() as conn:
+        row = conn.execute(
+            "SELECT * FROM service_account_credential WHERE identity_id = ?",
+            (identity_id,),
+        ).fetchone()
+        return _row_to_sa_credential(row) if row is not None else None
+
+
+def update_service_account_keys(
+    identity_id: int,
+    public_key_path: str,
+    private_key_path: str,
+    key_version: int,
+) -> None:
+    """Point a SERVICE_ACCOUNT credential at freshly rotated key material."""
+    with _store() as conn:
+        conn.execute(
+            """
+            UPDATE service_account_credential
+               SET public_key_path = ?, private_key_path = ?, key_version = ?
+             WHERE identity_id = ?
+            """,
+            (public_key_path, private_key_path, key_version, identity_id),
         )
         conn.commit()

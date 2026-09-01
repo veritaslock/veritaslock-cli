@@ -185,10 +185,38 @@ def login(
             raise ApiError(0, f"could not reach {base_url}: {exc}") from exc
 
     _raise_for_problem(resp)
+    return _token_result(resp)
+
+
+def service_account_token(
+    base_url: str,
+    client_id: str,
+    client_secret: str,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    transport: httpx.BaseTransport | None = None,
+) -> TokenResult:
+    """Exchange a client id/secret for a token via ``POST /auth/service-account/token``."""
+    with httpx.Client(
+        base_url=base_url.rstrip("/"), timeout=timeout, transport=transport
+    ) as client:
+        try:
+            resp = client.post(
+                "/auth/service-account/token",
+                json={"clientId": client_id, "clientSecret": client_secret},
+            )
+        except httpx.RequestError as exc:
+            raise ApiError(0, f"could not reach {base_url}: {exc}") from exc
+
+    _raise_for_problem(resp)
+    return _token_result(resp)
+
+
+def _token_result(resp: httpx.Response) -> TokenResult:
     body = resp.json()
     token = body.get("accessToken")
     if not token:
-        raise ApiError(resp.status_code, "login response did not include a token")
+        raise ApiError(resp.status_code, "auth response did not include a token")
     return TokenResult(str(token), int(body.get("expiresIn") or 0))
 
 

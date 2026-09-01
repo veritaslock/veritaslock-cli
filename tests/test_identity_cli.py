@@ -69,18 +69,89 @@ def test_import_bad_credentials_stores_nothing(monkeypatch) -> None:
     assert store.list_identities("local") == []
 
 
+SA_DTO = {"id": "sa-1", "displayName": "sys", "role": "SYSTEM", "status": "ACTIVE", "keyVersion": 3}
+
+
 @respx.mock
-def test_import_rejects_service_account_kind() -> None:
+def test_import_service_account_validates_then_persists() -> None:
+    respx.get(f"{IDP}/v1/organizations", params={"name": "globo"}).mock(
+        return_value=httpx.Response(200, json=ORG_DTO)
+    )
+    token = respx.post(f"{IDP}/auth/service-account/token").mock(
+        return_value=httpx.Response(200, json={"accessToken": "sa-jwt", "expiresIn": 900})
+    )
+    respx.get(f"{IDP}/v1/service-accounts/sa-1").mock(
+        return_value=httpx.Response(200, json=SA_DTO)
+    )
+
     result = runner.invoke(
         app,
         [
             "identity", "import", "--kind", "SERVICE_ACCOUNT",
-            "--username", "svc", "--org", "globo",
-            "--role", "USER", "--label", "svc",
+            "--client-id", "sa-1", "--secret", "shh",
+            "--role", "SYSTEM", "--org", "globo", "--label", "sys",
         ],
     )
+
+    assert result.exit_code == 0, result.stdout
+    assert token.called
+    ident = store.get_identity("local", "sys")
+    assert ident.kind == "SERVICE_ACCOUNT"
+    assert ident.server_id == "sa-1"
+    cred = store.get_service_account_credential(ident.id)
+    assert cred is not None
+    assert cred.client_secret_plaintext == "shh"
+    assert cred.org_name == "globo"
+    assert cred.key_version == 3  # read from the server, not assumed 1
+    assert store.list_org_memberships(ident.id) == []  # no org_membership for SA
+
+
+@respx.mock
+def test_import_service_account_bad_secret_stores_nothing() -> None:
+    respx.get(f"{IDP}/v1/organizations", params={"name": "globo"}).mock(
+        return_value=httpx.Response(200, json=ORG_DTO)
+    )
+    respx.post(f"{IDP}/auth/service-account/token").mock(
+        return_value=httpx.Response(401, json={"detail": "Bad secret.", "errorCode": "UNAUTHORIZED"})
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "identity", "import", "--kind", "SERVICE_ACCOUNT",
+            "--client-id", "sa-1", "--secret", "wrong",
+            "--role", "SYSTEM", "--org", "globo", "--label", "sys",
+        ],
+    )
+
     assert result.exit_code == 1
-    assert "Phase 4" in result.stdout
+    assert "Bad secret" in result.stdout
+    assert store.list_identities("local") == []
+
+
+def test_import_service_account_missing_flags_errors() -> None:
+    result = runner.invoke(
+        app,
+        [
+            "identity", "import", "--kind", "SERVICE_ACCOUNT",
+            "--role", "SYSTEM", "--org", "globo", "--label", "sys",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "client-id" in result.output.lower()
+
+
+def test_import_wrong_role_enum_for_kind_errors() -> None:
+    result = runner.invoke(
+        app,
+        [
+            "identity", "import", "--kind", "SERVICE_ACCOUNT",
+            "--client-id", "sa-1", "--secret", "shh",
+            "--role", "ORG_ADMIN", "--org", "globo", "--label", "sys",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "ACCOUNT" in result.output  # lists the valid SA roles
 
 
 @respx.mock
