@@ -17,7 +17,7 @@ IDP = "http://idp.test"
 def _identity(label: str = "alice", tier1_password: str | None = "pw") -> store.Identity:
     store.ensure_local_environment_seeded()
     ident = store.add_identity("local", "USER", "u-1", "alice", label)
-    store.set_user_credential(ident.id, tier1_password)
+    store.set_user_acct(ident.id, tier1_password)
     return ident
 
 
@@ -92,7 +92,7 @@ def test_service_account_identity_uses_symmetric_token(isolated_store: Path) -> 
     store.ensure_local_environment_seeded()
     store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
     ident = store.add_identity("local", "SERVICE_ACCOUNT", "sa-1", "sa-1", "sys")
-    store.set_service_account_credential(ident.id, "local", "globo", "shh", key_version=1)
+    store.set_svc_acct(ident.id, "local", "globo", "shh", key_version=1)
 
     route = respx.post(f"{IDP}/auth/service-account/token").mock(
         return_value=httpx.Response(200, json={"accessToken": "sa-jwt", "expiresIn": 600})

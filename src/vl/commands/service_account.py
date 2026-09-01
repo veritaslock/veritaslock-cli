@@ -102,7 +102,7 @@ def _provision_public_key(
     raise last_error
 
 
-def _sa_row(dto: dict[str, Any], cred: store.ServiceAccountCredential | None) -> dict[str, Any]:
+def _sa_row(dto: dict[str, Any], cred: store.SvcAcct | None) -> dict[str, Any]:
     return {
         "id": dto["id"],
         "display_name": dto.get("displayName", ""),
@@ -186,7 +186,7 @@ def add(
         identity = store.add_identity(
             environment.name, "SERVICE_ACCOUNT", server_id, server_id, identity_label
         )
-        store.set_service_account_credential(
+        store.set_svc_acct(
             identity.id,
             environment.name,
             org_name,
@@ -230,7 +230,7 @@ def show(
             environment.idp_base_url,
             lambda c: c.get(f"/v1/service-accounts/{identity.server_id}"),
         )
-        cred = store.get_service_account_credential(identity.id)
+        cred = store.get_svc_acct(identity.id)
 
     if cred is None:
         client_secret = "(not stored)"
@@ -358,7 +358,7 @@ def update(
             ),
         )
 
-    render(_sa_row(dto, store.get_service_account_credential(identity.id)), title="Service account updated")
+    render(_sa_row(dto, store.get_svc_acct(identity.id)), title="Service account updated")
 
 
 @app.command("rotate-keys")
@@ -371,7 +371,7 @@ def rotate_keys(
     with _report_errors():
         environment = store.get_environment(env)
         identity = _local_sa(environment.name, label)
-        cred = store.get_service_account_credential(identity.id)
+        cred = store.get_svc_acct(identity.id)
         if cred is None:
             raise ServiceAccountError(f"no local credential recorded for {label!r}.")
         caller = store.resolve_identity(environment.name, as_)
@@ -411,7 +411,7 @@ def rotate_keys(
             final_private, final_public = keys.install_keypair(
                 new_private, new_public, key_dir
             )
-            store.update_service_account_keys(
+            store.update_svc_acct_keys(
                 identity.id, str(final_public), str(final_private), new_version
             )
         finally:
@@ -459,7 +459,7 @@ def get_assertion(
     with _report_errors():
         environment = store.get_environment(env)
         identity = _local_sa(environment.name, label)
-        cred = store.get_service_account_credential(identity.id)
+        cred = store.get_svc_acct(identity.id)
         if cred is None or cred.private_key_path is None:
             raise ServiceAccountError(
                 f"no private key path recorded for {label!r} — re-import it with "

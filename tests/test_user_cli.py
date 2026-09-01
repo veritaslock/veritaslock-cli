@@ -24,7 +24,7 @@ def _caller(label: str = "root", *, kind: str = "USER") -> store.Identity:
     store.ensure_local_environment_seeded()
     ident = store.add_identity("local", kind, "u-root", "root", label)
     if kind == "USER":
-        store.set_user_credential(ident.id, "pw")
+        store.set_user_acct(ident.id, "pw")
     store.set_default_identity("local", label)
     now = datetime.now(timezone.utc)
     store.set_cached_token(ident.id, "caller-jwt", now, now + timedelta(hours=1))
@@ -59,7 +59,7 @@ def test_add_creates_user_identity_credential_membership() -> None:
     assert "password" not in body
 
     ident = store.get_identity("local", "jdoe")
-    cred = store.get_user_credential(ident.id)
+    cred = store.get_user_acct(ident.id)
     assert cred is not None and cred.password_plaintext is not None
     assert bcrypt.checkpw(
         cred.password_plaintext.encode(), body["passwordHash"].encode()
@@ -138,7 +138,7 @@ def test_show_merges_server_and_local() -> None:
     _caller()
     store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
     target = store.add_identity("local", "USER", "u-5", "jdoe", "jdoe")
-    store.set_user_credential(target.id, "local-pw")
+    store.set_user_acct(target.id, "local-pw")
     store.upsert_org_membership(target.id, "local", "globo", "USER")
     respx.get(f"{IDP}/v1/users/u-5").mock(
         return_value=httpx.Response(
@@ -175,7 +175,7 @@ def test_list_passes_filters() -> None:
 def test_update_partial_and_tier1_password_sync() -> None:
     _caller()
     target = store.add_identity("local", "USER", "u-5", "jdoe", "jdoe")
-    store.set_user_credential(target.id, "old-pw")
+    store.set_user_acct(target.id, "old-pw")
     patch = respx.patch(f"{IDP}/v1/users/u-5").mock(
         return_value=httpx.Response(200, json={"id": "u-5", "username": "jdoe", "email": "j@example.com", "displayName": "New Name", "status": "ACTIVE", "mfaEnabled": False})
     )
@@ -190,14 +190,14 @@ def test_update_partial_and_tier1_password_sync() -> None:
     assert body["displayName"] == "New Name"
     assert body["passwordHash"].startswith("$2")
     assert set(body) == {"displayName", "passwordHash"}  # partial
-    assert store.get_user_credential(target.id).password_plaintext == "new-pw"  # tier 1 synced
+    assert store.get_user_acct(target.id).password_plaintext == "new-pw"  # tier 1 synced
 
 
 @respx.mock
 def test_update_tier2_password_not_stored() -> None:
     _caller()
     target = store.add_identity("local", "USER", "u-5", "jdoe", "jdoe")
-    store.set_user_credential(target.id, None)  # tier 2
+    store.set_user_acct(target.id, None)  # tier 2
     respx.patch(f"{IDP}/v1/users/u-5").mock(
         return_value=httpx.Response(200, json={"id": "u-5", "username": "jdoe", "email": "j@example.com", "displayName": "J", "status": "ACTIVE", "mfaEnabled": False})
     )
@@ -205,7 +205,7 @@ def test_update_tier2_password_not_stored() -> None:
     result = runner.invoke(app, ["user", "update", "jdoe", "--password", "new-pw"])
 
     assert result.exit_code == 0, result.stdout
-    assert store.get_user_credential(target.id).password_plaintext is None
+    assert store.get_user_acct(target.id).password_plaintext is None
 
 
 @respx.mock

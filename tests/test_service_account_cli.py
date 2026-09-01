@@ -22,7 +22,7 @@ ORG_DTO = {"id": "org-1", "name": "globo", "displayName": "Globo", "active": Tru
 def _caller() -> None:
     store.ensure_local_environment_seeded()
     ident = store.add_identity("local", "USER", "u-root", "root", "root")
-    store.set_user_credential(ident.id, "pw")
+    store.set_user_acct(ident.id, "pw")
     store.set_default_identity("local", "root")
     now = datetime.now(timezone.utc)
     store.set_cached_token(ident.id, "caller-jwt", now, now + timedelta(hours=1))
@@ -73,7 +73,7 @@ def test_add_provisions_keypair_and_stores_locally() -> None:
 
     ident = store.get_identity("local", "ingestbot")  # slugified label
     assert ident.kind == "SERVICE_ACCOUNT"
-    cred = store.get_service_account_credential(ident.id)
+    cred = store.get_svc_acct(ident.id)
     assert cred is not None and cred.key_version == 1
     assert Path(cred.private_key_path).read_bytes().__len__() == 64
     assert store.keys_root() / "sa-1" == Path(cred.private_key_path).parent
@@ -129,7 +129,7 @@ def test_show_masks_secret_unless_revealed() -> None:
     _caller()
     ident = store.add_identity("local", "SERVICE_ACCOUNT", "sa-1", "sa-1", "bot")
     store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
-    store.set_service_account_credential(ident.id, "local", "globo", "top-secret", key_version=2)
+    store.set_svc_acct(ident.id, "local", "globo", "top-secret", key_version=2)
     respx.get(f"{IDP}/v1/service-accounts/sa-1").mock(
         return_value=httpx.Response(200, json={"id": "sa-1", "displayName": "Bot", "role": "NODE", "status": "ACTIVE", "keyVersion": 2})
     )
@@ -172,7 +172,7 @@ def test_update_partial() -> None:
     _caller()
     store.add_identity("local", "SERVICE_ACCOUNT", "sa-1", "sa-1", "bot")
     store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
-    store.set_service_account_credential(store.get_identity("local", "bot").id, "local", "globo", "s")
+    store.set_svc_acct(store.get_identity("local", "bot").id, "local", "globo", "s")
     patch = respx.patch(f"{IDP}/v1/service-accounts/sa-1").mock(
         return_value=httpx.Response(200, json={"id": "sa-1", "displayName": "Renamed", "role": "NODE", "status": "SUSPENDED", "keyVersion": 1})
     )
@@ -203,7 +203,7 @@ def test_rotate_keys_swaps_on_success() -> None:
 
     priv, _ = keylib.generate_keypair(key_dir)
     original = priv.read_bytes()
-    store.set_service_account_credential(
+    store.set_svc_acct(
         ident.id, "local", "globo", "s",
         public_key_path=str(key_dir / "public.key"),
         private_key_path=str(priv),
@@ -218,7 +218,7 @@ def test_rotate_keys_swaps_on_success() -> None:
     assert result.exit_code == 0, result.stdout
     assert json.loads(patch.calls.last.request.content)["keyVersion"] == 2
     assert priv.read_bytes() != original  # key file replaced
-    assert store.get_service_account_credential(ident.id).key_version == 2
+    assert store.get_svc_acct(ident.id).key_version == 2
 
 
 @respx.mock
@@ -230,7 +230,7 @@ def test_delete_removes_local_identity_and_keys() -> None:
 
     key_dir = store.keys_root() / "sa-1"
     keylib.generate_keypair(key_dir)
-    store.set_service_account_credential(ident.id, "local", "globo", "s")
+    store.set_svc_acct(ident.id, "local", "globo", "s")
     route = respx.delete(f"{IDP}/v1/service-accounts/sa-1").mock(
         return_value=httpx.Response(204)
     )
@@ -251,7 +251,7 @@ def test_get_assertion_signs_with_stored_key() -> None:
 
     key_dir = store.keys_root() / "sa-1"
     priv, _ = keylib.generate_keypair(key_dir)
-    store.set_service_account_credential(
+    store.set_svc_acct(
         ident.id, "local", "globo", "s", private_key_path=str(priv), key_version=1
     )
 
@@ -271,7 +271,7 @@ def test_get_assertion_errors_without_key_path() -> None:
     _caller()
     ident = store.add_identity("local", "SERVICE_ACCOUNT", "sa-1", "sa-1", "bot")
     store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
-    store.set_service_account_credential(ident.id, "local", "globo", "s")
+    store.set_svc_acct(ident.id, "local", "globo", "s")
 
     result = runner.invoke(app, ["service-account", "get-assertion", "bot"])
     assert result.exit_code == 1

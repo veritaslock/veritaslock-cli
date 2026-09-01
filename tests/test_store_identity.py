@@ -29,7 +29,7 @@ def test_v3_tables_exist(isolated_store: Path) -> None:
     store.ensure_local_environment_seeded()
     with sqlite3.connect(isolated_store) as conn:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert {"identity", "user_credential", "org_membership", "token_cache"} <= tables
+    assert {"identity", "user_acct", "org_membership", "token_cache"} <= tables
 
 
 # --------------------------------------------------------------------------- #
@@ -131,15 +131,15 @@ def test_resolve_unresolvable_raises(isolated_store: Path, monkeypatch: pytest.M
 # --------------------------------------------------------------------------- #
 
 
-def test_user_credential_tiers(isolated_store: Path) -> None:
+def test_user_acct_tiers(isolated_store: Path) -> None:
     store.ensure_local_environment_seeded()
     ident = _mk_identity()
 
-    store.set_user_credential(ident.id, "s3cret")
-    assert store.get_user_credential(ident.id).password_plaintext == "s3cret"
+    store.set_user_acct(ident.id, "s3cret")
+    assert store.get_user_acct(ident.id).password_plaintext == "s3cret"
 
-    store.set_user_credential(ident.id, None)  # tier 2
-    assert store.get_user_credential(ident.id).password_plaintext is None
+    store.set_user_acct(ident.id, None)  # tier 2
+    assert store.get_user_acct(ident.id).password_plaintext is None
 
 
 def test_org_membership_requires_cached_org(isolated_store: Path) -> None:
@@ -163,7 +163,7 @@ def test_org_membership_upsert_and_list(isolated_store: Path) -> None:
 def test_delete_identity_cascades(isolated_store: Path) -> None:
     _seed_org()
     ident = _mk_identity()
-    store.set_user_credential(ident.id, "s3cret")
+    store.set_user_acct(ident.id, "s3cret")
     store.upsert_org_membership(ident.id, "local", "globo", "USER")
     now = datetime.now(timezone.utc)
     store.set_cached_token(ident.id, "tok", now, now + timedelta(hours=1))
@@ -171,7 +171,7 @@ def test_delete_identity_cascades(isolated_store: Path) -> None:
     store.delete_identity("local", "alice")
 
     with sqlite3.connect(isolated_store) as conn:
-        for table in ("user_credential", "org_membership", "token_cache"):
+        for table in ("user_acct", "org_membership", "token_cache"):
             count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             assert count == 0, table
 

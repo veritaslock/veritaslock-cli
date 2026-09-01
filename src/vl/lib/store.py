@@ -8,6 +8,8 @@ and bumping ``SCHEMA_VERSION`` (§8 of the ``vl env`` spec):
 * v3 — ``identity`` / ``user_credential`` / ``org_membership`` / ``token_cache``
   + ``vl identity`` and ``vl user`` (Phase 3).
 * v4 — ``service_account_credential`` + ``vl service-account`` (Phase 4).
+* v5 — rename ``user_credential`` -> ``user_acct``, ``service_account_credential``
+  -> ``svc_acct`` (naming-convention cleanup, no schema change).
 
 On open, every migration between the store's ``PRAGMA user_version`` and
 ``SCHEMA_VERSION`` is applied in order; a store from a *newer* `vl` is rejected
@@ -27,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Treat a cached token as expired this many seconds before its real expiry, to
 # avoid handing a command a token that dies mid-request.
@@ -123,6 +125,13 @@ _MIGRATIONS: tuple[str, ...] = (
             ON UPDATE CASCADE ON DELETE RESTRICT
     );
     """,
+    # 4 -> 5: rename the two extension tables to the abbreviated convention.
+    # RENAME TO preserves every row in place (passwords, secrets, key paths);
+    # a fresh store harmlessly creates-then-renames.
+    """
+    ALTER TABLE user_credential RENAME TO user_acct;
+    ALTER TABLE service_account_credential RENAME TO svc_acct;
+    """,
 )
 
 # Auto-seeded on first store-open so a fresh install works with zero setup (§4).
@@ -215,7 +224,7 @@ class Identity:
 
 
 @dataclass(frozen=True)
-class UserCredential:
+class UserAcct:
     """USER-kind extension of an identity. ``password_plaintext`` None == tier 2 (§7)."""
 
     identity_id: int
@@ -244,7 +253,7 @@ class Token:
 
 
 @dataclass(frozen=True)
-class ServiceAccountCredential:
+class SvcAcct:
     """SERVICE_ACCOUNT extension of an identity. ``client_secret_plaintext`` is always set."""
 
     identity_id: int
@@ -768,12 +777,12 @@ def resolve_identity(environment: str, explicit_label: str | None) -> Identity:
         return _row_to_identity(row)
 
 
-def set_user_credential(identity_id: int, password_plaintext: str | None) -> None:
+def set_user_acct(identity_id: int, password_plaintext: str | None) -> None:
     """Set (or clear) the stored password for a USER identity. ``None`` == tier 2."""
     with _store() as conn:
         conn.execute(
             """
-            INSERT INTO user_credential (identity_id, password_plaintext)
+            INSERT INTO user_acct (identity_id, password_plaintext)
             VALUES (?, ?)
             ON CONFLICT (identity_id) DO UPDATE SET
                 password_plaintext = excluded.password_plaintext
@@ -783,14 +792,14 @@ def set_user_credential(identity_id: int, password_plaintext: str | None) -> Non
         conn.commit()
 
 
-def get_user_credential(identity_id: int) -> UserCredential | None:
+def get_user_acct(identity_id: int) -> UserAcct | None:
     with _store() as conn:
         row = conn.execute(
-            "SELECT * FROM user_credential WHERE identity_id = ?", (identity_id,)
+            "SELECT * FROM user_acct WHERE identity_id = ?", (identity_id,)
         ).fetchone()
         if row is None:
             return None
-        return UserCredential(row["identity_id"], row["password_plaintext"])
+        return UserAcct(row["identity_id"], row["password_plaintext"])
 
 
 def upsert_org_membership(
@@ -878,8 +887,8 @@ def clear_cached_token(identity_id: int) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _row_to_sa_credential(row: sqlite3.Row) -> ServiceAccountCredential:
-    return ServiceAccountCredential(
+def _row_to_svc_acct(row: sqlite3.Row) -> SvcAcct:
+    return SvcAcct(
         identity_id=row["identity_id"],
         environment_name=row["environment_name"],
         org_name=row["org_name"],
@@ -890,7 +899,7 @@ def _row_to_sa_credential(row: sqlite3.Row) -> ServiceAccountCredential:
     )
 
 
-def set_service_account_credential(
+def set_svc_acct(
     identity_id: int,
     environment: str,
     org_name: str,
@@ -904,7 +913,7 @@ def set_service_account_credential(
     with _store() as conn:
         conn.execute(
             """
-            INSERT INTO service_account_credential
+            INSERT INTO svc_acct
                 (identity_id, environment_name, org_name, client_secret_plaintext,
                  public_key_path, private_key_path, key_version)
             VALUES (:identity_id, :environment_name, :org_name, :secret,
@@ -930,18 +939,18 @@ def set_service_account_credential(
         conn.commit()
 
 
-def get_service_account_credential(
+def get_svc_acct(
     identity_id: int,
-) -> ServiceAccountCredential | None:
+) -> SvcAcct | None:
     with _store() as conn:
         row = conn.execute(
-            "SELECT * FROM service_account_credential WHERE identity_id = ?",
+            "SELECT * FROM svc_acct WHERE identity_id = ?",
             (identity_id,),
         ).fetchone()
-        return _row_to_sa_credential(row) if row is not None else None
+        return _row_to_svc_acct(row) if row is not None else None
 
 
-def update_service_account_keys(
+def update_svc_acct_keys(
     identity_id: int,
     public_key_path: str,
     private_key_path: str,
@@ -951,7 +960,7 @@ def update_service_account_keys(
     with _store() as conn:
         conn.execute(
             """
-            UPDATE service_account_credential
+            UPDATE svc_acct
                SET public_key_path = ?, private_key_path = ?, key_version = ?
              WHERE identity_id = ?
             """,

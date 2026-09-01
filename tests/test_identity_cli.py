@@ -40,7 +40,7 @@ def test_import_validates_then_persists_tier1(monkeypatch) -> None:
     assert login.called
     ident = store.get_identity("local", "root")
     assert ident.server_id == "u-7"
-    assert store.get_user_credential(ident.id).password_plaintext == "pw"
+    assert store.get_user_acct(ident.id).password_plaintext == "pw"
     assert store.list_org_memberships(ident.id)[0].role == "ORG_ADMIN"
     assert store.get_organization("local", "globo").server_org_id == "org-1"
 
@@ -98,7 +98,7 @@ def test_import_service_account_validates_then_persists() -> None:
     ident = store.get_identity("local", "sys")
     assert ident.kind == "SERVICE_ACCOUNT"
     assert ident.server_id == "sa-1"
-    cred = store.get_service_account_credential(ident.id)
+    cred = store.get_svc_acct(ident.id)
     assert cred is not None
     assert cred.client_secret_plaintext == "shh"
     assert cred.org_name == "globo"
@@ -166,7 +166,7 @@ def test_login_creates_tier2_then_reuses(monkeypatch) -> None:
 
     ident = store.get_identity_by_principal("local", "alice", "USER")
     assert ident is not None
-    assert store.get_user_credential(ident.id).password_plaintext is None  # tier 2
+    assert store.get_user_acct(ident.id).password_plaintext is None  # tier 2
     assert store.get_cached_token(ident.id) is not None
 
     # second call reuses the same row (no duplicate, credential untouched)
@@ -179,7 +179,7 @@ def test_login_creates_tier2_then_reuses(monkeypatch) -> None:
 def test_login_reuses_tier1_identity_without_touching_credential(monkeypatch) -> None:
     store.ensure_local_environment_seeded()
     existing = store.add_identity("local", "USER", "u-1", "alice", "alice-stored")
-    store.set_user_credential(existing.id, "stored-pw")
+    store.set_user_acct(existing.id, "stored-pw")
 
     monkeypatch.setattr("typer.prompt", lambda *a, **k: "different-pw")
     respx.post(f"{IDP}/auth/user/login").mock(
@@ -189,7 +189,7 @@ def test_login_reuses_tier1_identity_without_touching_credential(monkeypatch) ->
     result = runner.invoke(app, ["identity", "login", "alice"])
 
     assert result.exit_code == 0, result.stdout
-    assert store.get_user_credential(existing.id).password_plaintext == "stored-pw"
+    assert store.get_user_acct(existing.id).password_plaintext == "stored-pw"
     assert len(store.list_identities("local")) == 1
 
 
@@ -197,7 +197,7 @@ def test_use_and_list_and_show(monkeypatch) -> None:
     store.ensure_local_environment_seeded()
     store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
     ident = store.add_identity("local", "USER", "u-1", "alice", "alice")
-    store.set_user_credential(ident.id, "sekret")
+    store.set_user_acct(ident.id, "sekret")
     store.upsert_org_membership(ident.id, "local", "globo", "USER")
 
     assert runner.invoke(app, ["identity", "use", "alice"]).exit_code == 0

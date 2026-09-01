@@ -35,7 +35,7 @@ def _reauthenticate(
     identity: store.Identity, idp_base_url: str, *, allow_prompt: bool | None
 ) -> str:
     if identity.kind == "SERVICE_ACCOUNT":
-        sa = store.get_service_account_credential(identity.id)
+        sa = store.get_svc_acct(identity.id)
         if sa is None:
             raise AuthError(
                 f"identity '{identity.label}' has no stored client secret — "
@@ -50,7 +50,7 @@ def _reauthenticate(
             ),
         )
 
-    credential = store.get_user_credential(identity.id)
+    credential = store.get_user_acct(identity.id)
     if credential is not None and credential.password_plaintext is not None:
         password = credential.password_plaintext  # tier 1 — silent
     else:

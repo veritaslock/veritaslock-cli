@@ -132,7 +132,7 @@ def add(
         identity = store.add_identity(
             environment.name, "USER", user_dto["id"], username, identity_label
         )
-        store.set_user_credential(identity.id, password)
+        store.set_user_acct(identity.id, password)
         store.upsert_org_membership(
             identity.id, environment.name, str(org_dto["name"]), role.value
         )
@@ -170,7 +170,7 @@ def show(
             environment.idp_base_url,
             lambda c: c.get(f"/v1/users/{identity.server_id}"),
         )
-        cred = store.get_user_credential(identity.id)
+        cred = store.get_user_acct(identity.id)
         memberships = store.list_org_memberships(identity.id)
 
     if cred is None or cred.password_plaintext is None:
@@ -311,9 +311,9 @@ def update(
             lambda c: c.patch(f"/v1/users/{identity.server_id}", json=body),
         )
         if new_password is not None:
-            cred = store.get_user_credential(identity.id)
+            cred = store.get_user_acct(identity.id)
             if cred is not None and cred.password_plaintext is not None:
-                store.set_user_credential(identity.id, new_password)  # tier 1: keep in sync
+                store.set_user_acct(identity.id, new_password)  # tier 1: keep in sync
 
     render(
         {

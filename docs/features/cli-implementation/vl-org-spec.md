@@ -118,7 +118,7 @@ This mirrors exactly how V20 (the seed-data migration) handles the pre-existing 
 `vl org add`, `update`, `members add`, `members list`, and `members remove` all require a genuine user-token caller server-side, but this document is deliberately sequenced before the identity/token-cache machinery exists. Rather than block on that dependency, these commands take credentials directly:
 
 - `--auth-user <username>` (required) and `--auth-password <password>` (prompted, hidden input, if omitted).
-- A single `POST /auth/user/login` call obtains a token used for that one request only. Nothing is cached to disk, and no `identity`/`user_credential` row is created — this is intentionally the same "re-authenticate every invocation" behavior the existing `create_user.sh`/`provision_service_account.sh` bash scripts already have, not a regression.
+- A single `POST /auth/user/login` call obtains a token used for that one request only. Nothing is cached to disk, and no `identity`/`user_acct` row is created — this is intentionally the same "re-authenticate every invocation" behavior the existing `create_user.sh`/`provision_service_account.sh` bash scripts already have, not a regression.
 
 This is explicitly an interim design, not a permanent one: once the identity document (Phase 3) lands, these same commands should gain a `--as <label>` option that resolves a stored/cached identity instead of requiring `--auth-user`/`--auth-password` every time. That upgrade is out of scope for this document — noted here so it isn't forgotten (§6.3).
 

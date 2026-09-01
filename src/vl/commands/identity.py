@@ -44,13 +44,13 @@ def _report_errors() -> Iterator[None]:
         raise typer.Exit(1) from exc
 
 
-def _secret_cell(cred: store.UserCredential | None, reveal: bool) -> str:
+def _secret_cell(cred: store.UserAcct | None, reveal: bool) -> str:
     if cred is None or cred.password_plaintext is None:
         return "(not stored)"
     return cred.password_plaintext if reveal else "********"
 
 
-def _sa_secret_cell(cred: store.ServiceAccountCredential | None, reveal: bool) -> str:
+def _sa_secret_cell(cred: store.SvcAcct | None, reveal: bool) -> str:
     if cred is None:
         return "(not stored)"
     return cred.client_secret_plaintext if reveal else "********"
@@ -65,11 +65,11 @@ def list_(env: EnvOption = None) -> None:
         rows = []
         for identity in identities:
             if identity.kind == "SERVICE_ACCOUNT":
-                sa = store.get_service_account_credential(identity.id)
+                sa = store.get_svc_acct(identity.id)
                 orgs = sa.org_name if sa is not None else "-"
                 secret = "stored"
             else:
-                cred = store.get_user_credential(identity.id)
+                cred = store.get_user_acct(identity.id)
                 memberships = store.list_org_memberships(identity.id)
                 orgs = ", ".join(f"{m.org_name}:{m.role}" for m in memberships) or "-"
                 secret = (
@@ -112,7 +112,7 @@ def show(
         }
         memberships: list[store.OrgMembership] = []
         if identity.kind == "SERVICE_ACCOUNT":
-            sa = store.get_service_account_credential(identity.id)
+            sa = store.get_svc_acct(identity.id)
             row["org"] = sa.org_name if sa else "-"
             row["secret"] = _sa_secret_cell(sa, reveal_secret)
             row["private_key_path"] = (sa.private_key_path if sa else None) or "(none)"
@@ -120,7 +120,7 @@ def show(
             row["key_version"] = (sa.key_version if sa else None) or "-"
         else:
             row["password"] = _secret_cell(
-                store.get_user_credential(identity.id), reveal_secret
+                store.get_user_acct(identity.id), reveal_secret
             )
             memberships = store.list_org_memberships(identity.id)
 
@@ -254,7 +254,7 @@ def _import_user(
         identity = store.add_identity(
             environment.name, "USER", server_id, username, label
         )
-        store.set_user_credential(identity.id, password)
+        store.set_user_acct(identity.id, password)
         store.upsert_org_membership(identity.id, environment.name, org_name, org_role)
 
     console.print(
@@ -298,7 +298,7 @@ def _import_service_account(
         identity = store.add_identity(
             environment.name, "SERVICE_ACCOUNT", client_id, client_id, label
         )
-        store.set_service_account_credential(
+        store.set_svc_acct(
             identity.id,
             environment.name,
             org_name,
@@ -328,12 +328,12 @@ def login(
 
         existing = store.get_identity_by_principal(environment.name, username, "USER")
         if existing is not None:
-            identity = existing  # reuse — user_credential is left untouched
+            identity = existing  # reuse — user_acct is left untouched
         else:
             identity = store.add_identity(
                 environment.name, "USER", server_id, username, username
             )
-            store.set_user_credential(identity.id, None)  # tier 2
+            store.set_user_acct(identity.id, None)  # tier 2
 
         issued = datetime.now(timezone.utc)
         store.set_cached_token(

@@ -9,14 +9,14 @@
 ## 1. Scope
 
 This document covers:
-- The common `identity` table (kind-agnostic — shared by users and, in a later document, service accounts) and its `USER`-specific extension table, `user_credential`.
+- The common `identity` table (kind-agnostic — shared by users and, in a later document, service accounts) and its `USER`-specific extension table, `user_acct`.
 - The `org_membership` join table, mirroring the IdP's own `organization` + `user_org_role` split (per Phase 2 §1) — replaces the flat, informational `org_id`/`org_name` columns an earlier draft of this document had put directly on `identity`.
 - `token_cache`, the JWT caching layer everything authenticated depends on.
 - The `vl identity` command group: `list`, `show`, `use`, `import`, `login`.
 - The `vl user` command group: `add`, `show`, `list`, `update`, `delete`.
 - A small retrofit to Phase 2's `vl org members add` command (§9.6) so it upserts `org_membership` when its target matches a locally known identity — folded into this document's scope rather than left as a later cleanup, since `org_membership` doesn't exist until this phase and the retrofit is small and purely mechanical once it does.
 
-**Deferred to the `vl service-account` document (Phase 4):** the `service_account_credential` extension table, `vl identity import --kind SERVICE_ACCOUNT`, and anything involving Ed25519 keypairs. Until that document lands, service-account bootstrapping (e.g. `SYSTEM`) continues via the existing bash scripts' env vars (`VL_SYSTEM_CLIENT_ID`/`VL_SYSTEM_CLIENT_SECRET`) — `vl` does not yet manage those identities.
+**Deferred to the `vl service-account` document (Phase 4):** the `svc_acct` extension table, `vl identity import --kind SERVICE_ACCOUNT`, and anything involving Ed25519 keypairs. Until that document lands, service-account bootstrapping (e.g. `SYSTEM`) continues via the existing bash scripts' env vars (`VL_SYSTEM_CLIENT_ID`/`VL_SYSTEM_CLIENT_SECRET`) — `vl` does not yet manage those identities.
 
 **Deferred to the `vl team` document (Phase 5):** `identity_team`, the local cache of team membership.
 
@@ -66,7 +66,7 @@ Same caching principle as `organization` itself (Phase 2 §3): this is populated
 
 `vl org members add` (Phase 2) does not populate this table on its own as originally specced — but as part of this document's scope, it's retrofitted to do so. See §9.6.
 
-## 5. Schema: `user_credential`
+## 5. Schema: `user_acct`
 
 | Field | Type | Notes |
 |---|---|---|
@@ -90,8 +90,8 @@ Every command that needs to call an authenticated endpoint checks this table fir
 
 ## 7. Two identity tiers, and the auth/token flow
 
-- **Tier 1 — credential stored locally.** `user_credential.password_plaintext` is set. Covers dev/test users created via `vl user add`, and any identity explicitly adopted via `vl identity import` (§8.4) with a password supplied for storage. `vl` can silently (re-)authenticate these at any time with no prompt.
-- **Tier 2 — credential intentionally not stored.** `user_credential.password_plaintext` is `NULL`. Set up via `vl identity login` (§8.5) — a real operator's own password, used once to obtain a token and immediately discarded, never written to `store.db`. Only the resulting JWT is cached.
+- **Tier 1 — credential stored locally.** `user_acct.password_plaintext` is set. Covers dev/test users created via `vl user add`, and any identity explicitly adopted via `vl identity import` (§8.4) with a password supplied for storage. `vl` can silently (re-)authenticate these at any time with no prompt.
+- **Tier 2 — credential intentionally not stored.** `user_acct.password_plaintext` is `NULL`. Set up via `vl identity login` (§8.5) — a real operator's own password, used once to obtain a token and immediately discarded, never written to `store.db`. Only the resulting JWT is cached.
 
 **Token acquisition, per invocation:**
 1. Resolve the active identity (§8.3 precedence).
@@ -125,14 +125,14 @@ Adopts an identity that already exists server-side but wasn't created by `vl` �
 1. Resolve `org_id` from `--org` (unauthenticated `GET /v1/organizations?name=`), and upsert the local `organization` cache row (Phase 2 §3) if this is the first time this environment/org has been touched locally.
 2. If `--password` omitted, prompt interactively (hidden input).
 3. **Validate the credential before storing it**: call `POST /auth/user/login` with the given username/password. If it fails, error clearly and store nothing.
-4. On success, create the `identity` row (`kind='USER'`), a `user_credential` row **with the password stored** (`password_plaintext` set — `import` is explicitly for building a reusable tier-1 identity), and an `org_membership` row using the `--role` supplied. As noted in §4, this role is not independently verified against the server — it's whatever the caller asserts, since there's currently no endpoint that returns a user's actual org role.
+4. On success, create the `identity` row (`kind='USER'`), a `user_acct` row **with the password stored** (`password_plaintext` set — `import` is explicitly for building a reusable tier-1 identity), and an `org_membership` row using the `--role` supplied. As noted in §4, this role is not independently verified against the server — it's whatever the caller asserts, since there's currently no endpoint that returns a user's actual org role.
 
 `--kind SERVICE_ACCOUNT` is not yet accepted — deferred to Phase 4, which will extend this same command.
 
 ### 8.5 `vl identity login <username> [--env <env>]`
 The tier-2 path (§7): prompts interactively for a password (hidden input), authenticates against `/auth/user/login`.
 
-**Reuse, not label-based:** before creating anything, check whether an `identity` row already exists in this environment with `kind='USER'` and `principal_name = username` — regardless of what label it was given (so this also catches identities set up via `vl user add` or `vl identity import`, not just prior `login` calls). If found, reuse that row: authenticate, refresh its `token_cache` entry, done. `user_credential` is **never modified** by `login` — if the found row is tier 1 (password already stored) and the password just typed differs, that's not reconciled here; if it's tier 2, it stays tier 2. If no matching row exists, create one: `label = username` (no `--label` flag on this command), `kind='USER'`, resolve `server_id` from the login response, and a `user_credential` row with `password_plaintext = NULL` (tier 2).
+**Reuse, not label-based:** before creating anything, check whether an `identity` row already exists in this environment with `kind='USER'` and `principal_name = username` — regardless of what label it was given (so this also catches identities set up via `vl user add` or `vl identity import`, not just prior `login` calls). If found, reuse that row: authenticate, refresh its `token_cache` entry, done. `user_acct` is **never modified** by `login` — if the found row is tier 1 (password already stored) and the password just typed differs, that's not reconciled here; if it's tier 2, it stays tier 2. If no matching row exists, create one: `label = username` (no `--label` flag on this command), `kind='USER'`, resolve `server_id` from the login response, and a `user_acct` row with `password_plaintext = NULL` (tier 2).
 
 Does **not** create an `org_membership` row — this path doesn't ask for or receive org/role information, it only establishes the ability to authenticate. If org context is needed for this identity later, use `vl identity import` instead, or extend this command in a future revision.
 
@@ -148,10 +148,10 @@ Does **not** create an `org_membership` row — this path doesn't ask for or rec
 2. Derive `username` (first-initial + lastname, lowercased). `email` defaults to `first.last@example.com` if `--email` is omitted — **this default is a placeholder, not a real address**; it should always be overridden with `--email` for any account that might later become an org's `owner` (see `vl-org-spec.md` §4.8), since a real, reachable email is part of what `owner` is meant to guarantee. `--phone`, if supplied, is sent as `phoneNumber` on creation — required before this account can later be granted `owner` via `vl org update --owner` (`idp-org-admin-safety-spec.md` §2.7), though not required by `add` itself. Generate a random password and **bcrypt-hash it client-side** (the server only ever receives `passwordHash`, never plaintext). `--label`, if omitted, defaults to the derived `username`.
 3. Resolve the calling identity per §8.3 precedence. It must be `kind='USER'` — service accounts cannot create users. If resolution yields a service-account identity (once Phase 4 exists) or nothing at all, error clearly before attempting the API call.
 4. `POST /v1/users` with `{id: <generated uuid>, username, email, phoneNumber, displayName, passwordHash, status: "ACTIVE", mfaEnabled: false, organizations: [{orgId, orgName, role}]}` — `role` is `ORG_ADMIN` or `USER` per the flag (see §11.1 — this is confirmed correct; the old bash scripts' `"ADMIN"` was simply stale after the team-implementation rename).
-5. On success, create an `identity` row (`kind='USER'`), a `user_credential` row with `password_plaintext` set (tier 1 — `vl` generated this password), and an `org_membership` row for the org/role just granted. Print the plaintext password once; it is never displayed again by default.
+5. On success, create an `identity` row (`kind='USER'`), a `user_acct` row with `password_plaintext` set (tier 1 — `vl` generated this password), and an `org_membership` row for the org/role just granted. Print the plaintext password once; it is never displayed again by default.
 
 ### 9.2 `vl user show <label> [--reveal-secret]`
-`GET /v1/users/{server_id}`, merged with local `identity`/`user_credential`/`org_membership` metadata. Password masked unless `--reveal-secret`.
+`GET /v1/users/{server_id}`, merged with local `identity`/`user_acct`/`org_membership` metadata. Password masked unless `--reveal-secret`.
 
 ### 9.3 `vl user list [--org <org>] [--status <status>] [--env <env>]`
 `GET /v1/users?...` — pass through existing filters (`status`, `email`, pagination). Follows `nextCursor` if asked to page further. This lists server-side users, not local store rows — cross-reference with `vl identity list --env <env>` (filtered to `kind='USER'`) to see which of them `vl` has stored credentials for.
@@ -159,10 +159,10 @@ Does **not** create an `org_membership` row — this path doesn't ask for or rec
 ### 9.4 `vl user update <label> [--display-name <text>] [--status ACTIVE|SUSPENDED] [--email <email>] [--phone <number>] [--mfa | --no-mfa] [--password [<value>]] [--env <env>]`
 `PATCH /v1/users/{server_id}` with whichever flags are supplied (partial update), including `phoneNumber` if `--phone` is given. `--username` is **not** exposed in this phase — renaming would desync the local `principal_name`/default-label logic, and there's no pressing need for it yet.
 
-`--password` (value optional — prompts if given with no value, or generates a random one if omitted entirely, matching `add`'s convention): bcrypt-hash client-side, `PATCH passwordHash`. Tier-aware on the local side: if this identity's `user_credential.password_plaintext` was already set (tier 1), update it to the new value — the local record stays in sync with what was just rotated. If it was `NULL` (tier 2), leave it `NULL` — `vl` doesn't start storing a password for an identity that was deliberately tier 2, even though the actual server-side password just changed. The server-side change succeeds either way; only the local caching behavior differs by tier.
+`--password` (value optional — prompts if given with no value, or generates a random one if omitted entirely, matching `add`'s convention): bcrypt-hash client-side, `PATCH passwordHash`. Tier-aware on the local side: if this identity's `user_acct.password_plaintext` was already set (tier 1), update it to the new value — the local record stays in sync with what was just rotated. If it was `NULL` (tier 2), leave it `NULL` — `vl` doesn't start storing a password for an identity that was deliberately tier 2, even though the actual server-side password just changed. The server-side change succeeds either way; only the local caching behavior differs by tier.
 
 ### 9.5 `vl user delete <label> [--env <env>]`
-`DELETE /v1/users/{server_id}`, then delete the local `identity` row (cascades to `user_credential`, `org_membership`, and `token_cache`).
+`DELETE /v1/users/{server_id}`, then delete the local `identity` row (cascades to `user_acct`, `org_membership`, and `token_cache`).
 
 ### 9.6 Retrofit: `vl org members add` now upserts `org_membership`
 
@@ -186,8 +186,8 @@ def delete_identity(environment: str, label: str) -> None: ...
 def set_default_identity(environment: str, label: str) -> None: ...
 def resolve_identity(environment: str, explicit_label: str | None) -> Identity: ...  # implements §8.3 precedence; raises a clear, typed error if unresolvable
 
-def set_user_credential(identity_id: int, password_plaintext: str | None) -> None: ...  # None -> tier 2
-def get_user_credential(identity_id: int) -> UserCredential | None: ...
+def set_user_acct(identity_id: int, password_plaintext: str | None) -> None: ...  # None -> tier 2
+def get_user_acct(identity_id: int) -> UserAcct | None: ...
 
 def upsert_org_membership(identity_id: int, environment: str, org_name: str, role: str) -> None: ...
 def list_org_memberships(identity_id: int) -> list[OrgMembership]: ...
