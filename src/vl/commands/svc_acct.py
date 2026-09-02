@@ -32,7 +32,7 @@ from vl.commands._shared import (
 )
 from vl.lib import api, auth, keys, store
 from vl.lib.cli import HelpOnErrorGroup
-from vl.lib.output import console, render
+from vl.lib.output import console, note, render
 from vl.lib.roles import ServiceAccountRole
 
 app = typer.Typer(
@@ -481,7 +481,7 @@ def list_(
         + (f" in {org}" if org is not None else ""),
     )
     if next_cursor:
-        console.print(f"[dim]more results — rerun with --page {next_cursor}[/dim]")
+        note(f"more results — rerun with --page {next_cursor}")
 
 
 def _sa_org(identity_id: int) -> str:

@@ -46,5 +46,11 @@ def render(data: Row | list[Row], *, title: str | None = None) -> None:
     for column in rows[0]:
         table.add_column(str(column))
     for row in rows:
-        table.add_row(*(str(row.get(col, "")) for col in rows[0]))
+        table.add_row(*(_cell(row.get(col)) for col in rows[0]))
     console.print(table)
+
+
+def _cell(value: Any) -> str:
+    """Render one table cell. A missing / null value shows as an empty cell
+    rather than the literal string ``"None"``."""
+    return "" if value is None else str(value)

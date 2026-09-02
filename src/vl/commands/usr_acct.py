@@ -486,7 +486,7 @@ def list_(
         "data, so it's blank for accounts vl hasn't cached."
     )
     if next_cursor:
-        console.print(f"[dim]more results — rerun with --page {next_cursor}[/dim]")
+        note(f"more results — rerun with --page {next_cursor}")
 
 
 @app.command("update")

@@ -14,7 +14,7 @@ import typer
 from vl.commands._shared import AsOption, EnvOption, report_errors, resolve_org
 from vl.lib import api, auth, store
 from vl.lib.cli import HelpOnErrorGroup
-from vl.lib.output import console, render
+from vl.lib.output import console, note, render
 from vl.lib.roles import OrgRole
 
 app = typer.Typer(
@@ -115,7 +115,7 @@ def list_(
         title="Organizations",
     )
     if next_cursor:
-        console.print(f"[dim]more results — rerun with --page {next_cursor}[/dim]")
+        note(f"more results — rerun with --page {next_cursor}")
 
 
 # --------------------------------------------------------------------------- #

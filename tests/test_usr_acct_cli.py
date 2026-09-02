@@ -162,6 +162,31 @@ def test_add_only_first_name_still_sets_display_name() -> None:
 
 
 @respx.mock
+def test_add_without_name_renders_blank_display_name_not_none() -> None:
+    _caller()
+    respx.get(f"{IDP}/v1/organizations", params={"name": "globo"}).mock(
+        return_value=httpx.Response(200, json=ORG_DTO)
+    )
+    # server echoes displayName back as an explicit null
+    respx.post(f"{IDP}/v1/users").mock(
+        return_value=httpx.Response(
+            201,
+            json={
+                "id": "u-new", "username": "jdoe", "email": "j@x",
+                "displayName": None, "status": "ACTIVE",
+            },
+        )
+    )
+
+    result = runner.invoke(
+        app, ["usr-acct", "add", "jdoe", "--email", "j@x.com", "--org", "globo"]
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "None" not in result.stdout
+
+
+@respx.mock
 def test_add_rejects_service_account_caller() -> None:
     _caller("svc", kind="SERVICE_ACCOUNT")
 
@@ -358,8 +383,30 @@ def test_list_remote_passes_filters_and_marks_local() -> None:
 
     assert result.exit_code == 0, result.stdout
     assert route.calls.last.request.url.params["status"] == "ACTIVE"
-    rows = json.loads(result.stdout.split("more results")[0])
+    # JSON mode: the pagination hint is suppressed so stdout stays parseable.
+    rows = json.loads(result.stdout)
     assert {r["server_id"]: r["cached"] for r in rows} == {"u-1": "yes", "u-2": "no"}
+    assert "more results" not in result.stdout
+
+
+@respx.mock
+def test_list_remote_pagination_hint_shown_in_table_mode() -> None:
+    _caller()
+    respx.get(f"{IDP}/v1/users").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "items": [
+                    {"id": "u-1", "username": "a", "email": "a@x", "status": "ACTIVE"},
+                ],
+                "nextCursor": "1",
+            },
+        )
+    )
+
+    result = runner.invoke(app, ["usr-acct", "list", "--remote"])
+
+    assert result.exit_code == 0, result.stdout
     assert "--page 1" in result.stdout
 
 
