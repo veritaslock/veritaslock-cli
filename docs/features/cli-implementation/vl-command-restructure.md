@@ -59,16 +59,31 @@ cached** view by default — no server call. Flags:
 - `--all` — the server record merged with local metadata.
 
 `vl identity list`'s cross-kind "what can I `--as`?" view is replaced by top-level
-**`vl whoami`** (target environment + resolved default identity + its default org)
-plus the two per-kind local `list`s.
+**`vl whoami`** plus the two per-kind local `list`s.
+
+### `vl whoami` output
+
+A single row (no server call), fields:
+
+| field | value |
+|---|---|
+| `environment` | the resolved target environment |
+| `acting_as` | the resolved identity's label (or a "(none — …)" hint if nothing resolves) |
+| `kind` | `USER` / `SERVICE_ACCOUNT` (`-` if none) |
+| `org` | the identity's **default org** (§3a), or a hint: `(none or ambiguous — pass --org)` for a user, `(unknown — re-cache the account)` for a service account |
+| `role` | the identity's role in that org, from the cached `org_membership` row; `-` for a service account or when there's no single default org |
+
+`--as <label>` resolves as if that identity were selected. There is **no**
+`idp_base_url` field (dropped — it's environment config, not identity state).
 
 ## 3a. Default org
 
 An identity has an implicit **default org**: a `SERVICE_ACCOUNT`'s single org, or a
-`USER`'s sole cached `org_membership` (none if it has zero or several). `vl whoami`
-shows it, and `--org` on `vl usr-acct add` / `vl svc-acct add` is now optional —
-omitted, it uses the acting identity's default org (clear error if that's
-ambiguous). `vl org` / `vl team` still take a positional `<org>`.
+`USER`'s sole cached `org_membership` (none if it has zero or several). Implemented
+as `store.default_org_for_identity()`. `vl whoami` shows it, and `--org` on
+`vl usr-acct add` / `vl svc-acct add` is now optional — omitted, it uses the
+acting identity's default org (clear error if that's ambiguous). `vl org` /
+`vl team` still take a positional `<org>`.
 
 ## 4. `vl org` uses the resolved identity like everything else
 
