@@ -2,6 +2,8 @@
 
 
 > **Naming note:** the command surface was later restructured — `vl identity` folded into `vl usr-acct` / `vl svc-acct`, `vl user` → `vl usr-acct`, `vl service-account` → `vl svc-acct`, and `vl org` moved to the `--as` auth model. Behaviour, schema, and rationale below are unchanged; see `vl-command-restructure.md` for the mapping.
+>
+> **Scope trimmed (later):** `vl-command-restructure.md` §6 **removed the `members` and `ingest-clients` sub-groups** (§5.6, §5.7 below are historical) and **dropped `vl team list`'s `<org>` argument** in favour of role-based scoping (§5.3 revised there). The `team` / `team_member` tables and the server endpoints are unchanged.
 **Status:** Draft for implementation
 **Part of:** the larger `vl-cli-phase1-crud-spec.md` effort, broken out as its own standalone document.
 **Depends on:** `vl-env-spec.md` (Phase 1), `vl-org-spec.md` (Phase 2, for the local `organization` cache table this document's `team` table FKs against), `vl-identity-user-spec.md` (Phase 3, for `identity`, the `--as`/cached-token auth flow, and the `org_membership` design pattern this document mirrors), and `vl-service-account-spec.md` (Phase 4, for `identity`/`svc_acct` — team ingest clients populate the same tables Phase 4 established, via a different server endpoint).
@@ -15,7 +17,7 @@
 This document covers:
 - A local `team` cache table, mirroring `organization`'s shape and conventions exactly.
 - A local `team_member` join table, mirroring `org_membership`'s shape and conventions exactly — same reasoning, same population strategy (best-effort, populated as a side effect of commands that already know the membership, never authoritative).
-- The `vl team` command group: `add`, `show`, `list`, `update`, `delete`, plus `members` and `ingest-clients` sub-groups.
+- The `vl team` command group: `add`, `show`, `list`, `update`, `delete`, plus `members` and `ingest-clients` sub-groups. *(The two sub-groups were removed later — `vl-command-restructure.md` §6.)*
 
 **No separate `identity_team` cache table** — an earlier, very early draft of this project (before the `organization`/`org_membership` pattern existed) sketched a table by that name for the same purpose `team_member` now serves. `team_member`, designed consistently with everything built since, supersedes that idea; it was never implemented, so there's nothing to migrate away from.
 
@@ -76,8 +78,9 @@ On success: upsert the local `team` row, **and** insert a `team_member` row for 
 ### 5.2 `vl team show <org> <name> [--as <label>] [--env <env>]`
 `GET /v1/teams?orgId=<resolved>&name=<name>` (not `GET /v1/teams/{teamId}`) — deliberately, since this endpoint's guard (`requireOrgMember`) is broader than `getById`'s (`requireTeamRead`, presumably team-member-specific — exact rule not fully confirmed, §7 item 1), and it's also how `teamId` gets resolved for every other command anyway (§4). This is a design choice, not an oversight: any org member can look up a team's basic info by name, without needing to already be a member of that specific team. Upserts the local cache on success.
 
-### 5.3 `vl team list <org> [--name <filter>] [--as <label>] [--env <env>]`
-`GET /v1/teams?orgId=<resolved>&name=<optional filter>` → `ListResponse<TeamDto>`. Upserts the local cache for every row returned.
+### 5.3 `vl team list [--name <filter>] [--as <label>] [--env <env>]`
+
+> **Revised** by `vl-command-restructure.md` §6: the `<org>` argument is gone. Scope follows the caller's role, read from the `orgs` claim in their token (the same claim the IdP's `OrgStandingResolver` reads): a **PLATFORM_ADMIN** entry → every org's teams (page through the public `GET /v1/organizations`, then `GET /v1/teams?orgId=` per org); otherwise one `GET /v1/teams?orgId=` per org in the caller's `orgs` claim. Both render an `org` column. `--name` is passed to each per-org call. Upserts the local cache for every row returned.
 
 ### 5.4 `vl team update <org> <name> [--name <new-name>] [--description <text>] [--as <label>] [--env <env>]`
 Resolve `teamId` (§4), then `PATCH /v1/teams/{teamId}` with whichever fields are supplied. Upserts the local cache row on success.
@@ -87,12 +90,16 @@ Resolve `teamId` (§4), then `DELETE /v1/teams/{teamId}`. On success, delete the
 
 ### 5.6 Members
 
+> **Removed** — `vl-command-restructure.md` §6 dropped the `members` sub-group entirely. The subsection below is historical. The `POST/PATCH/DELETE /v1/teams/{id}/members` endpoints and the local `team_member` table still exist; `vl team add` still writes the creator's `TEAM_ADMIN` row (§5.1).
+
 - **`vl team members list <org> <team-name> [--as <label>] [--env <env>]`** — resolve `teamId`, `GET /v1/teams/{teamId}/members` → `ListResponse<TeamMemberDto>`. Upserts `team_member` rows for every result — this is the one place this table gets refreshed in bulk (§3).
 - **`vl team members add <org> <team-name> --user-id <server-user-id> [--role TEAM_ADMIN|TEAM_MEMBER] [--as <label>] [--env <env>]`** — resolve `teamId`, `POST /v1/teams/{teamId}/members` with `{userId, role}` (`role` optional, defaults server-side to `TEAM_MEMBER` if omitted, per `AddTeamMemberRequest`). On success: upsert a `team_member` row **only if** `--user-id` matches a locally known identity's `server_id` — same best-effort pattern already established for `vl org members add`'s retrofit (Phase 3 §9.6); if the target isn't tracked locally, nothing to attach the membership to, and that's fine.
 - **`vl team members set-role <org> <team-name> <user-id> --role <TEAM_ADMIN|TEAM_MEMBER> [--as <label>] [--env <env>]`** — resolve `teamId`, `PATCH /v1/teams/{teamId}/members/{userId}` with `{role}`. Same best-effort local upsert as `add`.
 - **`vl team members remove <org> <team-name> <user-id> [--as <label>] [--env <env>]`** — resolve `teamId`, `DELETE /v1/teams/{teamId}/members/{userId}`. If a local `team_member` row exists for that identity/team, delete it.
 
 ### 5.7 Ingest clients
+
+> **Removed** — `vl-command-restructure.md` §6 dropped the `ingest-clients` sub-group entirely. The subsection below is historical; the server endpoints are unchanged.
 
 **Team-scoped ingest clients created here become normal local service-account identities**, using the same `identity`/`svc_acct` tables Phase 4 established — even though they're created via a different server endpoint than `vl service-account add`. This keeps the local store internally consistent: an `INGEST_CLIENT` is an `INGEST_CLIENT` locally regardless of which server-side path created it, and it's usable via `--as` for anything else that accepts a service-account identity (including org-key access, `idp-org-key-rbac-spec.md`'s `INGEST_CLIENT` allowlist).
 

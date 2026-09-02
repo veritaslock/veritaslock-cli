@@ -202,33 +202,28 @@ acquisition) and an Ed25519 keypair, written to `<store dir>/keys/<id>/`
 (`private.key` 600, `public.key` 644). `get-assertion` prints an EdDSA JWT (300 s)
 for use elsewhere, e.g. node-side authentication — it isn't part of `vl`'s internal
 auth flow, and doesn't work on an account that has no keypair (e.g. a team ingest
-client).
+client, which only ever gets a symmetric secret).
 
 ## Teams
 
 ```bash
 vl team add globo ingest --description "Ingest team"   # creator becomes TEAM_ADMIN
 vl team show globo ingest
-vl team list globo
+vl team list                                           # scoped by the caller's role — see below
+vl team list --name ingest                             # filter by exact name
 vl team update globo ingest --name ingestion
-vl team members add globo ingestion --user-id <id> --role TEAM_ADMIN
-vl team members set-role globo ingestion <id> --role TEAM_MEMBER
-vl team members list globo ingestion
-vl team members remove globo ingestion <id>
 vl team delete globo ingestion
 ```
 
-Teams are addressed by `<org> <team-name>`; `vl` resolves the server team id via
-its local `team` cache, falling back to `GET /v1/teams?orgId=&name=`. Team ingest
-clients are created as normal local `SERVICE_ACCOUNT` identities (symmetric secret
-only — no keypair):
+`vl team list` takes no `<org>` argument — its scope follows the caller's role,
+read from the `orgs` claim in their token (the server's own authoritative view):
 
-```bash
-vl team ingest-clients add globo ingestion "edge-01"   # prints the secret once
-vl team ingest-clients list globo ingestion
-vl team ingest-clients rotate globo ingestion <service-account-id>
-vl team ingest-clients delete globo ingestion <service-account-id>
-```
+- **PLATFORM_ADMIN** — every organization's teams (`org` column shows which).
+- **ORG_ADMIN / USER** — the teams of the organization(s) the caller belongs to.
+
+`add` / `show` / `update` / `delete` still take `<org> <team-name>`; `vl` resolves
+the server team id via its local `team` cache, falling back to
+`GET /v1/teams?orgId=&name=`.
 
 ## Layout
 
@@ -241,7 +236,7 @@ src/vl/
 │   ├── org.py        vl org add | show | list | update | members ...
 │   ├── usr_acct.py   vl usr-acct add | cache | login | use | clear | show | list | update | delete
 │   ├── svc_acct.py   vl svc-acct add | cache | use | clear | show | list | update | delete | get-assertion
-│   ├── team.py       vl team add | show | list | update | delete | members ... | ingest-clients ...
+│   ├── team.py       vl team add | show | list | update | delete
 │   ├── whoami.py     vl whoami
 │   └── history.py    vl history
 └── lib/              shared helpers used across commands

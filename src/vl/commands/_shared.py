@@ -111,6 +111,46 @@ def org_name_resolver(environment: store.Environment) -> Callable[[str], str]:
     return resolve
 
 
+def fetch_all_orgs(environment: store.Environment) -> list[dict[str, Any]]:
+    """Every organization, via the public paginated ``GET /v1/organizations``.
+
+    Each page is upserted into the local ``organization`` cache as it's read.
+    """
+    orgs: list[dict[str, Any]] = []
+    page = 0
+    with api.IdpClient(environment.idp_base_url) as client:
+        while True:
+            body: dict[str, Any] = client.get(
+                "/v1/organizations", params={"page": page}
+            )
+            items: list[dict[str, Any]] = body.get("items", [])
+            orgs.extend(items)
+            for item in items:
+                cache_org(environment.name, item)
+            cursor = body.get("nextCursor")
+            if not cursor:
+                return orgs
+            page = int(cursor) if str(cursor).isdigit() else page + 1
+
+
+def caller_orgs_claim(
+    caller: store.Identity, environment: store.Environment
+) -> list[dict[str, Any]]:
+    """The caller token's ``orgs`` claim (``[{orgId, role}, ...]``).
+
+    This is what the server bakes into the token at login and what its own
+    org-standing checks read, so it's the authoritative view of which orgs the
+    caller belongs to and with what role. Empty for a token that carries no
+    ``orgs`` claim (e.g. a service account).
+    """
+    token = auth.get_token(caller, environment.idp_base_url)
+    claims = api.decode_jwt_payload(token)
+    orgs = claims.get("orgs")
+    if not isinstance(orgs, list):
+        return []
+    return [e for e in orgs if isinstance(e, dict) and e.get("orgId")]
+
+
 def resolve_membership_org(
     identity: store.Identity, explicit: str | None
 ) -> str:

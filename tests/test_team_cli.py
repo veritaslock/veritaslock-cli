@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -106,16 +107,118 @@ def test_show_unknown_team_errors() -> None:
     assert "No team 'nope'" in result.stdout
 
 
+FULCRUM_DTO = {"id": "org-2", "name": "fulcrum", "displayName": "Fulcrum", "active": True}
+FULCRUM_TEAM = {**TEAM_DTO, "id": "t-2", "name": "leverage", "orgId": "org-2"}
+
+
+def _jwt(orgs: list[dict[str, str]]) -> str:
+    """A fake but decodable JWT carrying just an ``orgs`` claim."""
+    payload = (
+        base64.urlsafe_b64encode(json.dumps({"orgs": orgs}).encode())
+        .decode()
+        .rstrip("=")
+    )
+    return f"h.{payload}.s"
+
+
+def _caller_with_orgs(orgs: list[dict[str, str]]) -> store.Identity:
+    store.ensure_local_environment_seeded()
+    ident = store.add_identity("local", "USER", "u-root", "root", "root")
+    store.set_user_acct(ident.id, "pw")
+    store.set_default_identity("local", "root")
+    now = datetime.now(timezone.utc)
+    store.set_cached_token(ident.id, _jwt(orgs), now, now + timedelta(hours=1))
+    return ident
+
+
 @respx.mock
-def test_list_caches_each_team() -> None:
-    _caller()
-    _mock_org()
-    respx.get(f"{IDP}/v1/teams", params={"orgId": "org-1"}).mock(
+def test_list_org_member_lists_own_orgs_and_caches() -> None:
+    _caller_with_orgs([{"orgId": "org-1", "role": "USER"}])
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    route = respx.get(f"{IDP}/v1/teams", params={"orgId": "org-1"}).mock(
         return_value=httpx.Response(200, json={"items": [TEAM_DTO], "nextCursor": None})
     )
-    result = runner.invoke(app, ["team", "list", "globo"])
+
+    result = runner.invoke(app, ["team", "list"])
+
     assert result.exit_code == 0, result.stdout
+    assert route.called
+    assert "ingest" in result.stdout and "globo" in result.stdout
     assert store.list_teams("local", "globo")[0].name == "ingest"
+
+
+@respx.mock
+def test_list_multi_org_member_aggregates_across_its_orgs() -> None:
+    _caller_with_orgs(
+        [
+            {"orgId": "org-1", "role": "USER"},
+            {"orgId": "org-2", "role": "KEY_READER"},
+        ]
+    )
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    store.upsert_organization("local", "fulcrum", "org-2", "Fulcrum", active=True)
+    respx.get(f"{IDP}/v1/teams", params={"orgId": "org-1"}).mock(
+        return_value=httpx.Response(200, json={"items": [TEAM_DTO]})
+    )
+    respx.get(f"{IDP}/v1/teams", params={"orgId": "org-2"}).mock(
+        return_value=httpx.Response(200, json={"items": [FULCRUM_TEAM]})
+    )
+
+    result = runner.invoke(app, ["team", "list"])
+
+    assert result.exit_code == 0, result.stdout
+    assert "ingest" in result.stdout and "leverage" in result.stdout
+
+
+@respx.mock
+def test_list_platform_admin_lists_every_org() -> None:
+    _caller_with_orgs([{"orgId": "org-1", "role": "PLATFORM_ADMIN"}])
+    respx.get(f"{IDP}/v1/organizations").mock(
+        return_value=httpx.Response(
+            200, json={"items": [ORG_DTO, FULCRUM_DTO], "nextCursor": None}
+        )
+    )
+    respx.get(f"{IDP}/v1/teams", params={"orgId": "org-1"}).mock(
+        return_value=httpx.Response(200, json={"items": [TEAM_DTO]})
+    )
+    respx.get(f"{IDP}/v1/teams", params={"orgId": "org-2"}).mock(
+        return_value=httpx.Response(200, json={"items": [FULCRUM_TEAM]})
+    )
+
+    result = runner.invoke(app, ["team", "list"])
+
+    assert result.exit_code == 0, result.stdout
+    assert "all organizations" in result.stdout
+    assert "ingest" in result.stdout and "leverage" in result.stdout
+
+
+@respx.mock
+def test_list_passes_name_filter_through() -> None:
+    _caller_with_orgs([{"orgId": "org-1", "role": "USER"}])
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    route = respx.get(f"{IDP}/v1/teams").mock(
+        return_value=httpx.Response(200, json={"items": [TEAM_DTO]})
+    )
+
+    result = runner.invoke(app, ["team", "list", "--name", "ingest"])
+
+    assert result.exit_code == 0, result.stdout
+    assert route.calls.last.request.url.params["name"] == "ingest"
+
+
+@respx.mock
+def test_list_service_account_caller_sees_nothing() -> None:
+    # A token with no `orgs` claim (service account) yields an empty listing.
+    store.ensure_local_environment_seeded()
+    ident = store.add_identity("local", "SERVICE_ACCOUNT", "sa-1", "sa-1", "sys")
+    store.set_default_identity("local", "sys")
+    now = datetime.now(timezone.utc)
+    store.set_cached_token(ident.id, "h.e30.s", now, now + timedelta(hours=1))
+
+    result = runner.invoke(app, ["team", "list"], env={"VL_OUTPUT": "json"})
+
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout) == []
 
 
 @respx.mock
@@ -179,143 +282,3 @@ def test_delete_resolves_then_drops_local() -> None:
     assert route.called
     assert store.get_team_or_none("local", "globo", "ingest") is None
 
-
-@respx.mock
-def test_members_list_refreshes_cache_for_known_identities() -> None:
-    _caller()
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
-    store.upsert_team("local", "globo", "ingest", "t-1")
-    known = store.add_identity("local", "USER", "u-9", "jdoe", "jdoe")
-    _mock_org()
-    respx.get(f"{IDP}/v1/teams/t-1/members").mock(
-        return_value=httpx.Response(
-            200,
-            json={"items": [
-                {"teamId": "t-1", "userId": "u-9", "role": "TEAM_ADMIN", "addedAt": "x"},
-                {"teamId": "t-1", "userId": "u-unknown", "role": "TEAM_MEMBER", "addedAt": "x"},
-            ]},
-        )
-    )
-
-    result = runner.invoke(app, ["team", "members", "list", "globo", "ingest"])
-
-    assert result.exit_code == 0, result.stdout
-    memberships = store.list_team_memberships(known.id)
-    assert [(m.team_name, m.role) for m in memberships] == [("ingest", "TEAM_ADMIN")]
-
-
-@respx.mock
-def test_members_add_defaults_role_and_upserts_known() -> None:
-    _caller()
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
-    store.upsert_team("local", "globo", "ingest", "t-1")
-    known = store.add_identity("local", "USER", "u-9", "jdoe", "jdoe")
-    _mock_org()
-    add = respx.post(f"{IDP}/v1/teams/t-1/members").mock(
-        return_value=httpx.Response(201, json={"teamId": "t-1", "userId": "u-9", "role": "TEAM_MEMBER"})
-    )
-
-    result = runner.invoke(
-        app, ["team", "members", "add", "globo", "ingest", "--user-id", "u-9"]
-    )
-
-    assert result.exit_code == 0, result.stdout
-    assert json.loads(add.calls.last.request.content) == {"userId": "u-9"}  # role omitted
-    assert store.list_team_memberships(known.id)[0].role == "TEAM_MEMBER"
-
-
-@respx.mock
-def test_members_set_role_and_remove() -> None:
-    _caller()
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
-    store.upsert_team("local", "globo", "ingest", "t-1")
-    known = store.add_identity("local", "USER", "u-9", "jdoe", "jdoe")
-    store.upsert_team_member(known.id, "local", "globo", "ingest", "TEAM_MEMBER")
-    _mock_org()
-    respx.patch(f"{IDP}/v1/teams/t-1/members/u-9").mock(
-        return_value=httpx.Response(200, json={"teamId": "t-1", "userId": "u-9", "role": "TEAM_ADMIN"})
-    )
-    respx.delete(f"{IDP}/v1/teams/t-1/members/u-9").mock(return_value=httpx.Response(204))
-
-    set_role = runner.invoke(
-        app, ["team", "members", "set-role", "globo", "ingest", "u-9", "--role", "TEAM_ADMIN"]
-    )
-    assert set_role.exit_code == 0, set_role.stdout
-    assert store.list_team_memberships(known.id)[0].role == "TEAM_ADMIN"
-
-    remove = runner.invoke(app, ["team", "members", "remove", "globo", "ingest", "u-9"])
-    assert remove.exit_code == 0, remove.stdout
-    assert store.list_team_memberships(known.id) == []
-
-
-@respx.mock
-def test_ingest_client_add_creates_service_account_identity() -> None:
-    _caller()
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
-    store.upsert_team("local", "globo", "ingest", "t-1")
-    _mock_org()
-    respx.post(f"{IDP}/v1/teams/t-1/ingest-clients").mock(
-        return_value=httpx.Response(
-            201,
-            json={"id": "sa-9", "displayName": "edge-01", "clientSecret": "sek", "keyVersion": 1, "status": "ACTIVE", "createdAt": "x"},
-        )
-    )
-
-    result = runner.invoke(
-        app, ["team", "ingest-clients", "add", "globo", "ingest", "edge-01"]
-    )
-
-    assert result.exit_code == 0, result.stdout
-    assert "sek" in result.stdout  # secret shown once
-    ident = store.get_identity("local", "ingest-edge-01")
-    assert ident.kind == "SERVICE_ACCOUNT" and ident.server_id == "sa-9"
-    cred = store.get_svc_acct(ident.id)
-    assert cred is not None
-    assert cred.client_secret_plaintext == "sek"
-    assert cred.private_key_path is None  # ingest clients never get a keypair
-
-
-@respx.mock
-def test_ingest_client_rotate_and_delete_track_local() -> None:
-    _caller()
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
-    store.upsert_team("local", "globo", "ingest", "t-1")
-    ident = store.add_identity("local", "SERVICE_ACCOUNT", "sa-9", "sa-9", "ingest-edge-01")
-    store.set_svc_acct(ident.id, "local", "globo", "old", key_version=1)
-    _mock_org()
-    respx.post(f"{IDP}/v1/teams/t-1/ingest-clients/sa-9/rotate").mock(
-        return_value=httpx.Response(200, json={"id": "sa-9", "displayName": "edge-01", "clientSecret": "new", "keyVersion": 2, "status": "ACTIVE", "createdAt": "x"})
-    )
-    respx.delete(f"{IDP}/v1/teams/t-1/ingest-clients/sa-9").mock(return_value=httpx.Response(204))
-
-    rotate = runner.invoke(
-        app, ["team", "ingest-clients", "rotate", "globo", "ingest", "sa-9"]
-    )
-    assert rotate.exit_code == 0, rotate.stdout
-    cred = store.get_svc_acct(ident.id)
-    assert cred.client_secret_plaintext == "new" and cred.key_version == 2
-
-    delete = runner.invoke(
-        app, ["team", "ingest-clients", "delete", "globo", "ingest", "sa-9"]
-    )
-    assert delete.exit_code == 0, delete.stdout
-    assert store.list_identities("local", kind="SERVICE_ACCOUNT") == []
-
-
-@respx.mock
-def test_ingest_client_list_no_local_write() -> None:
-    _caller()
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
-    store.upsert_team("local", "globo", "ingest", "t-1")
-    _mock_org()
-    respx.get(f"{IDP}/v1/teams/t-1/ingest-clients").mock(
-        return_value=httpx.Response(200, json={"items": [{"id": "sa-9", "displayName": "edge-01", "status": "ACTIVE", "keyVersion": 1}]})
-    )
-
-    result = runner.invoke(
-        app, ["team", "ingest-clients", "list", "globo", "ingest"], env={"VL_OUTPUT": "json"}
-    )
-
-    assert result.exit_code == 0, result.stdout
-    assert "sa-9" in result.stdout
-    assert store.list_identities("local", kind="SERVICE_ACCOUNT") == []

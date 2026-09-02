@@ -129,8 +129,9 @@ An identity has an implicit **default org**: a `SERVICE_ACCOUNT`'s single org, o
 `USER`'s sole cached `org_membership` (none if it has zero or several). Implemented
 as `store.default_org_for_identity()`. `vl whoami` shows it, and `--org` on
 `vl usr-acct add` / `vl svc-acct add` is now optional — omitted, it uses the
-acting identity's default org (clear error if that's ambiguous). `vl org` /
-`vl team` still take a positional `<org>`.
+acting identity's default org (clear error if that's ambiguous). `vl org` still
+takes a positional `<org>`; so do `vl team add` / `show` / `update` / `delete`,
+but **`vl team list` dropped it** — see §6.
 
 ## 4. `vl org` uses the resolved identity like everything else
 
@@ -144,3 +145,26 @@ acting identity's default org (clear error if that's ambiguous). `vl org` /
 Out of scope for this version; may return. `commands/events.py` and the
 now-orphaned `lib/config.py` were deleted. The `environment.kafka_bootstrap`
 column and `vl env --kafka` stay (forward-looking, per `vl-env-spec.md` §3).
+
+## 6. `vl team` trimmed to the team resource itself
+
+The `members` and `ingest-clients` sub-groups were **removed** — `vl team` is now
+just `add` / `show` / `list` / `update` / `delete`. This supersedes
+`vl-team-spec.md` §5.6 and §5.7. The server endpoints and the local `team_member`
+table are untouched; `team add` still caches the creator's `TEAM_ADMIN` row
+(`vl-team-spec.md` §5.1), it just has no `vl` reader any more.
+
+**`vl team list` dropped its `<org>` argument** (supersedes `vl-team-spec.md`
+§5.3). Scope now follows the caller's role, read from the `orgs` claim in their
+token (the same claim the IdP's `OrgStandingResolver` reads, so `vl`'s view
+matches the server's authorization view):
+
+- a **PLATFORM_ADMIN** entry (grants admin standing on every org) → list every
+  organization's teams: page through the public `GET /v1/organizations`, then
+  `GET /v1/teams?orgId=` per org.
+- otherwise → one `GET /v1/teams?orgId=` per org in the caller's `orgs` claim
+  (any-role membership, so a `KEY_READER`-only org is included — it still passes
+  the endpoint's `requireOrgMember` guard).
+
+Both render an `org` column. `--name <filter>` is still accepted and is passed to
+each per-org call. A token with no `orgs` claim (a service account) lists nothing.
