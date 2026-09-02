@@ -33,7 +33,7 @@ def test_v6_tables_exist(isolated_store: Path) -> None:
     tables = _tables(isolated_store)
     assert {"team", "team_member"} <= tables
     with sqlite3.connect(isolated_store) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION == 6
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
 
 
 def test_v5_store_migrates_to_v6(isolated_store: Path, monkeypatch: pytest.MonkeyPatch) -> None:

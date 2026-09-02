@@ -59,13 +59,44 @@ def generate_keypair(dest_dir: Path) -> tuple[Path, Path]:
     return private_path, public_path
 
 
+def import_private_key(src: Path, dest_dir: Path) -> tuple[Path, Path]:
+    """Copy an existing raw Ed25519 private key into ``dest_dir`` in managed layout.
+
+    Accepts a 32-byte seed or a 64-byte (seed ‖ public key) file, and writes the
+    canonical pair: ``private.key`` (64 bytes) plus a ``public.key`` derived from
+    it. The public key is always recomputed from the seed, so a caller only ever
+    has to supply the private half. Returns ``(private_path, public_path)``.
+    """
+    raw = Path(src).read_bytes()
+    if len(raw) not in (32, 64):
+        raise ValueError(
+            f"{src}: expected a 32- or 64-byte raw Ed25519 key, got {len(raw)} bytes"
+        )
+    private_key = Ed25519PrivateKey.from_private_bytes(raw[:32])
+    seed = private_key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+    public_raw = private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(dest_dir, 0o700)
+    private_path = dest_dir / "private.key"
+    public_path = dest_dir / "public.key"
+    private_path.write_bytes(seed + public_raw)
+    public_path.write_bytes(public_raw)
+    os.chmod(private_path, 0o600)
+    os.chmod(public_path, 0o644)
+    return private_path, public_path
+
+
 def install_keypair(
     private_src: Path, public_src: Path, dest_dir: Path
 ) -> tuple[Path, Path]:
     """Move a staged keypair into its final home, replacing what's there.
 
-    Used by rotation: the new keys are generated to a temp dir first, then moved
-    in only after the server has accepted the new public key.
+    The staged-swap primitive for key rotation: generate the new keys to a temp
+    dir, then move them in only after the server has accepted the new public key.
+    Currently unused — `vl svc-acct rotate-keys` was removed pending server
+    support (see docs/features/cli-implementation/svc-acct-key-rotation-gap.md) —
+    but kept for when rotation returns.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(dest_dir, 0o700)

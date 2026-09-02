@@ -11,6 +11,7 @@ and bumping ``SCHEMA_VERSION`` (§8 of the ``vl env`` spec):
 * v5 — rename ``user_credential`` -> ``user_acct``, ``service_account_credential``
   -> ``svc_acct`` (naming-convention cleanup, no schema change).
 * v6 — ``team`` cache + ``team_member`` join + ``vl team`` (Phase 6).
+* v7 — ``command_history`` ring buffer + ``vl history``.
 
 On open, every migration between the store's ``PRAGMA user_version`` and
 ``SCHEMA_VERSION`` is applied in order; a store from a *newer* `vl` is rejected
@@ -22,15 +23,16 @@ Everything here is local-only: no network calls, no authentication.
 from __future__ import annotations
 
 import os
+import shlex
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # Treat a cached token as expired this many seconds before its real expiry, to
 # avoid handing a command a token that dies mid-request.
@@ -164,6 +166,16 @@ _MIGRATIONS: tuple[str, ...] = (
         FOREIGN KEY (environment_name, org_name, team_name)
             REFERENCES team(environment_name, org_name, name)
             ON DELETE CASCADE
+    );
+    """,
+    # 6 -> 7: local command-history ring buffer for `vl history`. Local-only and
+    # best-effort — writes here are swallowed on failure and never fail the
+    # command being logged. Trimmed to the last _HISTORY_KEEP rows on each write.
+    """
+    CREATE TABLE IF NOT EXISTS command_history (
+        id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        ran_at  TEXT NOT NULL,
+        argv    TEXT NOT NULL
     );
     """,
 )
@@ -903,6 +915,19 @@ def list_org_memberships(identity_id: int) -> list[OrgMembership]:
         ]
 
 
+def default_org_for_identity(identity: Identity) -> str | None:
+    """The org an identity implicitly acts in, or ``None`` if it's ambiguous.
+
+    SERVICE_ACCOUNT: its single org. USER: its sole cached org membership, or
+    ``None`` when it has zero or more than one.
+    """
+    if identity.kind == "SERVICE_ACCOUNT":
+        cred = get_svc_acct(identity.id)
+        return cred.org_name if cred is not None else None
+    names = {m.org_name for m in list_org_memberships(identity.id)}
+    return next(iter(names)) if len(names) == 1 else None
+
+
 def get_cached_token(identity_id: int) -> Token | None:
     """A cached token for the identity — ``None`` if absent or (near) expired."""
     with _store() as conn:
@@ -1221,3 +1246,89 @@ def delete_team_member(
             (identity_id, environment_name, org_name, team_name),
         )
         conn.commit()
+
+
+# --------------------------------------------------------------------------- #
+# Command history (`vl history`)
+# --------------------------------------------------------------------------- #
+
+# How many recent invocations the ring buffer retains.
+_HISTORY_KEEP = 200
+
+# Options whose following value (or `=value`) is a credential and must never be
+# written to the history table.
+_HISTORY_SECRET_OPTS = frozenset(
+    {"--password", "--secret", "--client-id", "--client-secret", "--current-password"}
+)
+
+
+@dataclass(frozen=True)
+class HistoryEntry:
+    """One recorded `vl` invocation."""
+
+    ran_at: str
+    command: str
+
+
+def _redact_args(args: Sequence[str]) -> list[str]:
+    """Shell-quote args, replacing credential values with ``***``."""
+    out: list[str] = []
+    redact_next = False
+    for arg in args:
+        if redact_next:
+            out.append("***")
+            redact_next = False
+            continue
+        name = arg.split("=", 1)[0]
+        if name in _HISTORY_SECRET_OPTS:
+            if "=" in arg:
+                out.append(f"{name}=***")
+            else:
+                out.append(name)
+                redact_next = True
+            continue
+        out.append(shlex.quote(arg))
+    return out
+
+
+def record_command(args: Sequence[str]) -> None:
+    """Append one invocation to the local history ring buffer (best-effort).
+
+    Credential-bearing option values are redacted first. Any failure — read-only
+    store, locked db, schema mismatch — is swallowed: history is a convenience and
+    must never fail the command it is logging.
+    """
+    try:
+        rendered = "vl " + " ".join(_redact_args(args)) if args else "vl"
+        with _store() as conn:
+            conn.execute(
+                "INSERT INTO command_history (ran_at, argv) VALUES (?, ?)",
+                (_now(), rendered),
+            )
+            conn.execute(
+                "DELETE FROM command_history WHERE id <= "
+                "(SELECT MAX(id) FROM command_history) - ?",
+                (_HISTORY_KEEP,),
+            )
+            conn.commit()
+    except (sqlite3.Error, OSError, StoreError):
+        pass
+
+
+def list_command_history(limit: int) -> list[HistoryEntry]:
+    """The ``limit`` most recent invocations, oldest first.
+
+    ``vl history`` calls are filtered out here as well as at record time, so a
+    store written by an older `vl` (which did log them) still reads clean.
+    """
+    with _store() as conn:
+        rows = conn.execute(
+            "SELECT ran_at, argv FROM command_history "
+            "WHERE argv <> 'vl history' AND argv NOT LIKE 'vl history %' "
+            "ORDER BY id DESC LIMIT ?",
+            (max(limit, 0),),
+        ).fetchall()
+    return [
+        HistoryEntry(ran_at=row["ran_at"], command=row["argv"])
+        for row in reversed(rows)
+    ]

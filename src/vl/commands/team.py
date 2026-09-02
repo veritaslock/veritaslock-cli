@@ -6,15 +6,20 @@ token flow throughout. See vl-team-spec.md.
 
 from __future__ import annotations
 
-import re
 import shutil
-from collections.abc import Iterator
-from contextlib import contextmanager
 from typing import Annotated, Any
 
 import typer
 
-from vl.lib import api, auth, store
+from vl.commands._shared import (
+    AsOption,
+    EnvOption,
+    assert_label_free,
+    report_errors,
+    resolve_org,
+    slugify,
+)
+from vl.lib import auth, store
 from vl.lib.output import console, render
 from vl.lib.roles import TeamRole
 
@@ -25,48 +30,6 @@ ingest_clients_app = typer.Typer(
 )
 app.add_typer(members_app, name="members")
 app.add_typer(ingest_clients_app, name="ingest-clients")
-
-EnvOption = Annotated[
-    str | None,
-    typer.Option("--env", help="Environment to target (default: the store's default)."),
-]
-AsOption = Annotated[
-    str | None, typer.Option("--as", help="Identity label to run this command as.")
-]
-
-
-@contextmanager
-def _report_errors() -> Iterator[None]:
-    try:
-        yield
-    except (store.StoreError, api.ApiError, auth.AuthError) as exc:
-        console.print(f"[red]Error:[/red] {exc}")
-        raise typer.Exit(1) from exc
-
-
-def _slugify(name: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-
-
-def _assert_label_free(environment_name: str, label: str) -> None:
-    try:
-        store.get_identity(environment_name, label)
-    except store.IdentityNotFoundError:
-        return
-    raise store.IdentityExistsError(
-        f"Identity {label!r} already exists in environment {environment_name!r}."
-    )
-
-
-def _cache_org(environment_name: str, dto: dict[str, Any]) -> str:
-    store.upsert_organization(
-        environment_name,
-        dto["name"],
-        dto["id"],
-        dto["displayName"],
-        bool(dto["active"]),
-    )
-    return str(dto["name"])
 
 
 def _cache_team(
@@ -93,18 +56,11 @@ def _team_row(dto: dict[str, Any], team: store.Team | None) -> dict[str, Any]:
     }
 
 
-def _resolve_org(environment: store.Environment, org: str) -> dict[str, Any]:
-    with api.IdpClient(environment.idp_base_url) as client:
-        dto: dict[str, Any] = client.get("/v1/organizations", params={"name": org})
-    _cache_org(environment.name, dto)
-    return dto
-
-
 def _resolve_team(
     caller: store.Identity, environment: store.Environment, org: str, team_name: str
 ) -> tuple[str, str]:
     """Return ``(server_team_id, org_name)`` — local cache first, then the server."""
-    org_dto = _resolve_org(environment, org)
+    org_dto = resolve_org(environment, org)
     org_name = str(org_dto["name"])
 
     cached = store.get_team_or_none(environment.name, org_name, team_name)
@@ -143,10 +99,10 @@ def add(
     as_: AsOption = None,
 ) -> None:
     """Create a team (the caller becomes TEAM_ADMIN, server-side, in one transaction)."""
-    with _report_errors():
+    with report_errors():
         environment = store.get_environment(env)
         caller = store.resolve_identity(environment.name, as_)
-        org_dto = _resolve_org(environment, org)
+        org_dto = resolve_org(environment, org)
         org_name = str(org_dto["name"])
         dto = auth.authed_call(
             caller,
@@ -171,10 +127,10 @@ def show(
     as_: AsOption = None,
 ) -> None:
     """Show a team."""
-    with _report_errors():
+    with report_errors():
         environment = store.get_environment(env)
         caller = store.resolve_identity(environment.name, as_)
-        org_dto = _resolve_org(environment, org)
+        org_dto = resolve_org(environment, org)
         org_name = str(org_dto["name"])
         body = auth.authed_call(
             caller,
@@ -202,10 +158,10 @@ def list_(
     as_: AsOption = None,
 ) -> None:
     """List an organization's teams."""
-    with _report_errors():
+    with report_errors():
         environment = store.get_environment(env)
         caller = store.resolve_identity(environment.name, as_)
-        org_dto = _resolve_org(environment, org)
+        org_dto = resolve_org(environment, org)
         org_name = str(org_dto["name"])
         params: dict[str, Any] = {"orgId": org_dto["id"]}
         if name is not None:
@@ -251,7 +207,7 @@ def update(
             "[red]Error:[/red] nothing to update — supply --name and/or --description."
         )
         raise typer.Exit(1)
-    with _report_errors():
+    with report_errors():
         environment = store.get_environment(env)
         caller = store.resolve_identity(environment.name, as_)
         team_id, org_name = _resolve_team(caller, environment, org, name)
@@ -282,7 +238,7 @@ def delete(
     as_: AsOption = None,
 ) -> None:
     """Delete a team (drops the local cache row and its team_member rows)."""
-    with _report_errors():
+    with report_errors():
         environment = store.get_environment(env)
         caller = store.resolve_identity(environment.name, as_)
         team_id, org_name = _resolve_team(caller, environment, org, name)
@@ -309,7 +265,7 @@ def members_list(
     as_: AsOption = None,
 ) -> None:
     """List a team's members (bulk-refreshes the local team_member cache)."""
-    with _report_errors():
+    with report_errors():
         environment = store.get_environment(env)
         caller = store.resolve_identity(environment.name, as_)
         team_id, org_name = _resolve_team(caller, environment, org, team_name)
@@ -357,7 +313,7 @@ def members_add(
     as_: AsOption = None,
 ) -> None:
     """Add a member to a team."""
-    with _report_errors():
+    with report_errors():
         environment = store.get_environment(env)
         caller = store.resolve_identity(environment.name, as_)
         team_id, org_name = _resolve_team(caller, environment, org, team_name)
@@ -390,7 +346,7 @@ def members_set_role(
     as_: AsOption = None,
 ) -> None:
     """Change an existing team member's role."""
-    with _report_errors():
+    with report_errors():
         environment = store.get_environment(env)
         caller = store.resolve_identity(environment.name, as_)
         team_id, org_name = _resolve_team(caller, environment, org, team_name)
@@ -421,7 +377,7 @@ def members_remove(
     as_: AsOption = None,
 ) -> None:
     """Remove a member from a team."""
-    with _report_errors():
+    with report_errors():
         environment = store.get_environment(env)
         caller = store.resolve_identity(environment.name, as_)
         team_id, org_name = _resolve_team(caller, environment, org, team_name)
@@ -454,7 +410,7 @@ def ingest_clients_list(
     as_: AsOption = None,
 ) -> None:
     """List a team's ingest clients (live view, no local write)."""
-    with _report_errors():
+    with report_errors():
         environment = store.get_environment(env)
         caller = store.resolve_identity(environment.name, as_)
         team_id, _ = _resolve_team(caller, environment, org, team_name)
@@ -488,11 +444,11 @@ def ingest_clients_add(
     as_: AsOption = None,
 ) -> None:
     """Create a team ingest client — stored locally as a SERVICE_ACCOUNT identity."""
-    label = _slugify(f"{team_name}-{display_name}")
-    with _report_errors():
+    label = slugify(f"{team_name}-{display_name}")
+    with report_errors():
         environment = store.get_environment(env)
         caller = store.resolve_identity(environment.name, as_)
-        _assert_label_free(environment.name, label)
+        assert_label_free(environment.name, label)
         team_id, org_name = _resolve_team(caller, environment, org, team_name)
         dto = auth.authed_call(
             caller,
@@ -536,7 +492,7 @@ def ingest_clients_rotate(
     as_: AsOption = None,
 ) -> None:
     """Rotate an ingest client's client secret."""
-    with _report_errors():
+    with report_errors():
         environment = store.get_environment(env)
         caller = store.resolve_identity(environment.name, as_)
         team_id, _ = _resolve_team(caller, environment, org, team_name)
@@ -572,7 +528,7 @@ def ingest_clients_delete(
     as_: AsOption = None,
 ) -> None:
     """Delete a team ingest client."""
-    with _report_errors():
+    with report_errors():
         environment = store.get_environment(env)
         caller = store.resolve_identity(environment.name, as_)
         team_id, _ = _resolve_team(caller, environment, org, team_name)

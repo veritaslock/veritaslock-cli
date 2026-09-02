@@ -1,5 +1,7 @@
 # veritaslock-cli (`vl`) — Phase 6: `vl team`
 
+
+> **Naming note:** the command surface was later restructured — `vl identity` folded into `vl usr-acct` / `vl svc-acct`, `vl user` → `vl usr-acct`, `vl service-account` → `vl svc-acct`, and `vl org` moved to the `--as` auth model. Behaviour, schema, and rationale below are unchanged; see `vl-command-restructure.md` for the mapping.
 **Status:** Draft for implementation
 **Part of:** the larger `vl-cli-phase1-crud-spec.md` effort, broken out as its own standalone document.
 **Depends on:** `vl-env-spec.md` (Phase 1), `vl-org-spec.md` (Phase 2, for the local `organization` cache table this document's `team` table FKs against), `vl-identity-user-spec.md` (Phase 3, for `identity`, the `--as`/cached-token auth flow, and the `org_membership` design pattern this document mirrors), and `vl-service-account-spec.md` (Phase 4, for `identity`/`svc_acct` — team ingest clients populate the same tables Phase 4 established, via a different server endpoint).

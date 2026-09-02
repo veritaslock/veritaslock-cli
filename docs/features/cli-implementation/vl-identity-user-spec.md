@@ -1,5 +1,7 @@
 # veritaslock-cli (`vl`) — Phase 3: `vl identity` + `vl user`
 
+
+> **Naming note:** the command surface was later restructured — `vl identity` folded into `vl usr-acct` / `vl svc-acct`, `vl user` → `vl usr-acct`, `vl service-account` → `vl svc-acct`, and `vl org` moved to the `--as` auth model. Behaviour, schema, and rationale below are unchanged; see `vl-command-restructure.md` for the mapping.
 **Status:** Draft for implementation
 **Part of:** the larger `vl-cli-phase1-crud-spec.md` effort, broken out as its own standalone document. Depends on `vl-env-spec.md` (Phase 1) and `vl-org-spec.md` (Phase 2) — the `org_membership` join table introduced here references both `identity(id)` (defined in this document) and `organization(environment_name, name)` (defined in Phase 2).
 **Builds on:** the `environment` table from Phase 1, the `organization` table from Phase 2, and the live `UserController` on the IdP.
