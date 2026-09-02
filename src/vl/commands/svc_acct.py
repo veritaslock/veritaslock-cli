@@ -365,6 +365,10 @@ def list_(
     all_: Annotated[
         bool, typer.Option("--all", help="List server-side accounts, marking which are cached.")
     ] = False,
+    org: Annotated[
+        str | None,
+        typer.Option("--org", help="Filter the local listing to accounts in this org."),
+    ] = None,
     role: Annotated[
         ServiceAccountRole | None,
         typer.Option("--role", help="Server filter (with --remote / --all)."),
@@ -386,7 +390,18 @@ def list_(
     with report_errors():
         environment = store.get_environment(env)
 
+        if org is not None and (remote or all_):
+            raise CliError(
+                "--org filters the local cached listing and can't be combined "
+                "with --remote / --all (the server account list has no org filter)."
+            )
+
         if not remote and not all_:
+            identities = store.list_identities(
+                environment.name, kind="SERVICE_ACCOUNT"
+            )
+            if org is not None:
+                identities = [i for i in identities if _sa_org(i.id) == org]
             rows = [
                 {
                     "label": f"{i.label} *" if i.is_default else i.label,
@@ -395,11 +410,12 @@ def list_(
                     "key_version": _sa_key_version(i.id),
                     "secret": "stored",
                 }
-                for i in store.list_identities(
-                    environment.name, kind="SERVICE_ACCOUNT"
-                )
+                for i in identities
             ]
-            render(rows, title=f"Cached service accounts ({environment.name})")
+            title = f"Cached service accounts ({environment.name})"
+            if org is not None:
+                title += f" in {org}"
+            render(rows, title=title)
             return
 
         caller = store.resolve_identity(environment.name, as_)

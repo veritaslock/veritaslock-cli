@@ -19,6 +19,7 @@ import typer
 
 from vl.commands._shared import (
     AsOption,
+    CliError,
     EnvOption,
     cache_org,
     fetch_org_by_id,
@@ -368,6 +369,10 @@ def list_(
     all_: Annotated[
         bool, typer.Option("--all", help="List server-side users, marking which are cached.")
     ] = False,
+    org: Annotated[
+        str | None,
+        typer.Option("--org", help="Filter the local listing to accounts with a membership in this org."),
+    ] = None,
     status: Annotated[
         UserStatus | None,
         typer.Option("--status", help="Server filter (with --remote / --all)."),
@@ -386,7 +391,23 @@ def list_(
     with report_errors():
         environment = store.get_environment(env)
 
+        if org is not None and (remote or all_):
+            raise CliError(
+                "--org filters the local cached listing and can't be combined "
+                "with --remote / --all (the server user list has no org filter)."
+            )
+
         if not remote and not all_:
+            identities = store.list_identities(environment.name, kind="USER")
+            if org is not None:
+                identities = [
+                    i
+                    for i in identities
+                    if any(
+                        m.org_name == org
+                        for m in store.list_org_memberships(i.id)
+                    )
+                ]
             rows = [
                 {
                     "username": f"{i.principal_name} *"
@@ -395,9 +416,12 @@ def list_(
                     "password": _secret_cell(store.get_user_acct(i.id), False),
                     "orgs": _orgs_summary(i.id),
                 }
-                for i in store.list_identities(environment.name, kind="USER")
+                for i in identities
             ]
-            render(rows, title=f"Cached users ({environment.name})")
+            title = f"Cached users ({environment.name})"
+            if org is not None:
+                title += f" in {org}"
+            render(rows, title=title)
             return
 
         caller = store.resolve_identity(environment.name, as_)

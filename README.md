@@ -145,6 +145,7 @@ does it in one call instead.
 vl usr-acct add John Doe --role USER                # --org defaults to your org
 vl usr-acct add Ana Reyes --org globo --role ORG_ADMIN --email ana@acme.com --phone +15555550123
 vl usr-acct list                                    # cached accounts (local, no server call)
+vl usr-acct list --org globo                        # cached accounts with a membership in globo
 vl usr-acct list --remote --status ACTIVE           # server-side users
 vl usr-acct show jdoe                               # local view; --remote / --all hit the server
 vl usr-acct update jdoe --display-name "John Doe" --phone +15555550123 --rotate-password
@@ -162,6 +163,7 @@ requires both before `vl org update --owner` accepts it.
 ```bash
 vl svc-acct add "Ingest Bot" --role ACCOUNT --org globo   # prints the secret once
 vl svc-acct list                                          # cached (local); --remote / --all for server
+vl svc-acct list --org globo                              # cached accounts in globo
 vl svc-acct show ingest-bot --reveal-secret               # local view; --remote / --all hit the server
 vl svc-acct update ingest-bot --status SUSPENDED
 vl svc-acct get-assertion ingest-bot                      # signed JWT for hand-off

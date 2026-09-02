@@ -164,6 +164,29 @@ def test_list_local_by_default() -> None:
     assert "sa-9" in result.stdout and "globo" in result.stdout
 
 
+def test_list_local_filtered_by_org() -> None:
+    _caller()
+    for name in ("globo", "acme"):
+        store.upsert_organization("local", name, f"o-{name}", name, active=True)
+    g = store.add_identity("local", "SERVICE_ACCOUNT", "sa-g", "sa-g", "gbot")
+    store.set_svc_acct(g.id, "local", "globo", "s", key_version=1)
+    a = store.add_identity("local", "SERVICE_ACCOUNT", "sa-a", "sa-a", "abot")
+    store.set_svc_acct(a.id, "local", "acme", "s", key_version=1)
+
+    result = runner.invoke(
+        app, ["svc-acct", "list", "--org", "acme"], env={"VL_OUTPUT": "json"}
+    )
+    assert result.exit_code == 0, result.stdout
+    assert "abot" in result.stdout and "gbot" not in result.stdout
+
+
+def test_list_org_rejects_remote() -> None:
+    _caller()
+    result = runner.invoke(app, ["svc-acct", "list", "--org", "globo", "--all"])
+    assert result.exit_code == 1
+    assert "filters the local cached listing" in result.stdout
+
+
 @respx.mock
 def test_list_remote_passes_filters() -> None:
     _caller()

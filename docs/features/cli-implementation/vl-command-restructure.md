@@ -57,6 +57,12 @@ cached** view by default — no server call. Flags:
 
 - `--remote` — the server-side listing / record instead (authenticated).
 - `--all` — the server record merged with local metadata.
+- `--org <name>` (`list` only) — filter the **local** listing: for `usr-acct`,
+  accounts with an `org_membership` in that org; for `svc-acct`, accounts whose
+  `svc_acct.org_name` matches. It can't be combined with `--remote` / `--all` —
+  neither `GET /v1/users` nor `GET /v1/service-accounts` takes an org filter, and
+  the user list rows carry no org data at all. Adding server-side org filtering
+  is a future IdP change (an `orgId` query param on both list endpoints).
 
 `vl identity list`'s cross-kind "what can I `--as`?" view is replaced by top-level
 **`vl whoami`** plus the two per-kind local `list`s.

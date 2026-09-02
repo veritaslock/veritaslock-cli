@@ -188,6 +188,34 @@ def test_list_local_by_default() -> None:
     assert "jdoe" in result.stdout and "root *" in result.stdout  # default marked
 
 
+def test_list_local_filtered_by_org() -> None:
+    _caller()
+    for name in ("globo", "acme"):
+        store.upsert_organization("local", name, f"o-{name}", name, active=True)
+    a = store.add_identity("local", "USER", "u-a", "aa", "aa")
+    store.set_user_acct(a.id, "pw")
+    store.upsert_org_membership(a.id, "local", "globo", "USER")
+    b = store.add_identity("local", "USER", "u-b", "bb", "bb")
+    store.set_user_acct(b.id, "pw")
+    store.upsert_org_membership(b.id, "local", "acme", "USER")
+
+    result = runner.invoke(
+        app, ["usr-acct", "list", "--org", "globo"], env={"VL_OUTPUT": "json"}
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "aa" in result.stdout
+    assert "bb" not in result.stdout
+    assert "root" not in result.stdout  # no membership in globo
+
+
+def test_list_org_rejects_remote() -> None:
+    _caller()
+    result = runner.invoke(app, ["usr-acct", "list", "--org", "globo", "--remote"])
+    assert result.exit_code == 1
+    assert "filters the local cached listing" in result.stdout
+
+
 @respx.mock
 def test_list_remote_passes_filters_and_marks_local() -> None:
     _caller()
