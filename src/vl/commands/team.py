@@ -13,6 +13,7 @@ import typer
 from vl.commands._shared import (
     AsOption,
     EnvOption,
+    cache_team,
     caller_orgs_claim,
     fetch_all_orgs,
     org_name_resolver,
@@ -26,20 +27,6 @@ from vl.lib.output import console, render
 app = typer.Typer(
     help="Manage VeritasLock teams.", no_args_is_help=True, cls=HelpOnErrorGroup
 )
-
-
-def _cache_team(
-    environment_name: str, org_name: str, dto: dict[str, Any]
-) -> store.Team:
-    return store.upsert_team(
-        environment_name,
-        org_name,
-        str(dto["name"]),
-        str(dto["id"]),
-        description=dto.get("description"),
-        created_by=dto.get("createdBy"),
-        created_at=str(dto["createdAt"]) if dto.get("createdAt") else None,
-    )
 
 
 def _team_row(dto: dict[str, Any], team: store.Team | None) -> dict[str, Any]:
@@ -75,7 +62,7 @@ def _resolve_team(
         raise store.TeamNotFoundError(
             f"No team {team_name!r} in organization {org!r}."
         )
-    _cache_team(environment.name, org_name, items[0])
+    cache_team(environment.name, org_name, items[0])
     return str(items[0]["id"]), org_name
 
 
@@ -108,7 +95,7 @@ def add(
                 json={"orgId": org_dto["id"], "name": name, "description": description},
             ),
         )
-        team = _cache_team(environment.name, org_name, dto)
+        team = cache_team(environment.name, org_name, dto)
         store.upsert_team_member(
             caller.id, environment.name, org_name, name, "TEAM_ADMIN"
         )
@@ -140,7 +127,7 @@ def show(
             raise store.TeamNotFoundError(
                 f"No team {name!r} in organization {org!r}."
             )
-        team = _cache_team(environment.name, org_name, items[0])
+        team = cache_team(environment.name, org_name, items[0])
     render(_team_row(items[0], team), title=f"Team: {org_name}/{name}")
 
 
@@ -188,7 +175,7 @@ def list_(
                 lambda c: c.get("/v1/teams", params=params),
             )
             for item in body.get("items", []):
-                _cache_team(environment.name, org_name, item)
+                cache_team(environment.name, org_name, item)
                 rows.append(
                     {
                         "org": org_name,
@@ -242,7 +229,7 @@ def update(
             # its best-effort team_member rows) and re-cache under the new name.
             if store.get_team_or_none(environment.name, org_name, name) is not None:
                 store.delete_team(environment.name, org_name, name)
-        team = _cache_team(environment.name, org_name, dto)
+        team = cache_team(environment.name, org_name, dto)
     render(_team_row(dto, team), title="Team updated")
 
 

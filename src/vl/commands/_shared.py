@@ -70,6 +70,21 @@ def cache_org(environment_name: str, dto: dict[str, Any]) -> str:
     return str(dto["name"])
 
 
+def cache_team(
+    environment_name: str, org_name: str, dto: dict[str, Any]
+) -> store.Team:
+    """Upsert the local ``team`` cache row from a TeamDto; return it."""
+    return store.upsert_team(
+        environment_name,
+        org_name,
+        str(dto["name"]),
+        str(dto["id"]),
+        description=dto.get("description"),
+        created_by=dto.get("createdBy"),
+        created_at=str(dto["createdAt"]) if dto.get("createdAt") else None,
+    )
+
+
 def resolve_org(environment: store.Environment, name: str) -> dict[str, Any]:
     """`GET /v1/organizations?name=` (public), cache it, return the DTO."""
     with api.IdpClient(environment.idp_base_url) as client:

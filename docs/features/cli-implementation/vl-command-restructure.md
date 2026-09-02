@@ -148,11 +148,27 @@ column and `vl env --kafka` stay (forward-looking, per `vl-env-spec.md` §3).
 
 ## 6. `vl team` trimmed to the team resource itself
 
-The `members` and `ingest-clients` sub-groups were **removed** — `vl team` is now
-just `add` / `show` / `list` / `update` / `delete`. This supersedes
-`vl-team-spec.md` §5.6 and §5.7. The server endpoints and the local `team_member`
-table are untouched; `team add` still caches the creator's `TEAM_ADMIN` row
-(`vl-team-spec.md` §5.1), it just has no `vl` reader any more.
+The `members` and `ingest-clients` sub-groups were **removed** from `vl team` —
+it's now just `add` / `show` / `list` / `update` / `delete`. This supersedes
+`vl-team-spec.md` §5.7 entirely and reshapes §5.6. The server endpoints and the
+local `team_member` table are untouched.
+
+**`vl team-member` came back as a top-level command, peer to `vl team`** — a
+trimmed replacement for the old `vl team members` sub-group, with just two verbs:
+
+- `vl team-member list <team> [--org <name>]` — the team's members, each `userId`
+  resolved to a `username` from the team org's user list (then `vl`'s local
+  cache, then the raw id). Bulk-refreshes the local `team_member` cache.
+- `vl team-member add <team> <username> [--role TEAM_ADMIN|TEAM_MEMBER] [--org <name>]`
+  — `POST /v1/teams/{id}/members`. The user must already belong to the team's
+  org; `vl` pre-checks that against `GET /v1/users?orgId=` before the call and
+  the server enforces it too (`TeamService.addMember`).
+
+Both address the team by **name alone**, resolved across the caller's orgs the
+same way `vl team list` scopes (every org for a PLATFORM_ADMIN); `--org`
+disambiguates when several match. There is no `set-role` / `remove` — `--role` on
+`add` is the only role control for now. `team add` still writes the creator's
+`TEAM_ADMIN` row locally (`vl-team-spec.md` §5.1).
 
 **`vl team list` dropped its `<org>` argument** (supersedes `vl-team-spec.md`
 §5.3). Scope now follows the caller's role, read from the `orgs` claim in their

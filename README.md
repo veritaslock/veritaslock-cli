@@ -225,6 +225,24 @@ read from the `orgs` claim in their token (the server's own authoritative view):
 the server team id via its local `team` cache, falling back to
 `GET /v1/teams?orgId=&name=`.
 
+## Team members
+
+`vl team-member` is a peer of `vl team`. A team is addressed by **name alone** —
+`vl` resolves it across the org(s) the caller belongs to (every org for a
+PLATFORM_ADMIN); pass `--org` only to disambiguate when more than one matches.
+
+```bash
+vl team-member list ingest                      # members, with usernames resolved
+vl team-member add ingest jdoe                   # jdoe joins as TEAM_MEMBER
+vl team-member add ingest jdoe --role TEAM_ADMIN
+vl team-member list ingest --org globo           # when >1 of your orgs has an "ingest"
+```
+
+`add` takes the team name and the **username**. The user must already be a member
+of the team's organization — `vl` checks this against the org's user list before
+the call (the server enforces it too). Usernames in `list` are resolved from the
+same org user list, falling back to `vl`'s local cache, then the raw id.
+
 ## Layout
 
 ```
@@ -237,6 +255,7 @@ src/vl/
 │   ├── usr_acct.py   vl usr-acct add | cache | login | use | clear | show | list | update | delete
 │   ├── svc_acct.py   vl svc-acct add | cache | use | clear | show | list | update | delete | get-assertion
 │   ├── team.py       vl team add | show | list | update | delete
+│   ├── team_member.py  vl team-member list | add
 │   ├── whoami.py     vl whoami
 │   └── history.py    vl history
 └── lib/              shared helpers used across commands

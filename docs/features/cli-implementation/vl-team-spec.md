@@ -3,7 +3,7 @@
 
 > **Naming note:** the command surface was later restructured — `vl identity` folded into `vl usr-acct` / `vl svc-acct`, `vl user` → `vl usr-acct`, `vl service-account` → `vl svc-acct`, and `vl org` moved to the `--as` auth model. Behaviour, schema, and rationale below are unchanged; see `vl-command-restructure.md` for the mapping.
 >
-> **Scope trimmed (later):** `vl-command-restructure.md` §6 **removed the `members` and `ingest-clients` sub-groups** (§5.6, §5.7 below are historical) and **dropped `vl team list`'s `<org>` argument** in favour of role-based scoping (§5.3 revised there). The `team` / `team_member` tables and the server endpoints are unchanged.
+> **Scope trimmed (later):** `vl-command-restructure.md` §6 **removed the `members` and `ingest-clients` sub-groups** from `vl team` and **dropped `vl team list`'s `<org>` argument** in favour of role-based scoping (§5.3 revised there). `members` was then reintroduced as a top-level **`vl team-member`** command (peer to `vl team`) with just `list` and `add` — see §5.6 and the restructure doc §6. `ingest-clients` (§5.7) is gone for good. The `team` / `team_member` tables and the server endpoints are unchanged.
 **Status:** Draft for implementation
 **Part of:** the larger `vl-cli-phase1-crud-spec.md` effort, broken out as its own standalone document.
 **Depends on:** `vl-env-spec.md` (Phase 1), `vl-org-spec.md` (Phase 2, for the local `organization` cache table this document's `team` table FKs against), `vl-identity-user-spec.md` (Phase 3, for `identity`, the `--as`/cached-token auth flow, and the `org_membership` design pattern this document mirrors), and `vl-service-account-spec.md` (Phase 4, for `identity`/`svc_acct` — team ingest clients populate the same tables Phase 4 established, via a different server endpoint).
@@ -90,7 +90,12 @@ Resolve `teamId` (§4), then `DELETE /v1/teams/{teamId}`. On success, delete the
 
 ### 5.6 Members
 
-> **Removed** — `vl-command-restructure.md` §6 dropped the `members` sub-group entirely. The subsection below is historical. The `POST/PATCH/DELETE /v1/teams/{id}/members` endpoints and the local `team_member` table still exist; `vl team add` still writes the creator's `TEAM_ADMIN` row (§5.1).
+> **Reshaped** — `vl-command-restructure.md` §6 replaced the `vl team members` sub-group with a top-level **`vl team-member`** command (peer to `vl team`), keeping only `list` and `add`:
+> - **`vl team-member list <team> [--org <name>] [--as <label>] [--env <env>]`** — `GET /v1/teams/{teamId}/members`, team resolved by name across the caller's orgs (§5.3-style scoping). Each `userId` is resolved to a `username` via the team org's `GET /v1/users?orgId=` list, then `vl`'s local cache, then shown raw. Bulk-refreshes the local `team_member` cache.
+> - **`vl team-member add <team> <username> [--role TEAM_ADMIN|TEAM_MEMBER] [--org <name>] [--as <label>] [--env <env>]`** — resolve the team (by name) and the user (by username, looked up in the team org's user list — this both maps `username → userId` and enforces "already in the org", which the server also checks in `TeamService.addMember`). Then `POST /v1/teams/{teamId}/members` with `{userId, role?}`. Best-effort local `team_member` upsert if the username matches a known local identity.
+> - **No `set-role` / `remove`.** `--role` on `add` is the only role control; re-`add` with a different `--role` also works server-side (it reactivates / re-roles an existing row).
+>
+> The `PATCH` / `DELETE /v1/teams/{id}/members/{userId}` endpoints still exist server-side. `vl team add` still writes the creator's `TEAM_ADMIN` row (§5.1). The subsection below is the historical `vl team members` design.
 
 - **`vl team members list <org> <team-name> [--as <label>] [--env <env>]`** — resolve `teamId`, `GET /v1/teams/{teamId}/members` → `ListResponse<TeamMemberDto>`. Upserts `team_member` rows for every result — this is the one place this table gets refreshed in bulk (§3).
 - **`vl team members add <org> <team-name> --user-id <server-user-id> [--role TEAM_ADMIN|TEAM_MEMBER] [--as <label>] [--env <env>]`** — resolve `teamId`, `POST /v1/teams/{teamId}/members` with `{userId, role}` (`role` optional, defaults server-side to `TEAM_MEMBER` if omitted, per `AddTeamMemberRequest`). On success: upsert a `team_member` row **only if** `--user-id` matches a locally known identity's `server_id` — same best-effort pattern already established for `vl org members add`'s retrofit (Phase 3 §9.6); if the target isn't tracked locally, nothing to attach the membership to, and that's fine.

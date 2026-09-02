@@ -9,7 +9,7 @@ import sys
 
 import typer
 
-from vl.commands import env, org, svc_acct, team, usr_acct
+from vl.commands import env, org, svc_acct, team, team_member, usr_acct
 from vl.commands.history import history
 from vl.commands.whoami import whoami
 from vl.lib import store
@@ -32,6 +32,7 @@ app.add_typer(usr_acct.app, name="user", hidden=True)
 app.add_typer(usr_acct.app, name="user-acct", hidden=True)
 app.add_typer(svc_acct.app, name="svc-acct")
 app.add_typer(team.app, name="team")
+app.add_typer(team_member.app, name="team-member")
 app.command("whoami")(whoami)
 app.command("history")(history)
 
