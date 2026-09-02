@@ -13,11 +13,13 @@ from typing import Annotated
 import typer
 
 from vl.lib import store
+from vl.lib.cli import HelpOnErrorGroup
 from vl.lib.output import console, render
 
 app = typer.Typer(
     help="Manage VeritasLock environments (local store only).",
     no_args_is_help=True,
+    cls=HelpOnErrorGroup,
 )
 
 

@@ -23,6 +23,13 @@ def _fmt() -> str:
     return os.environ.get("VL_OUTPUT", "table").lower()
 
 
+def note(message: str) -> None:
+    """Print a dim advisory line, suppressed in JSON mode so output stays parseable."""
+    if _fmt() == "json":
+        return
+    console.print(f"[dim]{message}[/dim]")
+
+
 def render(data: Row | list[Row], *, title: str | None = None) -> None:
     """Render a row or list of rows as a table or JSON."""
     rows = data if isinstance(data, list) else [data]

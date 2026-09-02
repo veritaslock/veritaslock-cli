@@ -23,16 +23,23 @@ from vl.commands._shared import (
     assert_label_free,
     cache_org,
     fetch_org_by_id,
+    org_name_resolver,
     refuse_duplicate_account,
     report_errors,
     resolve_membership_org,
+    resolve_org,
     slugify,
 )
 from vl.lib import api, auth, keys, store
+from vl.lib.cli import HelpOnErrorGroup
 from vl.lib.output import console, render
 from vl.lib.roles import ServiceAccountRole
 
-app = typer.Typer(help="Manage VeritasLock service accounts.", no_args_is_help=True)
+app = typer.Typer(
+    help="Manage VeritasLock service accounts.",
+    no_args_is_help=True,
+    cls=HelpOnErrorGroup,
+)
 
 
 class ServiceAccountStatus(str, Enum):
@@ -143,6 +150,7 @@ def add(
             public_key_path=str(public_path),
             private_key_path=str(private_path),
             key_version=1,
+            role=role.value,
         )
 
     render(_sa_row(created, None), title="Service account created")
@@ -238,6 +246,7 @@ def cache(
             public_key_path=stored_public,
             private_key_path=stored_private,
             key_version=sa_dto.get("keyVersion"),
+            role=sa_dto.get("role"),
         )
 
     console.print(
@@ -325,6 +334,12 @@ def show(
                 environment.idp_base_url,
                 lambda c: c.get(f"/v1/service-accounts/{identity.server_id}"),
             )
+            if cred is not None:
+                store.refresh_svc_acct_server_fields(
+                    identity.id,
+                    role=server.get("role"),
+                    key_version=server.get("keyVersion"),
+                )
 
     if remote and not all_:
         assert server is not None
@@ -336,6 +351,7 @@ def show(
         "id": identity.server_id,
         "default": "yes" if identity.is_default else "no",
         "org": cred.org_name if cred else "-",
+        "role": (cred.role if cred else None) or "-",
         "client_secret": _sa_secret_cell(cred, reveal_secret),
         "key_version": (cred.key_version if cred else None) or "-",
         "private_key_path": (cred.private_key_path if cred else None) or "(none)",
@@ -367,7 +383,11 @@ def list_(
     ] = False,
     org: Annotated[
         str | None,
-        typer.Option("--org", help="Filter the local listing to accounts in this org."),
+        typer.Option(
+            "--org",
+            help="Filter to accounts in this org. Local by default; with "
+            "--remote / --all it's sent as the server's orgId filter.",
+        ),
     ] = None,
     role: Annotated[
         ServiceAccountRole | None,
@@ -390,12 +410,6 @@ def list_(
     with report_errors():
         environment = store.get_environment(env)
 
-        if org is not None and (remote or all_):
-            raise CliError(
-                "--org filters the local cached listing and can't be combined "
-                "with --remote / --all (the server account list has no org filter)."
-            )
-
         if not remote and not all_:
             identities = store.list_identities(
                 environment.name, kind="SERVICE_ACCOUNT"
@@ -407,6 +421,7 @@ def list_(
                     "label": f"{i.label} *" if i.is_default else i.label,
                     "id": i.server_id,
                     "org": _sa_org(i.id),
+                    "role": _sa_role(i.id),
                     "key_version": _sa_key_version(i.id),
                     "secret": "stored",
                 }
@@ -426,6 +441,8 @@ def list_(
             params["status"] = status.value
         if include_deleted:
             params["includeDeleted"] = "true"
+        if org is not None:
+            params["orgId"] = resolve_org(environment, org)["id"]
         body = auth.authed_call(
             caller,
             environment.idp_base_url,
@@ -437,19 +454,31 @@ def list_(
             i.server_id: i
             for i in store.list_identities(environment.name, kind="SERVICE_ACCOUNT")
         }
+        for item in items:
+            local = by_server_id.get(item["id"])
+            if local is not None:
+                store.refresh_svc_acct_server_fields(
+                    local.id,
+                    role=item.get("role"),
+                    key_version=item.get("keyVersion"),
+                )
+        resolve_org_name = org_name_resolver(environment)
 
     render(
         [
             {
                 "id": item["id"],
                 "display_name": item.get("displayName", ""),
+                "org": resolve_org_name(str(item.get("orgId") or "")),
                 "role": item.get("role", ""),
                 "status": item.get("status", ""),
+                "cached": "yes" if item["id"] in by_server_id else "no",
                 "label": _local_label(by_server_id.get(item["id"])),
             }
             for item in items
         ],
-        title="Service accounts (server)",
+        title="Service accounts (server)"
+        + (f" in {org}" if org is not None else ""),
     )
     if next_cursor:
         console.print(f"[dim]more results — rerun with --page {next_cursor}[/dim]")
@@ -463,6 +492,11 @@ def _sa_org(identity_id: int) -> str:
 def _sa_key_version(identity_id: int) -> str:
     cred = store.get_svc_acct(identity_id)
     return str(cred.key_version) if cred and cred.key_version is not None else "-"
+
+
+def _sa_role(identity_id: int) -> str:
+    cred = store.get_svc_acct(identity_id)
+    return (cred.role if cred else None) or "-"
 
 
 def _local_label(identity: store.Identity | None) -> str:
@@ -522,6 +556,8 @@ def update(
                 f"/v1/service-accounts/{identity.server_id}", json=body
             ),
         )
+        if role is not None:
+            store.update_svc_acct_role(identity.id, role.value)
 
     render(
         _sa_row(dto, store.get_svc_acct(identity.id)), title="Service account updated"

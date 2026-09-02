@@ -13,17 +13,23 @@ from vl.commands import env, org, svc_acct, team, usr_acct
 from vl.commands.history import history
 from vl.commands.whoami import whoami
 from vl.lib import store
+from vl.lib.cli import HelpOnErrorGroup
 
 app = typer.Typer(
     name="vl",
     help="Unified admin CLI for VeritasLock.",
     no_args_is_help=True,
     add_completion=False,
+    cls=HelpOnErrorGroup,
 )
 
 app.add_typer(env.app, name="env")
 app.add_typer(org.app, name="org")
 app.add_typer(usr_acct.app, name="usr-acct")
+# `user` / `user-acct` are undocumented synonyms for `usr-acct` — accepted
+# silently (hidden from help, no deprecation notice).
+app.add_typer(usr_acct.app, name="user", hidden=True)
+app.add_typer(usr_acct.app, name="user-acct", hidden=True)
 app.add_typer(svc_acct.app, name="svc-acct")
 app.add_typer(team.app, name="team")
 app.command("whoami")(whoami)

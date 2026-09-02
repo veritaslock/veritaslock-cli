@@ -94,6 +94,15 @@ def get_private_key_path(identity_label: str, environment: str) -> Path: ...
 
 ## 4. `vl user`
 
+> **Superseded.** This section was broken out into
+> [`cli-implementation/vl-identity-user-spec.md`](cli-implementation/vl-identity-user-spec.md)
+> and then reshaped by
+> [`cli-implementation/vl-command-restructure.md`](cli-implementation/vl-command-restructure.md).
+> The command is now **`vl usr-acct`** (aliases `user` / `user-acct`); `add` takes
+> `<username> --email <email> [--role]` (role defaults to `USER`); `list` / `show`
+> default to a local view and take `--org`. Treat the subsections below as
+> historical — see those two documents for current behaviour.
+
 ### 4.1 `vl user add <first> <last> --org <org> --role <ADMIN|USER> [--env <env>]`
 
 1. Resolve `org_id` from `--org` via `GET /v1/organizations?name=`.
@@ -117,6 +126,14 @@ def get_private_key_path(identity_label: str, environment: str) -> Path: ...
 ---
 
 ## 5. `vl service-account`
+
+> **Superseded.** This section was broken out into
+> [`cli-implementation/vl-service-account-spec.md`](cli-implementation/vl-service-account-spec.md)
+> and then reshaped by
+> [`cli-implementation/vl-command-restructure.md`](cli-implementation/vl-command-restructure.md).
+> The command is now **`vl svc-acct`**; `list` / `show` default to a local view,
+> `list` takes `--org` and shows an `org` column. Treat the subsections below as
+> historical — see those two documents for current behaviour.
 
 Every service account needs **both** a symmetric secret (for `clientId`/`clientSecret` → `/auth/service-account/token`) and an asymmetric Ed25519 keypair (for private-key-signed JWT assertions → `/auth/service-account/authenticate`) — neither is deferrable per your direction. This makes `add` a multi-step flow, mirroring `provision_service_account.sh` exactly.
 

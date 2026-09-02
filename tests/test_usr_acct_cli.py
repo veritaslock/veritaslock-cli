@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 import bcrypt
 import httpx
+import pytest
 import respx
 from typer.testing import CliRunner
 
@@ -47,14 +48,16 @@ def test_add_creates_user_identity_credential_membership() -> None:
     )
 
     result = runner.invoke(
-        app, ["usr-acct", "add", "John", "Doe", "--org", "globo", "--role", "USER"]
+        app, ["usr-acct", "add", "jdoe", "--email", "jdoe@x.com", "--org", "globo"]
     )
 
     assert result.exit_code == 0, result.stdout
     body = json.loads(create.calls.last.request.content)
     assert body["username"] == "jdoe"
-    assert body["email"] == "john.doe@example.com"  # placeholder default
+    assert body["email"] == "jdoe@x.com"
+    assert "displayName" not in body  # no --first / --last
     assert "phoneNumber" not in body  # omitted when --phone not given
+    # --role omitted -> defaults to USER
     assert body["organizations"][0] == {"orgId": "org-1", "orgName": "globo", "role": "USER"}
     # client-side bcrypt hash, never plaintext
     assert body["passwordHash"].startswith("$2")
@@ -67,11 +70,12 @@ def test_add_creates_user_identity_credential_membership() -> None:
         cred.password_plaintext.encode(), body["passwordHash"].encode()
     )
     assert store.list_org_memberships(ident.id)[0].role == "USER"
-    assert "Password (shown once)" in result.stdout
+    assert "globo:USER" in result.stdout  # org shown in the summary
+    assert "Password (generated, shown once)" in result.stdout
 
 
 @respx.mock
-def test_add_sends_explicit_email_and_phone() -> None:
+def test_add_sends_name_email_and_phone() -> None:
     _caller()
     respx.get(f"{IDP}/v1/organizations", params={"name": "globo"}).mock(
         return_value=httpx.Response(200, json=ORG_DTO)
@@ -86,16 +90,75 @@ def test_add_sends_explicit_email_and_phone() -> None:
     result = runner.invoke(
         app,
         [
-            "usr-acct", "add", "John", "Doe", "--org", "globo", "--role", "ORG_ADMIN",
+            "usr-acct", "add", "jdoe", "--org", "globo", "--role", "ORG_ADMIN",
+            "--first", "John", "--last", "Doe",
             "--email", "j@real.com", "--phone", "+15555550123",
         ],
+        env={"VL_OUTPUT": "json"},
     )
 
     assert result.exit_code == 0, result.stdout
     body = json.loads(create.calls.last.request.content)
     assert body["email"] == "j@real.com"
     assert body["phoneNumber"] == "+15555550123"
-    assert "+15555550123" in result.stdout
+    assert body["displayName"] == "John Doe"  # joined from --first / --last
+    summary = json.loads(result.stdout.split("Password")[0])
+    assert summary["phone"] == "+15555550123"
+    assert summary["org"] == "globo:ORG_ADMIN"
+
+
+@respx.mock
+def test_add_uses_supplied_password_and_stays_quiet() -> None:
+    _caller()
+    respx.get(f"{IDP}/v1/organizations", params={"name": "globo"}).mock(
+        return_value=httpx.Response(200, json=ORG_DTO)
+    )
+    create = respx.post(f"{IDP}/v1/users").mock(
+        return_value=httpx.Response(
+            201, json={"id": "u-new", "username": "jdoe", "email": "j@x", "status": "ACTIVE"}
+        )
+    )
+
+    result = runner.invoke(
+        app,
+        ["usr-acct", "add", "jdoe", "--email", "j@x.com", "--org", "globo",
+         "--password", "correct horse battery"],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    body = json.loads(create.calls.last.request.content)
+    assert bcrypt.checkpw(b"correct horse battery", body["passwordHash"].encode())
+    cred = store.get_user_acct(store.get_identity("local", "jdoe").id)
+    assert cred is not None and cred.password_plaintext == "correct horse battery"
+    assert "generated" not in result.stdout  # nothing printed — the user chose it
+
+
+def test_add_requires_email() -> None:
+    _caller()
+    result = runner.invoke(app, ["usr-acct", "add", "jdoe", "--org", "globo"])
+    # a missing required option -> `add` help, exit 0, no server call attempted
+    assert result.exit_code == 0
+    assert "--email" in result.output and "Error" not in result.output
+
+
+@respx.mock
+def test_add_only_first_name_still_sets_display_name() -> None:
+    _caller()
+    respx.get(f"{IDP}/v1/organizations", params={"name": "globo"}).mock(
+        return_value=httpx.Response(200, json=ORG_DTO)
+    )
+    create = respx.post(f"{IDP}/v1/users").mock(
+        return_value=httpx.Response(
+            201, json={"id": "u-new", "username": "cher", "email": "c@x", "status": "ACTIVE"}
+        )
+    )
+
+    result = runner.invoke(
+        app, ["usr-acct", "add", "cher", "--email", "c@x.com", "--org", "globo", "--first", "Cher"]
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(create.calls.last.request.content)["displayName"] == "Cher"
 
 
 @respx.mock
@@ -103,7 +166,7 @@ def test_add_rejects_service_account_caller() -> None:
     _caller("svc", kind="SERVICE_ACCOUNT")
 
     result = runner.invoke(
-        app, ["usr-acct", "add", "John", "Doe", "--org", "globo", "--role", "USER"]
+        app, ["usr-acct", "add", "jdoe", "--email", "j@x.com", "--org", "globo"]
     )
     assert result.exit_code == 1
     assert "only a USER identity" in result.stdout
@@ -112,7 +175,7 @@ def test_add_rejects_service_account_caller() -> None:
 def test_add_with_no_identity_errors() -> None:
     store.ensure_local_environment_seeded()  # no identities at all
     result = runner.invoke(
-        app, ["usr-acct", "add", "John", "Doe", "--org", "globo", "--role", "USER"]
+        app, ["usr-acct", "add", "jdoe", "--email", "j@x.com", "--org", "globo"]
     )
     assert result.exit_code == 1
     assert "No identity selected" in result.stdout
@@ -129,7 +192,7 @@ def test_add_surfaces_403_from_server() -> None:
     )
 
     result = runner.invoke(
-        app, ["usr-acct", "add", "John", "Doe", "--org", "globo", "--role", "ORG_ADMIN"]
+        app, ["usr-acct", "add", "jdoe", "--email", "j@x.com", "--org", "globo", "--role", "ORG_ADMIN"]
     )
     assert result.exit_code == 1
     assert "Not authorized to create users" in result.stdout
@@ -175,6 +238,49 @@ def test_show_all_merges_server_and_local() -> None:
     assert "globo:USER" in result.stdout  # local field
 
 
+@pytest.mark.parametrize("noun", ["usr-acct", "user", "user-acct"])
+def test_command_noun_synonyms(noun: str) -> None:
+    _caller()
+    ident = store.add_identity("local", "USER", "u-5", "jdoe", "jdoe")
+    store.set_user_acct(ident.id, "pw")
+
+    result = runner.invoke(app, [noun, "list"], env={"VL_OUTPUT": "json"})
+
+    assert result.exit_code == 0, result.stdout
+    assert "jdoe" in result.stdout
+    assert "deprecat" not in result.stdout.lower() and "synonym" not in result.stdout.lower()
+
+
+def test_synonyms_hidden_from_top_level_help() -> None:
+    result = runner.invoke(app, ["--help"])
+    assert "usr-acct" in result.stdout
+    assert "user-acct" not in result.stdout
+    # "user" only ever appears inside other words (e.g. "user accounts"), never as
+    # a standalone command entry.
+    assert not any(
+        line.strip().startswith("user ") or line.strip().startswith("user-acct")
+        for line in result.stdout.splitlines()
+    )
+
+
+@pytest.mark.parametrize("argv", [["usr-acct", "nope"], ["user", "nope"], ["nope"]])
+def test_unknown_subcommand_prints_help_like_dash_dash_help(argv: list[str]) -> None:
+    result = runner.invoke(app, argv)
+    assert result.exit_code == 0  # behaves exactly like --help
+    assert "Usage:" in result.output and "Commands" in result.output
+    assert "Error" not in result.output and "No such command" not in result.output
+    if argv[:1] != ["nope"]:
+        assert "Manage VeritasLock user accounts." in result.output  # group's own help
+
+
+def test_leaf_command_missing_arg_prints_command_help() -> None:
+    result = runner.invoke(app, ["usr-acct", "login"])  # `login` needs <username>
+    assert result.exit_code == 0
+    assert "Authenticate as yourself" in result.output  # the command's own help
+    assert "username" in result.output
+    assert "Error" not in result.output and "Missing argument" not in result.output
+
+
 def test_list_local_by_default() -> None:
     _caller()
     store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
@@ -209,11 +315,23 @@ def test_list_local_filtered_by_org() -> None:
     assert "root" not in result.stdout  # no membership in globo
 
 
-def test_list_org_rejects_remote() -> None:
+@respx.mock
+def test_list_remote_resolves_org_to_orgid_filter() -> None:
     _caller()
-    result = runner.invoke(app, ["usr-acct", "list", "--org", "globo", "--remote"])
-    assert result.exit_code == 1
-    assert "filters the local cached listing" in result.stdout
+    respx.get(f"{IDP}/v1/organizations", params={"name": "globo"}).mock(
+        return_value=httpx.Response(200, json=ORG_DTO)
+    )
+    route = respx.get(f"{IDP}/v1/users").mock(
+        return_value=httpx.Response(200, json={"items": []})
+    )
+
+    result = runner.invoke(
+        app, ["usr-acct", "list", "--remote", "--org", "globo"],
+        env={"VL_OUTPUT": "json"},
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert route.calls.last.request.url.params["orgId"] == "org-1"
 
 
 @respx.mock
@@ -241,8 +359,35 @@ def test_list_remote_passes_filters_and_marks_local() -> None:
     assert result.exit_code == 0, result.stdout
     assert route.calls.last.request.url.params["status"] == "ACTIVE"
     rows = json.loads(result.stdout.split("more results")[0])
-    assert {r["server_id"]: r["cached"] for r in rows} == {"u-1": "yes", "u-2": ""}
+    assert {r["server_id"]: r["cached"] for r in rows} == {"u-1": "yes", "u-2": "no"}
     assert "--page 1" in result.stdout
+
+
+@respx.mock
+def test_list_remote_orgs_column_from_local_cache() -> None:
+    _caller()
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    store.upsert_organization("local", "acme", "org-2", "Acme", active=True)
+    cached = store.add_identity("local", "USER", "u-1", "a", "alpha")
+    store.upsert_org_membership(cached.id, "local", "globo", "ORG_ADMIN")
+    store.upsert_org_membership(cached.id, "local", "acme", "USER")
+    respx.get(f"{IDP}/v1/users").mock(
+        return_value=httpx.Response(200, json={"items": [
+            {"id": "u-1", "username": "a", "email": "a@x", "status": "ACTIVE"},
+            {"id": "u-2", "username": "b", "email": "b@x", "status": "ACTIVE"},
+        ]})
+    )
+
+    result = runner.invoke(
+        app, ["usr-acct", "list", "--remote"], env={"VL_OUTPUT": "json"}
+    )
+
+    assert result.exit_code == 0, result.stdout
+    rows = json.loads(result.stdout)
+    assert {r["server_id"]: r["orgs"] for r in rows} == {
+        "u-1": "acme:USER, globo:ORG_ADMIN",  # every cached membership, comma-separated
+        "u-2": "-",  # not cached — server list has no org data
+    }
 
 
 @respx.mock
@@ -425,7 +570,7 @@ def test_add_defaults_org_to_callers_org() -> None:
         return_value=httpx.Response(201, json={"id": "u-new", "username": "jdoe", "email": "j@x", "displayName": "J D", "status": "ACTIVE"})
     )
 
-    result = runner.invoke(app, ["usr-acct", "add", "John", "Doe", "--role", "USER"])
+    result = runner.invoke(app, ["usr-acct", "add", "jdoe", "--email", "j@x.com"])
 
     assert result.exit_code == 0, result.stdout
     assert json.loads(create.calls.last.request.content)["organizations"][0]["orgName"] == "globo"
@@ -437,6 +582,6 @@ def test_add_errors_when_org_ambiguous() -> None:
         store.upsert_organization("local", n, f"o-{n}", n, active=True)
         store.upsert_org_membership(caller.id, "local", n, "USER")
 
-    result = runner.invoke(app, ["usr-acct", "add", "John", "Doe", "--role", "USER"])
+    result = runner.invoke(app, ["usr-acct", "add", "jdoe", "--email", "j@x.com"])
     assert result.exit_code == 1
     assert "no --org given" in result.stdout

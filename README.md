@@ -6,6 +6,11 @@ Structured like `git`/`kubectl` with noun-verb subcommands (`vl org add`,
 `vl usr-acct add`). This tool progressively replaces and consolidates the bash
 scripts spread across the `veritaslock-node` and `veritaslock-services` repos.
 
+Any incomplete or wrong invocation — a bare group (`vl`, `vl usr-acct`), an
+unknown subcommand (`vl usr-acct blah`), a missing required argument
+(`vl usr-acct login`), an unknown option — just prints the relevant `--help` and
+exits `0`, exactly as `--help` would. No error box.
+
 ## Install
 
 ```bash
@@ -142,33 +147,55 @@ does it in one call instead.
 ## Users
 
 ```bash
-vl usr-acct add John Doe --role USER                # --org defaults to your org
-vl usr-acct add Ana Reyes --org globo --role ORG_ADMIN --email ana@acme.com --phone +15555550123
+vl usr-acct add jdoe --email jdoe@acme.com          # username is the arg; role defaults to USER; --org defaults to your org
+vl usr-acct add areyes --org globo --role ORG_ADMIN --first Ana --last Reyes \
+    --email ana@acme.com --phone +15555550123 --password 's3cr3t'
 vl usr-acct list                                    # cached accounts (local, no server call)
-vl usr-acct list --org globo                        # cached accounts with a membership in globo
+vl usr-acct list --org globo                        # accounts with a membership in globo (local)
 vl usr-acct list --remote --status ACTIVE           # server-side users
+vl usr-acct list --remote --org globo               # server-side users in globo (server orgId filter)
 vl usr-acct show jdoe                               # local view; --remote / --all hit the server
 vl usr-acct update jdoe --display-name "John Doe" --phone +15555550123 --rotate-password
 vl usr-acct delete jdoe                             # server delete + local clear
 ```
 
+Both listings carry an `orgs` column (every membership, comma-separated as
+`org:role`). On the local listing it's the cached memberships; on `--remote` /
+`--all` it's still sourced from vl's local cache — the server user list returns no
+membership data — so it reads `-` for accounts vl hasn't cached. The `--remote` /
+`--all` listing also has a `cached` column (`yes` / `no`) marking which server
+accounts vl has stored locally.
+
+`add` takes the **username** as its argument. `--email` is **required** (the server
+rejects a user without a valid address). `--role` is optional and defaults to
+`USER`. `--first` / `--last` are optional and only feed the display name. Set
+`--phone` too for any account that may later become an org's owner. `--password`
+sets a specific password; omit it and a strong random one is generated and printed
+once.
+
 Every `vl usr-acct` command authenticates as the resolved identity (which must be
 a `USER`). Passwords are bcrypt-hashed client-side — the server only ever sees the
-hash. `--email` defaults to a `first.last@example.com` placeholder; set a real one
-(and `--phone`) for any account that may later become an org's owner — the server
-requires both before `vl org update --owner` accepts it.
+hash.
 
 ## Service accounts
 
 ```bash
 vl svc-acct add "Ingest Bot" --role ACCOUNT --org globo   # prints the secret once
 vl svc-acct list                                          # cached (local); --remote / --all for server
-vl svc-acct list --org globo                              # cached accounts in globo
+vl svc-acct list --org globo                              # accounts in globo (local; add --remote for the server)
 vl svc-acct show ingest-bot --reveal-secret               # local view; --remote / --all hit the server
 vl svc-acct update ingest-bot --status SUSPENDED
 vl svc-acct get-assertion ingest-bot                      # signed JWT for hand-off
 vl svc-acct delete ingest-bot
 ```
+
+Every listing (local and `--remote` / `--all`) shows the account's single `org` and
+its `role`. On the server listing `org` is resolved from the row's `orgId` via a
+public `GET /v1/organizations/{id}` (cached per run), falling back to the raw id if
+the org can't be resolved, and a `cached` column (`yes` / `no`) marks which server
+accounts vl has stored locally. `role` is cached locally; `--remote` / `--all` on
+`list` or `show` refresh the cached `role` / `key_version` from the server, so an
+account cached by an older `vl` (role shows `-`) fills in on its next server view.
 
 An account created with `add` gets a symmetric client secret (for `vl`'s own token
 acquisition) and an Ed25519 keypair, written to `<store dir>/keys/<id>/`
@@ -224,5 +251,6 @@ src/vl/
     ├── passwords.py  client-side password generation + bcrypt hashing
     ├── keys.py       Ed25519 keygen, key-file storage, assertion signing
     ├── roles.py      shared role enums
+    ├── cli.py        Typer group class: full --help on any usage error
     └── output.py     table/json output rendering
 ```

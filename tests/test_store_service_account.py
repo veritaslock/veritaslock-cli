@@ -95,6 +95,46 @@ def test_set_credential_upserts(isolated_store: Path) -> None:
     assert store.get_svc_acct(ident.id).client_secret_plaintext == "two"
 
 
+def test_role_stored_and_updated(isolated_store: Path) -> None:
+    ident = _seed()
+    store.set_svc_acct(ident.id, "local", "globo", "s", role="ACCOUNT")
+    assert store.get_svc_acct(ident.id).role == "ACCOUNT"
+
+    store.update_svc_acct_role(ident.id, "SYSTEM")
+    assert store.get_svc_acct(ident.id).role == "SYSTEM"
+
+    # role is optional — a credential written without one reads back None
+    other = store.add_identity("local", "SERVICE_ACCOUNT", "sa-2", "sa-2", "sa2")
+    store.set_svc_acct(other.id, "local", "globo", "s")
+    assert store.get_svc_acct(other.id).role is None
+
+
+def test_v7_store_migrates_to_v8_adding_role_column(
+    isolated_store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store, "SCHEMA_VERSION", 7)
+    ident = _seed()
+    with sqlite3.connect(isolated_store) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(
+            "INSERT INTO svc_acct "
+            "(identity_id, environment_name, org_name, client_secret_plaintext, key_version) "
+            "VALUES (?, 'local', 'globo', 'old', 3)",
+            (ident.id,),
+        )
+        conn.commit()
+    assert "role" not in {r[1] for r in sqlite3.connect(isolated_store).execute("PRAGMA table_info(svc_acct)")}
+
+    monkeypatch.setattr(store, "SCHEMA_VERSION", 8)
+    cred = store.get_svc_acct(ident.id)  # reopening runs 7 -> 8
+
+    assert cred is not None
+    assert cred.client_secret_plaintext == "old" and cred.key_version == 3
+    assert cred.role is None  # pre-existing row, column added nullable
+    with sqlite3.connect(isolated_store) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
+
+
 def test_update_keys_only(isolated_store: Path) -> None:
     ident = _seed()
     store.set_svc_acct(ident.id, "local", "globo", "shh", key_version=1)

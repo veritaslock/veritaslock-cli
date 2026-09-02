@@ -75,6 +75,7 @@ def test_add_provisions_keypair_and_stores_locally() -> None:
     assert ident.kind == "SERVICE_ACCOUNT"
     cred = store.get_svc_acct(ident.id)
     assert cred is not None and cred.key_version == 1
+    assert cred.role == "ACCOUNT"  # cached from --role
     assert Path(cred.private_key_path).read_bytes().__len__() == 64
     assert store.keys_root() / "sa-1" == Path(cred.private_key_path).parent
     assert "Client secret (shown once)" in result.stdout
@@ -156,12 +157,24 @@ def test_list_local_by_default() -> None:
     _caller()
     store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
     ident = store.add_identity("local", "SERVICE_ACCOUNT", "sa-9", "sa-9", "bot")
-    store.set_svc_acct(ident.id, "local", "globo", "s", key_version=2)
+    store.set_svc_acct(ident.id, "local", "globo", "s", key_version=2, role="NODE")
 
     # No respx mock — the local listing must not hit the server.
     result = runner.invoke(app, ["svc-acct", "list"], env={"VL_OUTPUT": "json"})
     assert result.exit_code == 0, result.stdout
-    assert "sa-9" in result.stdout and "globo" in result.stdout
+    rows = json.loads(result.stdout)
+    assert rows[0]["org"] == "globo" and rows[0]["role"] == "NODE"
+
+
+def test_list_local_role_dash_when_unknown() -> None:
+    _caller()
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    ident = store.add_identity("local", "SERVICE_ACCOUNT", "sa-old", "sa-old", "bot")
+    store.set_svc_acct(ident.id, "local", "globo", "s")  # no role (older cache)
+
+    result = runner.invoke(app, ["svc-acct", "list"], env={"VL_OUTPUT": "json"})
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout)[0]["role"] == "-"
 
 
 def test_list_local_filtered_by_org() -> None:
@@ -180,11 +193,20 @@ def test_list_local_filtered_by_org() -> None:
     assert "abot" in result.stdout and "gbot" not in result.stdout
 
 
-def test_list_org_rejects_remote() -> None:
+@respx.mock
+def test_list_remote_resolves_org_to_orgid_filter() -> None:
     _caller()
-    result = runner.invoke(app, ["svc-acct", "list", "--org", "globo", "--all"])
-    assert result.exit_code == 1
-    assert "filters the local cached listing" in result.stdout
+    respx.get(f"{IDP}/v1/organizations", params={"name": "globo"}).mock(
+        return_value=httpx.Response(200, json=ORG_DTO)
+    )
+    route = respx.get(f"{IDP}/v1/service-accounts").mock(
+        return_value=httpx.Response(200, json={"items": []})
+    )
+
+    result = runner.invoke(app, ["svc-acct", "list", "--all", "--org", "globo"])
+
+    assert result.exit_code == 0, result.stdout
+    assert route.calls.last.request.url.params["orgId"] == "org-1"
 
 
 @respx.mock
@@ -201,6 +223,74 @@ def test_list_remote_passes_filters() -> None:
     assert result.exit_code == 0, result.stdout
     params = route.calls.last.request.url.params
     assert params["role"] == "NODE" and params["includeDeleted"] == "true"
+
+
+@respx.mock
+def test_list_remote_shows_org_resolved_from_orgid() -> None:
+    _caller()
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)  # cached
+    respx.get(f"{IDP}/v1/service-accounts").mock(
+        return_value=httpx.Response(200, json={"items": [
+            {"id": "sa-1", "displayName": "B", "role": "NODE", "status": "ACTIVE", "keyVersion": 1, "orgId": "org-1"},
+            {"id": "sa-2", "displayName": "C", "role": "NODE", "status": "ACTIVE", "keyVersion": 1, "orgId": "org-2"},
+        ]})
+    )
+    respx.get(f"{IDP}/v1/organizations/org-2").mock(
+        return_value=httpx.Response(200, json={"id": "org-2", "name": "acme", "displayName": "Acme", "active": True})
+    )
+
+    result = runner.invoke(app, ["svc-acct", "list", "--remote"], env={"VL_OUTPUT": "json"})
+
+    assert result.exit_code == 0, result.stdout
+    rows = json.loads(result.stdout)
+    assert {r["id"]: r["org"] for r in rows} == {"sa-1": "globo", "sa-2": "acme"}
+
+
+@respx.mock
+def test_list_remote_backfills_cached_role_and_key_version() -> None:
+    _caller()
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    ident = store.add_identity("local", "SERVICE_ACCOUNT", "sa-1", "sa-1", "bot")
+    store.set_svc_acct(ident.id, "local", "globo", "s")  # role/key_version unknown
+    respx.get(f"{IDP}/v1/service-accounts").mock(
+        return_value=httpx.Response(200, json={"items": [
+            {"id": "sa-1", "displayName": "B", "role": "INGEST_CLIENT", "status": "ACTIVE", "keyVersion": 4, "orgId": "org-1"},
+            {"id": "sa-x", "displayName": "X", "role": "SYSTEM", "status": "ACTIVE", "keyVersion": 9, "orgId": "org-1"},
+        ]})
+    )
+
+    result = runner.invoke(app, ["svc-acct", "list", "--all"], env={"VL_OUTPUT": "json"})
+
+    assert result.exit_code == 0, result.stdout
+    cred = store.get_svc_acct(ident.id)
+    assert cred.role == "INGEST_CLIENT" and cred.key_version == 4  # healed from server
+    # the uncached sa-x got no local row
+    assert store.get_identity_by_server_id("local", "sa-x", "SERVICE_ACCOUNT") is None
+    # `cached` column marks which server rows exist locally
+    assert {r["id"]: r["cached"] for r in json.loads(result.stdout)} == {
+        "sa-1": "yes",
+        "sa-x": "no",
+    }
+
+
+@respx.mock
+def test_show_all_backfills_cached_role() -> None:
+    _caller()
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    ident = store.add_identity("local", "SERVICE_ACCOUNT", "sa-1", "sa-1", "bot")
+    store.set_svc_acct(ident.id, "local", "globo", "s", key_version=1)
+    respx.get(f"{IDP}/v1/service-accounts/sa-1").mock(
+        return_value=httpx.Response(200, json={
+            "id": "sa-1", "displayName": "B", "role": "INGEST_CLIENT",
+            "status": "ACTIVE", "keyVersion": 2, "orgId": "org-1",
+        })
+    )
+
+    result = runner.invoke(app, ["svc-acct", "show", "bot", "--all"])
+
+    assert result.exit_code == 0, result.stdout
+    cred = store.get_svc_acct(ident.id)
+    assert cred.role == "INGEST_CLIENT" and cred.key_version == 2
 
 
 @respx.mock
@@ -221,6 +311,23 @@ def test_update_partial() -> None:
     assert json.loads(patch.calls.last.request.content) == {"status": "SUSPENDED"}
 
 
+@respx.mock
+def test_update_role_syncs_local_cache() -> None:
+    _caller()
+    store.add_identity("local", "SERVICE_ACCOUNT", "sa-1", "sa-1", "bot")
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    ident = store.get_identity("local", "bot").id
+    store.set_svc_acct(ident, "local", "globo", "s", role="ACCOUNT")
+    respx.patch(f"{IDP}/v1/service-accounts/sa-1").mock(
+        return_value=httpx.Response(200, json={"id": "sa-1", "displayName": "b", "role": "NODE", "status": "ACTIVE", "keyVersion": 1})
+    )
+
+    result = runner.invoke(app, ["svc-acct", "update", "bot", "--role", "NODE"])
+
+    assert result.exit_code == 0, result.stdout
+    assert store.get_svc_acct(ident).role == "NODE"
+
+
 def test_update_nothing_supplied_errors() -> None:
     _caller()
     store.add_identity("local", "SERVICE_ACCOUNT", "sa-1", "sa-1", "bot")
@@ -238,7 +345,9 @@ def test_rotate_keys_command_is_absent() -> None:
     assert "rotate-keys" not in names
 
     result = runner.invoke(app, ["svc-acct", "rotate-keys", "bot"])
-    assert result.exit_code == 2  # Click: no such command
+    assert result.exit_code == 0  # unknown subcommand -> prints `svc-acct` help
+    assert "rotate-keys" not in result.output
+    assert "get-assertion" in result.output  # the real command list
 
 
 @respx.mock
@@ -330,6 +439,7 @@ def test_cache_validates_and_resolves_org() -> None:
     assert cred.client_secret_plaintext == "shh"
     assert cred.org_name == "globo"  # from sa_dto.orgId, not a flag
     assert cred.key_version == 3
+    assert cred.role == "SYSTEM"  # cached from the server record
 
 
 @respx.mock

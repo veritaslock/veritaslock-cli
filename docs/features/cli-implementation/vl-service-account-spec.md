@@ -81,11 +81,32 @@ This is the intended path for finally bringing `SYSTEM` (and any other pre-exist
 8. If step 7 fails, retry once automatically with the same `bootstrapHash` (only nulled server-side on success), then surface the error clearly if it still fails.
 9. Store the identity locally: an `identity` row (`kind='SERVICE_ACCOUNT'`, `server_id`/`principal_name` = the returned id) and a `svc_acct` row (`org_name`, `client_secret_plaintext`, `public_key_path`, `private_key_path`, `key_version: 1`). **No `org_membership` row** — see §2. Print the client secret once.
 
-### 5.2 `vl service-account show <label> [--reveal-secret] [--env <env>]`
-`GET /v1/service-accounts/{server_id}`, merged with local metadata (key file paths, whether a keypair is provisioned). Secret masked unless `--reveal-secret`.
+### 5.2 `vl svc-acct show <label> [--reveal-secret] [--remote | --all] [--env <env>]`
+Local cached view by default (restructure doc §3). `--remote` shows only the server record; `--all` merges it with local metadata (key file paths, whether a keypair is provisioned). Secret masked unless `--reveal-secret`. On `--remote` / `--all` the local credential's server-owned fields (`role`, `key_version`) are backfilled from the response — see §5.3.
 
-### 5.3 `vl service-account list [--org <org>] [--role <role>] [--status <status>] [--include-deleted] [--env <env>]`
-`GET /v1/service-accounts?...` — pass through existing filters and pagination.
+### 5.3 `vl svc-acct list [--org <org>] [--role <role>] [--status <status>] [--include-deleted] [--remote | --all] [--page <n>] [--env <env>]`
+
+> **Revised** by the restructure (§3 of `vl-command-restructure.md`) and this
+> session:
+> - Defaults to the **local cached** listing; `--remote` / `--all` hit
+>   `GET /v1/service-accounts` and pass through `role` / `status` /
+>   `includeDeleted` / pagination.
+> - `--org <name>` filters by org in every mode. Local: `svc_acct.org_name`
+>   matches. `--remote` / `--all`: resolved to the org id via
+>   `GET /v1/organizations?name=` and sent as the `orgId` query param (the server
+>   filters on the account's flat `orgId`).
+> - Every mode renders `org` and `role` columns. On `--remote` / `--all` the
+>   row's `orgId` is resolved to a name via a public `GET /v1/organizations/{id}`
+>   (memoised per invocation), falling back to the raw id if it can't be resolved.
+> - `role` is a cached column (`svc_acct.role`, v8), populated by `add` (`--role`)
+>   and `cache` (server record). On `--remote` / `--all`, `list` **and** `show`
+>   backfill `role` and `key_version` into the local credential row from the
+>   server response — an account cached before v8 (role `NULL`, shown as `-`)
+>   self-heals on its first server view. A `None`/absent server value leaves the
+>   cached column untouched; uncached accounts get no local row.
+> - The `--remote` / `--all` listing also has a `cached` column (`yes` / `no`)
+>   for which server rows `vl` holds a local credential, plus the pre-existing
+>   `label` column (the local label, `*` if it's the default identity).
 
 ### 5.4 `vl service-account update <label> [--display-name <text>] [--description <text>] [--status PENDING|ACTIVE|SUSPENDED|DELETED] [--role <role>] [--json-metadata <text>] [--env <env>]`
 `PATCH /v1/service-accounts/{server_id}` with whichever flags are supplied (partial update, `bootstrapHash` query param omitted — not relevant post-provisioning). Public-key rotation is **not** part of this command — see §5.5.

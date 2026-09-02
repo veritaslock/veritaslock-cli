@@ -148,19 +148,40 @@ Local-only removal — **no server call**. Deletes the `identity` row and everyt
 
 **Authentication for every command in this section:** all five subcommands below (`add`, `show`, `list`, `update`, `delete`) resolve the calling identity per §8.3 precedence (`--as <label>` / `VL_IDENTITY` / environment default) and use the cached-token flow from §7 — there is no unauthenticated path for any user-related endpoint (unlike Phase 2's org reads, which are intentionally public). Each subcommand below accepts `--as <label>` even where not spelled out individually in its signature.
 
-### 9.1 `vl user add <first> <last> --org <org> --role <ORG_ADMIN|USER> [--label <label>] [--email <email>] [--phone <number>] [--env <env>]`
+### 9.1 `vl usr-acct add <username> --email <email> [--role <ORG_ADMIN|USER>] [--first <name>] [--last <name>] [--org <org>] [--phone <number>] [--password <value>] [--env <env>]`
+
+> **Syntax revised** after the restructure: `<username>` is now an explicit
+> positional argument (was derived from `<first> <last>`); `--email` is a
+> **required** option (the IdP's `CreateUserRequest.email` is `@NotBlank @Email`);
+> `--role` is optional, **defaulting to `USER`**; `--first` / `--last` are
+> optional and only build the display name; `--password` lets the caller supply a
+> specific password. The `--label` flag is gone — a user's local handle is always
+> its username (restructure doc §2).
 
 1. Resolve `org_id` from `--org` via `GET /v1/organizations?name=`, and upsert the local `organization` cache row (Phase 2 §3) if needed.
-2. Derive `username` (first-initial + lastname, lowercased). `email` defaults to `first.last@example.com` if `--email` is omitted — **this default is a placeholder, not a real address**; it should always be overridden with `--email` for any account that might later become an org's `owner` (see `vl-org-spec.md` §4.8), since a real, reachable email is part of what `owner` is meant to guarantee. `--phone`, if supplied, is sent as `phoneNumber` on creation — required before this account can later be granted `owner` via `vl org update --owner` (`idp-org-admin-safety-spec.md` §2.7), though not required by `add` itself. Generate a random password and **bcrypt-hash it client-side** (the server only ever receives `passwordHash`, never plaintext). `--label`, if omitted, defaults to the derived `username`.
+2. `username` is taken verbatim from the argument (also the local handle). `--email` is required and sent as-is. `displayName` is `"<first> <last>"` with whichever of `--first` / `--last` were given, omitted if neither. `--role` defaults to `USER` when not given. Set a real address for any account that might become an org's `owner` (see `vl-org-spec.md` §4.8). `--phone`, if supplied, is sent as `phoneNumber` — required before this account can later be granted `owner` via `vl org update --owner` (`idp-org-admin-safety-spec.md` §2.7), though not by `add` itself. The password is `--password` if given, else a generated random one; either way it's **bcrypt-hashed client-side** (the server only ever receives `passwordHash`, never plaintext).
 3. Resolve the calling identity per §8.3 precedence. It must be `kind='USER'` — service accounts cannot create users. If resolution yields a service-account identity (once Phase 4 exists) or nothing at all, error clearly before attempting the API call.
-4. `POST /v1/users` with `{id: <generated uuid>, username, email, phoneNumber, displayName, passwordHash, status: "ACTIVE", mfaEnabled: false, organizations: [{orgId, orgName, role}]}` — `role` is `ORG_ADMIN` or `USER` per the flag (see §11.1 — this is confirmed correct; the old bash scripts' `"ADMIN"` was simply stale after the team-implementation rename).
-5. On success, create an `identity` row (`kind='USER'`), a `user_acct` row with `password_plaintext` set (tier 1 — `vl` generated this password), and an `org_membership` row for the org/role just granted. Print the plaintext password once; it is never displayed again by default.
+4. `POST /v1/users` with `{id: <generated uuid>, username, email, passwordHash, status: "ACTIVE", mfaEnabled: false, organizations: [{orgId, orgName, role}]}`, plus `displayName` and `phoneNumber` only when non-empty. `role` is `ORG_ADMIN` or `USER` per the flag (see §11.1 — this is confirmed correct; the old bash scripts' `"ADMIN"` was simply stale after the team-implementation rename).
+5. On success, create an `identity` row (`kind='USER'`), a `user_acct` row with `password_plaintext` set (tier 1 — `vl` holds this password), and an `org_membership` row for the org/role just granted. Print a summary (username, email, phone, display name, **`org` as `<org>:<role>`**, server id). If the password was **generated**, also print it once ("Password (generated, shown once)"); if the caller passed `--password`, print nothing (they already have it).
 
 ### 9.2 `vl user show <label> [--reveal-secret]`
 `GET /v1/users/{server_id}`, merged with local `identity`/`user_acct`/`org_membership` metadata. Password masked unless `--reveal-secret`.
 
-### 9.3 `vl user list [--org <org>] [--status <status>] [--env <env>]`
-`GET /v1/users?...` — pass through existing filters (`status`, `email`, pagination). Follows `nextCursor` if asked to page further. This lists server-side users, not local store rows — cross-reference with `vl identity list --env <env>` (filtered to `kind='USER'`) to see which of them `vl` has stored credentials for.
+### 9.3 `vl usr-acct list [--org <org>] [--status <status>] [--email <email>] [--remote | --all] [--page <n>] [--env <env>]`
+
+> **Revised** by the restructure (§3 of `vl-command-restructure.md`) and this
+> session:
+> - Defaults to the **local cached** listing; `--remote` / `--all` hit `GET /v1/users`.
+> - `--org <name>` filters by org in every mode. Local: accounts with a matching
+>   `org_membership`. `--remote` / `--all`: resolved to the org id via
+>   `GET /v1/organizations?name=` and sent as the `orgId` query param (the server
+>   matches any-role membership). `--status` / `--email` / `--page` apply only to
+>   the server modes; `nextCursor` paging is followed as before.
+> - Every mode renders an `orgs` column — the account's cached memberships joined
+>   as `org:role`. `GET /v1/users` returns no membership data, so on `--remote` /
+>   `--all` it's still the local cache and shows `-` for accounts `vl` hasn't
+>   cached (a dim note says so). A `cached` column (`yes` / `no`) marks which
+>   server rows `vl` holds credentials for.
 
 ### 9.4 `vl user update <label> [--display-name <text>] [--status ACTIVE|SUSPENDED] [--email <email>] [--phone <number>] [--mfa | --no-mfa] [--password [<value>]] [--env <env>]`
 `PATCH /v1/users/{server_id}` with whichever flags are supplied (partial update), including `phoneNumber` if `--phone` is given. `--username` is **not** exposed in this phase — renaming would desync the local `principal_name`/default-label logic, and there's no pressing need for it yet.

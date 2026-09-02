@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Annotated, Any
 
@@ -86,6 +86,29 @@ def fetch_org_by_id(base_url: str, org_id: str) -> dict[str, Any] | None:
         return dto
     except api.ApiError:
         return None
+
+
+def org_name_resolver(environment: store.Environment) -> Callable[[str], str]:
+    """A memoised ``org id -> org name`` lookup for rendering server rows.
+
+    Tries the local ``organization`` cache first, then a public
+    ``GET /v1/organizations/{id}``, and finally falls back to the id itself so a
+    listing never fails just because one org can't be resolved.
+    """
+    names: dict[str, str] = {
+        org.server_org_id: org.name
+        for org in store.list_organizations(environment.name)
+    }
+
+    def resolve(org_id: str) -> str:
+        if not org_id:
+            return "-"
+        if org_id not in names:
+            dto = fetch_org_by_id(environment.idp_base_url, org_id)
+            names[org_id] = str(dto["name"]) if dto else org_id
+        return names[org_id]
+
+    return resolve
 
 
 def resolve_membership_org(

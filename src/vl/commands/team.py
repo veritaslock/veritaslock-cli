@@ -20,13 +20,20 @@ from vl.commands._shared import (
     slugify,
 )
 from vl.lib import auth, store
+from vl.lib.cli import HelpOnErrorGroup
 from vl.lib.output import console, render
 from vl.lib.roles import TeamRole
 
-app = typer.Typer(help="Manage VeritasLock teams.", no_args_is_help=True)
-members_app = typer.Typer(help="Manage a team's members.", no_args_is_help=True)
+app = typer.Typer(
+    help="Manage VeritasLock teams.", no_args_is_help=True, cls=HelpOnErrorGroup
+)
+members_app = typer.Typer(
+    help="Manage a team's members.", no_args_is_help=True, cls=HelpOnErrorGroup
+)
 ingest_clients_app = typer.Typer(
-    help="Manage a team's ingest clients.", no_args_is_help=True
+    help="Manage a team's ingest clients.",
+    no_args_is_help=True,
+    cls=HelpOnErrorGroup,
 )
 app.add_typer(members_app, name="members")
 app.add_typer(ingest_clients_app, name="ingest-clients")

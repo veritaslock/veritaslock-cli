@@ -39,10 +39,29 @@ service accounts, so it folded into those.
 ## 2. `vl user` → `vl usr-acct`, `vl service-account` → `vl svc-acct`
 
 3-char prefixes on both, symmetry with the store table names. Every subcommand
-from the phase specs keeps its name and behaviour under the new noun (`add`,
-`show`, `list`, `update`, `delete`, `get-assertion`, …). (`svc-acct rotate-keys`
-was later removed — see
+from the phase specs keeps its name under the new noun (`add`, `show`, `list`,
+`update`, `delete`, `get-assertion`, …), and its behaviour except where noted
+here: `list` / `show` default to the local view (§3), and `usr-acct add` took a
+new argument shape (`vl-identity-user-spec.md` §9.1 — `<username>` positional,
+`--email` required, `--role` optional defaulting to `USER`, `--first` / `--last`
+/ `--password` added). (`svc-acct rotate-keys` was later removed — see
 [svc-acct-key-rotation-gap.md](svc-acct-key-rotation-gap.md).)
+
+`usr-acct` is the canonical noun, but **`user` and `user-acct` are accepted as
+silent synonyms** — the same sub-app is mounted under all three names, with the
+two aliases hidden from `vl --help` and carrying no deprecation notice. `svc-acct`
+has no such aliases.
+
+Every command group (root and nested) uses `HelpOnErrorGroup` (`vl.lib.cli`). Any
+incomplete or wrong invocation — a bare group, an unknown subcommand
+(`vl usr-acct blah`), a leaf command missing a required argument
+(`vl usr-acct login`), an unknown option — prints the failing command's full
+`--help` to stdout and exits `0`, exactly as if `--help` had been passed. No
+usage hint, no red error box, no `Error:` line. `parse_args` handles a group's
+own `no_args_is_help` / option errors; `invoke` on the outermost group handles
+everything raised deeper (unknown subcommand, a leaf command's argument errors)
+as it bubbles up. Only genuine command failures (`report_errors` → `Exit(1)`,
+API/auth/store errors) still exit non-zero.
 
 **No `--label` for users.** A user's local handle is its **username** — `usr-acct`
 commands take a `<username>` argument, and `cache` / `add` set `identity.label`
@@ -57,12 +76,34 @@ cached** view by default — no server call. Flags:
 
 - `--remote` — the server-side listing / record instead (authenticated).
 - `--all` — the server record merged with local metadata.
-- `--org <name>` (`list` only) — filter the **local** listing: for `usr-acct`,
-  accounts with an `org_membership` in that org; for `svc-acct`, accounts whose
-  `svc_acct.org_name` matches. It can't be combined with `--remote` / `--all` —
-  neither `GET /v1/users` nor `GET /v1/service-accounts` takes an org filter, and
-  the user list rows carry no org data at all. Adding server-side org filtering
-  is a future IdP change (an `orgId` query param on both list endpoints).
+- `--org <name>` (`list` only) — filter by org. On the default local listing:
+  for `usr-acct`, accounts with an `org_membership` in that org; for `svc-acct`,
+  accounts whose `svc_acct.org_name` matches. With `--remote` / `--all` it's
+  resolved to the org's id (`GET /v1/organizations?name=`, public) and sent as
+  the `orgId` query param that `GET /v1/users` and `GET /v1/service-accounts` now
+  accept — for `usr-acct` the server matches any-role membership in that org; for
+  `svc-acct`, the account's flat `orgId`.
+
+Both `list`s render an org column in every mode:
+
+- `usr-acct` → `orgs`: every cached `org_membership` for the account, joined as
+  `org:role`. `GET /v1/users` returns no membership data, so on `--remote` /
+  `--all` this is still the local cache and reads `-` for uncached accounts (a
+  dim note says so).
+- `svc-acct` → `org`: the account's one org. On `--remote` / `--all` the row's
+  `orgId` is resolved to a name via a public `GET /v1/organizations/{id}` (memoised
+  per invocation), falling back to the raw id. `svc-acct list` also shows `role`
+  (an `svc_acct.role` column, v8).
+
+The `--remote` / `--all` listing for both nouns carries a `cached` column
+(`yes` / `no`) flagging which server rows `vl` has a local credential for.
+`svc-acct` keeps its `label` column alongside it (the local label, `*` if the
+default identity).
+
+`svc-acct list` / `show` on `--remote` / `--all` **backfill the local cache** with
+the server-owned fields (`role`, `key_version`) for any account `vl` already has a
+credential row for — so an account cached before v8 (role `NULL`) self-heals on
+its first server view.
 
 `vl identity list`'s cross-kind "what can I `--as`?" view is replaced by top-level
 **`vl whoami`** plus the two per-kind local `list`s.

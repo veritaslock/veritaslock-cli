@@ -13,12 +13,19 @@ import typer
 
 from vl.commands._shared import AsOption, EnvOption, report_errors, resolve_org
 from vl.lib import api, auth, store
+from vl.lib.cli import HelpOnErrorGroup
 from vl.lib.output import console, render
 from vl.lib.roles import OrgRole
 
-app = typer.Typer(help="Manage VeritasLock organizations.", no_args_is_help=True)
+app = typer.Typer(
+    help="Manage VeritasLock organizations.",
+    no_args_is_help=True,
+    cls=HelpOnErrorGroup,
+)
 members_app = typer.Typer(
-    help="Manage an organization's members.", no_args_is_help=True
+    help="Manage an organization's members.",
+    no_args_is_help=True,
+    cls=HelpOnErrorGroup,
 )
 app.add_typer(members_app, name="members")
 

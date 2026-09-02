@@ -19,19 +19,24 @@ import typer
 
 from vl.commands._shared import (
     AsOption,
-    CliError,
     EnvOption,
     cache_org,
     fetch_org_by_id,
     refuse_duplicate_account,
     report_errors,
     resolve_membership_org,
+    resolve_org,
 )
 from vl.lib import api, auth, passwords, store
-from vl.lib.output import console, render
+from vl.lib.cli import HelpOnErrorGroup
+from vl.lib.output import console, note, render
 from vl.lib.roles import UserOrgRole
 
-app = typer.Typer(help="Manage VeritasLock user accounts.", no_args_is_help=True)
+app = typer.Typer(
+    help="Manage VeritasLock user accounts.",
+    no_args_is_help=True,
+    cls=HelpOnErrorGroup,
+)
 
 
 class UserStatus(str, Enum):
@@ -211,20 +216,27 @@ def clear(username: UsernameArg, env: EnvOption = None) -> None:
 
 @app.command("add")
 def add(
-    first: Annotated[str, typer.Argument(help="First name.")],
-    last: Annotated[str, typer.Argument(help="Last name.")],
-    role: Annotated[UserOrgRole, typer.Option("--role", help="Org role to grant.")],
+    username: UsernameArg,
+    email: Annotated[
+        str,
+        typer.Option(
+            "--email",
+            help="Email (required — the server rejects a user without a valid "
+            "address). Use a real one for any account that may become an org owner.",
+        ),
+    ],
+    role: Annotated[
+        UserOrgRole, typer.Option("--role", help="Org role to grant (default: USER).")
+    ] = UserOrgRole.USER,
+    first: Annotated[
+        str | None, typer.Option("--first", help="First name (display name only).")
+    ] = None,
+    last: Annotated[
+        str | None, typer.Option("--last", help="Last name (display name only).")
+    ] = None,
     org: Annotated[
         str | None,
         typer.Option("--org", help="Organization (default: the acting identity's org)."),
-    ] = None,
-    email: Annotated[
-        str | None,
-        typer.Option(
-            "--email",
-            help="Email (default: first.last@example.com — a placeholder; always "
-            "set a real one for an account that may become an org owner).",
-        ),
     ] = None,
     phone: Annotated[
         str | None,
@@ -234,23 +246,31 @@ def add(
             "granted an org's owner role.",
         ),
     ] = None,
+    password: Annotated[
+        str | None,
+        typer.Option(
+            "--password",
+            help="Password to set. A strong random one is generated if omitted. "
+            "Passing it here exposes it in shell history / process list.",
+        ),
+    ] = None,
     env: EnvOption = None,
     as_: AsOption = None,
 ) -> None:
-    """Create a user server-side, cache its generated credential, print the password once.
+    """Create a user server-side, cache its credential, print the password once.
 
-    The username (first-initial + last name) is the local handle.
+    The username argument is both the server-side username and the local handle.
     """
+    generated = password is None
+    password = password or passwords.generate_password()
+
     with report_errors():
         environment = store.get_environment(env)
         caller = store.resolve_identity(environment.name, as_)
         _require_user_caller(caller)
         org_name_arg = resolve_membership_org(caller, org)
 
-        username = f"{first[:1]}{last}".lower()
-        user_email = email or f"{first.lower()}.{last.lower()}@example.com"
-        display_name = f"{first} {last}"
-        password = passwords.generate_password()
+        display_name = " ".join(p for p in (first, last) if p)
         user_id = str(uuid.uuid4())
 
         def _call(client: api.IdpClient) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -260,8 +280,7 @@ def add(
             body: dict[str, Any] = {
                 "id": user_id,
                 "username": username,
-                "email": user_email,
-                "displayName": display_name,
+                "email": email,
                 "passwordHash": passwords.bcrypt_hash(password),
                 "status": "ACTIVE",
                 "mfaEnabled": False,
@@ -273,6 +292,8 @@ def add(
                     }
                 ],
             }
+            if display_name:
+                body["displayName"] = display_name
             if phone is not None:
                 body["phoneNumber"] = phone
             user_dto: dict[str, Any] = client.post("/v1/users", json=body)
@@ -291,15 +312,17 @@ def add(
 
     render(
         {
-            "username": user_dto["username"],
-            "email": user_dto["email"],
+            "username": user_dto.get("username", username),
+            "email": user_dto.get("email") or "",
             "phone": user_dto.get("phoneNumber") or "",
             "display_name": user_dto.get("displayName", ""),
+            "org": f"{org_name}:{role.value}",
             "server_id": user_dto["id"],
         },
         title="User created",
     )
-    console.print(f"[bold]Password (shown once):[/bold] {password}")
+    if generated:
+        console.print(f"[bold]Password (generated, shown once):[/bold] {password}")
 
 
 @app.command("show")
@@ -371,7 +394,11 @@ def list_(
     ] = False,
     org: Annotated[
         str | None,
-        typer.Option("--org", help="Filter the local listing to accounts with a membership in this org."),
+        typer.Option(
+            "--org",
+            help="Filter to accounts with a membership in this org. Local by "
+            "default; with --remote / --all it's sent as the server's orgId filter.",
+        ),
     ] = None,
     status: Annotated[
         UserStatus | None,
@@ -390,12 +417,6 @@ def list_(
     """List user accounts. Cached (local) by default; --remote / --all hit the server."""
     with report_errors():
         environment = store.get_environment(env)
-
-        if org is not None and (remote or all_):
-            raise CliError(
-                "--org filters the local cached listing and can't be combined "
-                "with --remote / --all (the server user list has no org filter)."
-            )
 
         if not remote and not all_:
             identities = store.list_identities(environment.name, kind="USER")
@@ -430,6 +451,8 @@ def list_(
             params["status"] = status.value
         if email is not None:
             params["email"] = email
+        if org is not None:
+            params["orgId"] = resolve_org(environment, org)["id"]
         body = auth.authed_call(
             caller,
             environment.idp_base_url,
@@ -437,8 +460,8 @@ def list_(
         )
         items: list[dict[str, Any]] = body.get("items", [])
         next_cursor = body.get("nextCursor")
-        cached_ids = {
-            i.server_id
+        cached = {
+            i.server_id: i
             for i in store.list_identities(environment.name, kind="USER")
         }
 
@@ -448,12 +471,19 @@ def list_(
                 "username": item["username"],
                 "email": item["email"],
                 "status": item["status"],
+                "orgs": _orgs_summary(cached[item["id"]].id)
+                if item["id"] in cached
+                else "-",
                 "server_id": item["id"],
-                "cached": "yes" if item["id"] in cached_ids else "",
+                "cached": "yes" if item["id"] in cached else "no",
             }
             for item in items
         ],
-        title="Users (server)",
+        title="Users (server)" + (f" in {org}" if org is not None else ""),
+    )
+    note(
+        "orgs: from vl's local cache — the server user list carries no membership "
+        "data, so it's blank for accounts vl hasn't cached."
     )
     if next_cursor:
         console.print(f"[dim]more results — rerun with --page {next_cursor}[/dim]")

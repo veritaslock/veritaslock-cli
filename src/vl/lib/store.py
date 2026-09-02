@@ -12,6 +12,7 @@ and bumping ``SCHEMA_VERSION`` (§8 of the ``vl env`` spec):
   -> ``svc_acct`` (naming-convention cleanup, no schema change).
 * v6 — ``team`` cache + ``team_member`` join + ``vl team`` (Phase 6).
 * v7 — ``command_history`` ring buffer + ``vl history``.
+* v8 — ``svc_acct.role`` column (shown by ``vl svc-acct list`` / ``show``).
 
 On open, every migration between the store's ``PRAGMA user_version`` and
 ``SCHEMA_VERSION`` is applied in order; a store from a *newer* `vl` is rejected
@@ -32,7 +33,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # Treat a cached token as expired this many seconds before its real expiry, to
 # avoid handing a command a token that dies mid-request.
@@ -178,6 +179,12 @@ _MIGRATIONS: tuple[str, ...] = (
         argv    TEXT NOT NULL
     );
     """,
+    # 7 -> 8: cache the service account's role locally so `vl svc-acct list` /
+    # `show` can display it without a server call. Nullable — rows written by an
+    # older `vl` stay NULL until the account is next re-cached or updated.
+    """
+    ALTER TABLE svc_acct ADD COLUMN role TEXT;
+    """,
 )
 
 # Auto-seeded on first store-open so a fresh install works with zero setup (§4).
@@ -313,6 +320,7 @@ class SvcAcct:
     public_key_path: str | None
     private_key_path: str | None
     key_version: int | None
+    role: str | None = None
 
 
 @dataclass(frozen=True)
@@ -985,6 +993,8 @@ def _row_to_svc_acct(row: sqlite3.Row) -> SvcAcct:
         public_key_path=row["public_key_path"],
         private_key_path=row["private_key_path"],
         key_version=row["key_version"],
+        # `role` arrived in v8 — tolerate its absence on a store pinned older.
+        role=row["role"] if "role" in row.keys() else None,
     )
 
 
@@ -997,6 +1007,7 @@ def set_svc_acct(
     public_key_path: str | None = None,
     private_key_path: str | None = None,
     key_version: int | None = None,
+    role: str | None = None,
 ) -> None:
     """Insert or replace a SERVICE_ACCOUNT identity's credential row."""
     with _store() as conn:
@@ -1004,16 +1015,17 @@ def set_svc_acct(
             """
             INSERT INTO svc_acct
                 (identity_id, environment_name, org_name, client_secret_plaintext,
-                 public_key_path, private_key_path, key_version)
+                 public_key_path, private_key_path, key_version, role)
             VALUES (:identity_id, :environment_name, :org_name, :secret,
-                    :public_key_path, :private_key_path, :key_version)
+                    :public_key_path, :private_key_path, :key_version, :role)
             ON CONFLICT (identity_id) DO UPDATE SET
                 environment_name        = excluded.environment_name,
                 org_name                = excluded.org_name,
                 client_secret_plaintext = excluded.client_secret_plaintext,
                 public_key_path         = excluded.public_key_path,
                 private_key_path        = excluded.private_key_path,
-                key_version             = excluded.key_version
+                key_version             = excluded.key_version,
+                role                    = excluded.role
             """,
             {
                 "identity_id": identity_id,
@@ -1023,6 +1035,40 @@ def set_svc_acct(
                 "public_key_path": public_key_path,
                 "private_key_path": private_key_path,
                 "key_version": key_version,
+                "role": role,
+            },
+        )
+        conn.commit()
+
+
+def update_svc_acct_role(identity_id: int, role: str) -> None:
+    """Refresh a SERVICE_ACCOUNT credential's cached role (used after `update --role`)."""
+    with _store() as conn:
+        conn.execute(
+            "UPDATE svc_acct SET role = ? WHERE identity_id = ?", (role, identity_id)
+        )
+        conn.commit()
+
+
+def refresh_svc_acct_server_fields(
+    identity_id: int, *, role: str | None = None, key_version: int | None = None
+) -> None:
+    """Sync the server-owned columns (``role``, ``key_version``) of a cached
+    credential from a fresh ``--remote`` / ``--all`` read. A ``None`` argument
+    leaves that column untouched; a missing credential row is a no-op.
+    """
+    with _store() as conn:
+        conn.execute(
+            """
+            UPDATE svc_acct
+               SET role        = COALESCE(:role, role),
+                   key_version = COALESCE(:key_version, key_version)
+             WHERE identity_id = :identity_id
+            """,
+            {
+                "role": role,
+                "key_version": key_version,
+                "identity_id": identity_id,
             },
         )
         conn.commit()
