@@ -9,7 +9,7 @@ import sys
 
 import typer
 
-from vl.commands import env, org, svc_acct, team, team_member, usr_acct
+from vl.commands import env, org, org_members, svc_acct, team, team_member, usr_acct
 from vl.commands.history import history
 from vl.commands.whoami import whoami
 from vl.lib import store
@@ -25,6 +25,7 @@ app = typer.Typer(
 
 app.add_typer(env.app, name="env")
 app.add_typer(org.app, name="org")
+app.add_typer(org_members.app, name="org-members")
 app.add_typer(usr_acct.app, name="usr-acct")
 # `user` / `user-acct` are undocumented synonyms for `usr-acct` — accepted
 # silently (hidden from help, no deprecation notice).

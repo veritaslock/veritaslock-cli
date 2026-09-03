@@ -184,3 +184,23 @@ matches the server's authorization view):
 
 Both render an `org` column. `--name <filter>` is still accepted and is passed to
 each per-org call. A token with no `orgs` claim (a service account) lists nothing.
+
+## 7. `vl org members` split into a top-level `vl org-members`, same shape as §6
+
+The nested `members` sub-group under `vl org` was **removed**; its four verbs
+moved unchanged to a new top-level command, peer to `vl org` — the same
+restructure §6 already did for `vl team` / `vl team-member`. This supersedes
+`vl-org-spec.md` §4.5-§4.7a's command names (behaviour, endpoints, and request
+shapes are otherwise unchanged).
+
+- `vl org-members add <org> --user-id <id> --role <role> [--org's --as/--env]`
+- `vl org-members list <org>`
+- `vl org-members set-role <org> <user-id> --role <role>`
+- `vl org-members remove <org> --user-id <id>`
+
+Unlike the `vl team` split, there was no name-resolution logic to carry over —
+an org is addressed directly by name (`resolve_org`), not searched for across
+the caller's orgs the way a team is — so `vl org-members` is a straight lift of
+the old `members_app` commands into `src/vl/commands/org_members.py`, mounted
+on the root app as `org-members`. `vl org`'s own commands (`add`, `show`,
+`list`, `update`) are unaffected.
