@@ -99,62 +99,70 @@ def add(
             "could not derive a label from the display name — pass --label",
             param_hint="--label",
         )
-    client_secret = secret or secrets.token_hex(16)
 
+    client_secret = secret or secrets.token_hex(16)
     with report_errors():
         environment = store.get_environment(env)
         caller = store.resolve_identity(environment.name, as_)
         assert_label_free(environment.name, identity_label)
         org_name_arg = resolve_membership_org(caller, org)
-
-        with api.IdpClient(environment.idp_base_url) as client:
-            org_dto = client.get("/v1/organizations", params={"name": org_name_arg})
-        org_name = cache_org(environment.name, org_dto)
-
-        created = auth.authed_call(
-            caller,
-            environment.idp_base_url,
-            lambda c: c.post(
-                "/v1/service-accounts",
-                json={
-                    "displayName": display_name,
-                    "description": description,
-                    "role": role.value,
-                    "keyVersion": 1,
-                    "clientSecret": client_secret,
-                    "orgId": org_dto["id"],
-                    "publicKey": None,
-                    "bootstrapHash": None,
-                },
-            ),
-        )
-        server_id = str(created["id"])
-
-        key_dir = store.keys_root() / server_id
-        private_path, public_path = keys.generate_keypair(key_dir)
-        _provision_public_key(
-            environment.idp_base_url,
-            server_id,
-            str(created["bootstrapHash"]),
-            keys.public_key_b64url(public_path),
-        )
-
-        identity = store.add_identity(
-            environment.name, "SERVICE_ACCOUNT", server_id, server_id, identity_label
-        )
-        store.set_svc_acct(
-            identity.id,
-            environment.name,
-            org_name,
-            client_secret,
-            public_key_path=str(public_path),
-            private_key_path=str(private_path),
-            key_version=1,
-            role=role.value,
-        )
+        created = create_svc_acct(display_name, description, client_secret, environment, identity_label, org_name_arg, caller, role)
 
     render(_sa_row(created, None), title="Service account created")
     console.print(f"[bold]Client secret (shown once):[/bold] {client_secret}")
+
+
+def create_svc_acct(display_name: str | None, description: str | None, client_secret: str,
+                    environment: store.Environment, identity_label: str, org_name_arg: str | None, caller: store.Identity,
+                    role: ServiceAccountRole) -> tuple[dict[str, Any], int]:
+
+    with api.IdpClient(environment.idp_base_url) as client:
+        org_dto = client.get("/v1/organizations", params={"name": org_name_arg})
+    org_name = cache_org(environment.name, org_dto)
+
+    created = auth.authed_call(
+        caller,
+        environment.idp_base_url,
+        lambda c: c.post(
+            "/v1/service-accounts",
+            json={
+                "displayName": display_name,
+                "description": description,
+                "role": role.value,
+                "keyVersion": 1,
+                "clientSecret": client_secret,
+                "orgId": org_dto["id"],
+                "publicKey": None,
+                "bootstrapHash": None,
+            },
+        ),
+    )
+    server_id = str(created["id"])
+
+    key_dir = store.keys_root() / server_id
+    private_path, public_path = keys.generate_keypair(key_dir)
+
+    _provision_public_key(
+        environment.idp_base_url,
+        server_id,
+        str(created["bootstrapHash"]),
+        keys.public_key_b64url(public_path),
+    )
+
+    identity = store.add_identity(
+        environment.name, "SERVICE_ACCOUNT", server_id, server_id, identity_label
+    )
+    store.set_svc_acct(
+        identity.id,
+        environment.name,
+        org_name,
+        client_secret,
+        public_key_path=str(public_path),
+        private_key_path=str(private_path),
+        key_version=1,
+        role=role.value,
+    )
+    return created, identity.id
 
 
 def _provision_public_key(

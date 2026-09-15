@@ -33,7 +33,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # Treat a cached token as expired this many seconds before its real expiry, to
 # avoid handing a command a token that dies mid-request.
@@ -185,6 +185,48 @@ _MIGRATIONS: tuple[str, ...] = (
     """
     ALTER TABLE svc_acct ADD COLUMN role TEXT;
     """,
+    # 8 -> 9: Node implementation, updating environment table and adding tables for kafka properties and node (Phase 7).
+    # Restrict delete of service account to prevent deletion of a node still in use.
+    # Node status defaults to state 'new'; node_id is initially null and assigned by the control-plane when node is first started.
+    # cp_state is the node's state in the control-plane which can be stale.
+    # cp_state_synced_at is the most recent time that the cp_state was updated.
+    """
+    ALTER TABLE environment ADD COLUMN token_url TEXT;
+    ALTER TABLE environment ADD COLUMN schema_registry_url TEXT;
+    CREATE TABLE IF NOT EXISTS env_kafka_property (
+        environment_name  TEXT NOT NULL
+                          REFERENCES environment(name)
+                          ON UPDATE CASCADE ON DELETE CASCADE,
+        key               TEXT NOT NULL,
+        value             TEXT NOT NULL,
+        PRIMARY KEY (environment_name, key)
+    );
+    CREATE TABLE IF NOT EXISTS node (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        environment_name  TEXT NOT NULL
+                          REFERENCES environment(name)
+                          ON UPDATE CASCADE ON DELETE RESTRICT,
+        org_name          TEXT NOT NULL,
+        name              TEXT NOT NULL,
+        node_id           TEXT UNIQUE,
+        host              TEXT NOT NULL DEFAULT '127.0.0.1',
+        svc_acct_id       INTEGER NOT NULL
+                          REFERENCES svc_acct(identity_id)
+                          ON DELETE RESTRICT,
+        port              INTEGER NOT NULL,
+        pid               INTEGER,
+        status            TEXT NOT NULL DEFAULT 'new'
+                          CHECK (status IN ('new', 'running', 'stopped')),
+        cp_state          TEXT
+                          CHECK (cp_state IN ('UP', 'DOWN', 'STANDBY') OR cp_state IS NULL),
+        cp_state_synced_at TEXT,
+        created_at        TEXT NOT NULL,
+        UNIQUE (environment_name, org_name, name),
+        FOREIGN KEY (environment_name, org_name)
+            REFERENCES organization(environment_name, name)
+            ON UPDATE CASCADE ON DELETE RESTRICT
+    );
+    """,
 )
 
 # Auto-seeded on first store-open so a fresh install works with zero setup (§4).
@@ -239,6 +281,14 @@ class NoResolvedIdentityError(StoreError):
 
 class TeamNotFoundError(StoreError):
     """Named team is not in the local cache."""
+
+
+class NodeNotFoundError(StoreError):
+    """Named node is not in the local cache."""
+
+
+class NodeExistsError(StoreError):
+    """Node with name in org org_name already exists in environment."""
 
 
 @dataclass(frozen=True)
@@ -347,6 +397,25 @@ class TeamMember:
     team_name: str
     role: str
     synced_at: str
+
+
+@dataclass(frozen=True)
+class Node:
+    """A cached node row (local mirror of the server's, not a source of truth)."""
+
+    id: int
+    environment_name: str
+    org_name: str
+    name: str
+    node_id: str | None
+    host: str
+    svc_acct_id: int
+    port: int
+    pid: int | None
+    node_status: str
+    cp_state: str | None
+    cp_state_synced_at: str | None
+    created_at: str
 
 
 # --------------------------------------------------------------------------- #
@@ -1292,6 +1361,78 @@ def delete_team_member(
             (identity_id, environment_name, org_name, team_name),
         )
         conn.commit()
+
+
+# --------------------------------------------------------------------------- #
+# Public API — node (Phase 7)
+# --------------------------------------------------------------------------- #
+
+
+def _row_to_node(row: sqlite3.Row) -> Node:
+    return Node(
+        id=row["id"],
+        environment_name=row["environment_name"],
+        org_name=row["org_name"],
+        name=row["name"],
+        node_id=row["node_id"],
+        host=row["host"],
+        svc_acct_id=row["svc_acct_id"],
+        port=row["port"],
+        pid=row["pid"],
+        node_status=row["status"],
+        cp_state=row["cp_state"],
+        cp_state_synced_at=row["cp_state_synced_at"],
+        created_at=row["created_at"]
+    )
+
+
+def _node_row(
+    conn: sqlite3.Connection, environment: str, org_name: str, name: str
+) -> sqlite3.Row | None:
+    row: sqlite3.Row | None = conn.execute(
+        "SELECT * FROM node WHERE environment_name = ? AND org_name = ? AND name = ?",
+        (environment, org_name, name),
+    ).fetchone()
+    return row
+
+
+def add_node(environment_name: str, org_name: str, name: str, host: str, svc_acct_id: int, port: int) -> Node:
+    """Create a Node row."""
+    with _store() as conn:
+        if _node_row(conn, environment_name, org_name, name) is not None:
+            raise NodeExistsError(
+                f"Node with {name!r} in {org_name!r} already exists in environment {environment_name!r}"
+            )
+        cursor = conn.execute(
+            """
+            INSERT INTO node (environment_name, org_name, name, host, svc_acct_id, port, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (environment_name, org_name, name, host, svc_acct_id, port, _now()),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM node WHERE id = ?", (cursor.lastrowid,)
+        ).fetchone()
+        assert row is not None  # just inserted
+        return _row_to_node(row)
+
+
+def list_nodes(environment_name: str, org_name: str | None = None) -> list[Node]:
+    with _store() as conn:
+        if org_name is None:
+            rows = conn.execute(
+                "SELECT * FROM node WHERE environment_name = ? "
+                "ORDER BY org_name, name",
+                (environment_name,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM node WHERE environment_name = ? AND org_name = ? "
+                "ORDER BY name",
+                (environment_name, org_name),
+            ).fetchall()
+        return [_row_to_node(row) for row in rows]
 
 
 # --------------------------------------------------------------------------- #
