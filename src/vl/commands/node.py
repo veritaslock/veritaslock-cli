@@ -6,92 +6,72 @@ token flow throughout. See vl-node-spec.md.
 
 from __future__ import annotations
 
+import secrets
 from typing import Annotated, Any
 
 import typer
-import socket
 
+from vl.commands import svc_acct
 from vl.commands._shared import (
     AsOption,
     EnvOption,
-    cache_team,
-    caller_orgs_claim,
-    fetch_all_orgs,
-    org_name_resolver,
     report_errors,
-    resolve_org,
+    resolve_org, assert_label_free,
 )
-from vl.lib import auth, store
+from vl.lib import store, roles
 from vl.lib.cli import HelpOnErrorGroup
-from vl.lib.output import console, render
+from vl.lib.output import render, note
+from pathlib import Path
 
 app = typer.Typer(
-    help="Manage VeritasLock nodes.", no_args_is_help=True, cls=HelpOnErrorGroup
+    help="Manage VeritasLock nodes.",
+    no_args_is_help=True,
+    cls=HelpOnErrorGroup
 )
 
-def _node_row(dto: dict[str, Any], node: store.Node) -> dict[str, Any]:
+
+def _node_row(node: store.Node) -> dict[str, Any]:
     return {
         "org": node.org_name,
-        "name": node.name,
-        "host": dto["host"],
-        "port": dto["port"],
+        "org_node": node.org_node,
+        "port": node.port,
         "status": node.node_status,
-        "created_at": dto.get("createdAt", ""),
+        "created_at": node.created_at,
     }
 
-def _resolve_node_name( org_name: str, node_name: str | None = None) -> str:
-    if node_name is None:
-        node_names = [obj.name for obj in store.list_nodes(org_name)]
 
-        # Extract only the numeric part after the last hyphen
-        nums = []
-        for name in node_names:
-            # Expect format: nodeN
-            if name.startswith("node"):
-                try:
-                    nums.append(int(name[4:]))
-                except ValueError:
-                    pass
-
-        max_n = max(nums) if nums else 0
-        node_name = f"node{max_n + 1}"
-
-    return f"{node_name}"
+def _resolve_org_node(env: str, org_name: str, org_node: int | None = None) -> int:
+    if org_node is None:
+        org_node = store.next_org_node(env, org_name)
+    return org_node
 
 
-def _resolve_port(org_name: str, port: int | None = None) -> int:
+def _resolve_port(port: int | None = None) -> int:
     if port is None:
-        ports = [obj.port for obj in store.list_nodes(org_name)]
-        max_port = max(ports) if ports else 7000
-        port = max_port + 1
+        port = store.next_port()
     return port
 
-def _resolve_host(org_name: str, host: str | None = None) -> str:
-    if host is None:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            # Doesn't need to be reachable — just used to pick the right interface
-            s.connect(("8.8.8.8", 80))
-            host = s.getsockname()[0]
-        finally:
-            s.close()
 
-    return host
+def create_node_dir(org: str, n: int) -> Path:
+    path = Path.home() / "orgs" / org / "nodes" / f"node{n}"
+    if path.exists():
+        note(f"WARNING: Directory already exists: {path}")
+    else:
+        path.mkdir(parents=True)
+        note(f"Created: {path}")
+    return path
+
 
 @app.command("create")
 def create(
     org: Annotated[str, typer.Argument(help="Organization name.")],
-    name: Annotated[
-        str | None,
-        typer.Option("--name", help="Node name (default: org-name-nodeN."),
+    org_node: Annotated[
+        int | None,
+        typer.Option("--node", help="Node number for org (defaults next available node number)."),
     ] = None,
     port: Annotated[
         int | None,
         typer.Option("--port", help="Node port (default: next available port)."),
-    ] = None,
-    host: Annotated[
-        str | None,
-        typer.Option( "--host", help="Node host (default: ip address of localhost)."),
     ] = None,
 
     env: EnvOption = None,
@@ -100,22 +80,21 @@ def create(
     """Create a node """
     with report_errors():
         environment = store.get_environment(env)
-        node_name = _resolve_node_name(org, name)
-        port = _resolve_port(org, port)
-        host = _resolve_host(org, host)
+
+        resolved_port = _resolve_port(port)
         caller = store.resolve_identity(environment.name, as_)
         org_dto = resolve_org(environment, org)
         org_name = str(org_dto["name"])
-        dto = auth.authed_call(
-            caller,
-            environment.idp_base_url,
-            lambda c: c.post(
-                "/v1/nodes",
-                json={"orgId": org_dto["id"], "port": port, "host": host},
-            ),
-        )
-        node = store.add_node(environment.name, org_name, node_name, host, 0, port)
-
-    render(_node_row(dto, node), title="Node created")
+        org_node = _resolve_org_node(environment.name, org_name, org_node)
+        identity_label = f"{org_name}-{org_node}"
+        display_name = f"{org_name} node{org_node}"
+        role = roles.ServiceAccountRole.NODE
+        client_secret = secrets.token_hex(16)
+        assert_label_free(environment.name, identity_label)
+        _, identity_id = svc_acct.create_svc_acct(display_name, f"svc-acct for {display_name}", client_secret,
+                                 environment, identity_label, org_name, caller, role)
+        create_node_dir(org_name, org_node)
+        _node = store.add_node(environment.name, org_name, org_node, identity_id, resolved_port)
+    render(_node_row(_node), title="Node created")
 
 

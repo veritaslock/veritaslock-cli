@@ -106,7 +106,7 @@ def add(
         caller = store.resolve_identity(environment.name, as_)
         assert_label_free(environment.name, identity_label)
         org_name_arg = resolve_membership_org(caller, org)
-        created = create_svc_acct(display_name, description, client_secret, environment, identity_label, org_name_arg, caller, role)
+        created, _ = create_svc_acct(display_name, description, client_secret, environment, identity_label, org_name_arg, caller, role)
 
     render(_sa_row(created, None), title="Service account created")
     console.print(f"[bold]Client secret (shown once):[/bold] {client_secret}")

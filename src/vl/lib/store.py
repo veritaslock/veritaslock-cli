@@ -207,9 +207,8 @@ _MIGRATIONS: tuple[str, ...] = (
                           REFERENCES environment(name)
                           ON UPDATE CASCADE ON DELETE RESTRICT,
         org_name          TEXT NOT NULL,
-        name              TEXT NOT NULL,
-        node_id           TEXT UNIQUE,
-        host              TEXT NOT NULL DEFAULT '127.0.0.1',
+        org_node          INTEGER NOT NULL,
+        host              TEXT,
         svc_acct_id       INTEGER NOT NULL
                           REFERENCES svc_acct(identity_id)
                           ON DELETE RESTRICT,
@@ -217,11 +216,8 @@ _MIGRATIONS: tuple[str, ...] = (
         pid               INTEGER,
         status            TEXT NOT NULL DEFAULT 'new'
                           CHECK (status IN ('new', 'running', 'stopped')),
-        cp_state          TEXT
-                          CHECK (cp_state IN ('UP', 'DOWN', 'STANDBY') OR cp_state IS NULL),
-        cp_state_synced_at TEXT,
         created_at        TEXT NOT NULL,
-        UNIQUE (environment_name, org_name, name),
+        UNIQUE (environment_name, org_name, org_node),
         FOREIGN KEY (environment_name, org_name)
             REFERENCES organization(environment_name, name)
             ON UPDATE CASCADE ON DELETE RESTRICT
@@ -406,15 +402,12 @@ class Node:
     id: int
     environment_name: str
     org_name: str
-    name: str
-    node_id: str | None
-    host: str
+    org_node: int
+    host: str | None
     svc_acct_id: int
     port: int
     pid: int | None
     node_status: str
-    cp_state: str | None
-    cp_state_synced_at: str | None
     created_at: str
 
 
@@ -1373,42 +1366,39 @@ def _row_to_node(row: sqlite3.Row) -> Node:
         id=row["id"],
         environment_name=row["environment_name"],
         org_name=row["org_name"],
-        name=row["name"],
-        node_id=row["node_id"],
+        org_node=row["org_node"],
         host=row["host"],
         svc_acct_id=row["svc_acct_id"],
         port=row["port"],
         pid=row["pid"],
         node_status=row["status"],
-        cp_state=row["cp_state"],
-        cp_state_synced_at=row["cp_state_synced_at"],
         created_at=row["created_at"]
     )
 
 
 def _node_row(
-    conn: sqlite3.Connection, environment: str, org_name: str, name: str
+    conn: sqlite3.Connection, environment: str, org_name: str, org_node: int
 ) -> sqlite3.Row | None:
     row: sqlite3.Row | None = conn.execute(
-        "SELECT * FROM node WHERE environment_name = ? AND org_name = ? AND name = ?",
-        (environment, org_name, name),
+        "SELECT * FROM node WHERE environment_name = ? AND org_name = ? AND org_node = ?",
+        (environment, org_name, org_node),
     ).fetchone()
     return row
 
 
-def add_node(environment_name: str, org_name: str, name: str, host: str, svc_acct_id: int, port: int) -> Node:
+def add_node(environment_name: str, org_name: str, org_node: int, svc_acct_id: int, port: int) -> Node:
     """Create a Node row."""
     with _store() as conn:
-        if _node_row(conn, environment_name, org_name, name) is not None:
+        if _node_row(conn, environment_name, org_name, org_node) is not None:
             raise NodeExistsError(
-                f"Node with {name!r} in {org_name!r} already exists in environment {environment_name!r}"
+                f"Node with {org_node!r} in {org_name!r} already exists in environment {environment_name!r}"
             )
         cursor = conn.execute(
             """
-            INSERT INTO node (environment_name, org_name, name, host, svc_acct_id, port, created_at)
+            INSERT INTO node (environment_name, org_name, org_node, svc_acct_id, port, status, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (environment_name, org_name, name, host, svc_acct_id, port, _now()),
+            (environment_name, org_name, org_node, svc_acct_id, port, "new", _now()),
         )
         conn.commit()
         row = conn.execute(
@@ -1418,23 +1408,20 @@ def add_node(environment_name: str, org_name: str, name: str, host: str, svc_acc
         return _row_to_node(row)
 
 
-def list_nodes(environment_name: str, org_name: str | None = None) -> list[Node]:
+def next_org_node(environment_name: str, org_name: str) -> int:
     with _store() as conn:
-        if org_name is None:
-            rows = conn.execute(
-                "SELECT * FROM node WHERE environment_name = ? "
-                "ORDER BY org_name, name",
-                (environment_name,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM node WHERE environment_name = ? AND org_name = ? "
-                "ORDER BY name",
-                (environment_name, org_name),
-            ).fetchall()
-        return [_row_to_node(row) for row in rows]
+        row: sqlite3.Row = conn.execute(
+            "SELECT MAX(org_node) FROM node WHERE environment_name = ? AND org_name = ? ", (environment_name, org_name)
+        ).fetchone()
+        return row[0] + 1 if row[0] is not None else 1
 
 
+def next_port() -> int:
+    with _store() as conn:
+        row: sqlite3.Row = conn.execute(
+            "SELECT MAX(port) FROM node"
+        ).fetchone()
+        return row[0] + 1 if row[0] is not None else 7001
 # --------------------------------------------------------------------------- #
 # Command history (`vl history`)
 # --------------------------------------------------------------------------- #
