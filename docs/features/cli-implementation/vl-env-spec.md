@@ -1,7 +1,6 @@
 # veritaslock-cli (`vl`) — Phase 1: `vl env`
 
 **Status:** Draft for implementation
-**Part of:** the larger `vl-cli-phase1-crud-spec.md` effort, broken out as its own standalone document so it can be implemented and tested in isolation. `vl env` is the foundation everything else depends on.
 **Builds on:** the existing `veritaslock-cli` scaffold (Typer/Rich, `src/vl/` layout, noun-verb commands, `vl.lib.config`).
 
 ---
@@ -21,12 +20,16 @@ Default `~/.config/vl/store.db` (override via `VL_STORE_PATH`), consistent with 
 | Field | Type | Notes |
 |---|---|---|
 | name | text | **PRIMARY KEY** — e.g. `local`, `dev`, later `test`/`stage`/`prod`/`demo` |
-| idp_base_url | text | full URL, e.g. `http://localhost:8080` |
-| cp_base_url | text | full URL, e.g. `http://localhost:8082` |
-| di_base_url | text | full URL, e.g. `http://localhost:8083` |
-| kafka_bootstrap | text | nullable — unused by anything in this phase, kept for a future phase (`start_test_harness.sh` migration) rather than added back later via migration |
+| idp_base_url | text | `NOT NULL` — full URL, e.g. `http://localhost:8080` |
+| cp_base_url | text | `NOT NULL` — full URL, e.g. `http://localhost:8082` |
+| di_base_url | text | `NOT NULL` — full URL, e.g. `http://localhost:8083` |
+| token_url | text | `NOT NULL` — full URL, e.g. `http://localhost:8080/auth/service-account/authenticate`; distinct from `idp_base_url`, which is the IdP's base — token issuance has its own path |
+| schema_reg_url | text | `NOT NULL` — full URL, e.g. `http://localhost:8081` |
+| kafka_bootstrap | text | `NOT NULL` — e.g. `localhost:9092`; consumed by `vl node start`'s rendered `veritas-lock.conf` (`vl-node-spec.md` §5.2, `verilock-node-startup-spec.md` §3.1) |
 | is_default | integer | 0/1, at most one row set — backs `vl env use` |
 | created_at | text | ISO8601 |
+
+All six of `idp_base_url`/`cp_base_url`/`di_base_url`/`token_url`/`schema_reg_url`/`kafka_bootstrap` are `NOT NULL` at the table level, required at `vl env add` (§5.1). No default value for any of them, and no split between "required at add-time" and "required only for nodes" — every environment genuinely needs its own value for each (that's the whole reason they're columns instead of a shared constant), and there's no real use case where an environment is created without them, so deferring the requirement to first use would only move a config mistake from an immediate, clear error to a later, more confusing one.
 
 `name` is the primary key deliberately (not a surrogate id), and every table added in later phases that needs to scope a row to an environment references it directly: `environment_name TEXT REFERENCES environment(name) ON UPDATE CASCADE ON DELETE RESTRICT`.
 
@@ -42,7 +45,9 @@ name: local
 idp_base_url: http://localhost:8080
 cp_base_url: http://localhost:8082
 di_base_url: http://localhost:8083
-kafka_bootstrap: NULL
+token_url: http://localhost:8080/auth/service-account/authenticate
+schema_reg_url: http://localhost:8081
+kafka_bootstrap: localhost:9092
 is_default: 1
 ```
 
@@ -52,8 +57,8 @@ This is what makes a fresh install usable with zero setup — `vl env list` and 
 
 All of these are local-only — no network calls, no authentication.
 
-### 5.1 `vl env add <name> --idp-url <url> --cp-url <url> --di-url <url> [--kafka <bootstrap>]`
-Inserts a new `environment` row. Fails clearly (not a raw SQLite constraint error) if `name` already exists. Does not set `is_default` — the row is available for use via `--env <name>` or `vl env use <name>`, but doesn't silently take over as the default just by being created.
+### 5.1 `vl env add <name> --idp-url <url> --cp-url <url> --di-url <url> --token-url <url> --schema-reg-url <url> --kafka <bootstrap>`
+Inserts a new `environment` row. All six URL/bootstrap flags are required (§3) — `vl env add` fails with a clear "missing required argument" message, same as any other required flag elsewhere in this project, rather than succeeding with a partially-usable environment. Fails clearly (not a raw SQLite constraint error) if `name` already exists. Does not set `is_default` — the row is available for use via `--env <name>` or `vl env use <name>`, but doesn't silently take over as the default just by being created.
 
 ### 5.2 `vl env list`
 Lists all environments (name, three URLs, whether it's the default). Rendered via `vl.lib.output`.
@@ -64,8 +69,8 @@ Detail view of a single environment.
 ### 5.4 `vl env use <name>`
 Sets `is_default = 1` on the named row, clearing it on any other row (single-statement transaction, not two — avoid a window with zero or two defaults if interrupted).
 
-### 5.5 `vl env update <name> [--idp-url <url>] [--cp-url <url>] [--di-url <url>] [--kafka <bootstrap>]`
-Partial update — only the flags supplied are changed, same convention as the `PATCH` endpoints elsewhere in this project. Included so a wrong URL can be corrected without deleting and re-adding the environment, which would otherwise become blocked by `ON DELETE RESTRICT` (§3) the moment anything references it in a later phase.
+### 5.5 `vl env update <name> [--idp-url <url>] [--cp-url <url>] [--di-url <url>] [--token-url <url>] [--schema-reg-url <url>] [--kafka <bootstrap>]`
+Partial update — only the flags supplied are changed, same convention as the `PATCH` endpoints elsewhere in this project. Included so a wrong URL can be corrected without deleting and re-adding the environment, which would otherwise become blocked by `ON DELETE RESTRICT` (§3) the moment anything references it in a later phase. Every flag here is optional at the CLI level (that's what makes it a partial update), but none of them can be used to clear a value back to empty — all six are `NOT NULL` (§3), so `update` only ever changes a value to another non-empty one, never removes it.
 
 ### 5.6 `vl env delete <name>`
 Deletes the row. Fails with a clear message (not a raw FK-constraint error) if anything references it — per §3, this will be relevant starting with the `vl identity` phase once `identity` rows exist. In this phase alone, nothing yet references `environment`, so delete is unconditional in practice until later documents add referencing tables.
@@ -84,11 +89,11 @@ If `--env` names an environment that doesn't exist in the store, or (in the dege
 ## 7. Module: `vl.lib.store` (environment portion)
 
 ```python
-def add_environment(name: str, idp_base_url: str, cp_base_url: str, di_base_url: str, kafka_bootstrap: str | None = None) -> Environment: ...
+def add_environment(name: str, idp_base_url: str, cp_base_url: str, di_base_url: str, token_url: str, schema_reg_url: str, kafka_bootstrap: str) -> Environment: ...
 def list_environments() -> list[Environment]: ...
 def get_environment(name: str | None = None) -> Environment: ...  # None -> resolve default per §6; raises a clear, typed error if unresolvable
 def set_default_environment(name: str) -> None: ...
-def update_environment(name: str, idp_base_url: str | None = None, cp_base_url: str | None = None, di_base_url: str | None = None, kafka_bootstrap: str | None = None) -> Environment: ...  # partial update, only non-None fields change
+def update_environment(name: str, idp_base_url: str | None = None, cp_base_url: str | None = None, di_base_url: str | None = None, token_url: str | None = None, schema_reg_url: str | None = None, kafka_bootstrap: str | None = None) -> Environment: ...  # partial update, only non-None fields change
 def delete_environment(name: str) -> None: ...  # raises a clear, typed error on FK restriction, not a raw sqlite3.IntegrityError
 def ensure_local_environment_seeded() -> None: ...  # idempotent; called at store-open time
 ```

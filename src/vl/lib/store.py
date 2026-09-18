@@ -51,7 +51,9 @@ _MIGRATIONS: tuple[str, ...] = (
         idp_base_url     TEXT NOT NULL,
         cp_base_url      TEXT NOT NULL,
         di_base_url      TEXT NOT NULL,
-        kafka_bootstrap  TEXT,
+        token_url        TEXT NOT NULL,
+        schema_reg_url   TEXT NOT NULL,
+        kafka_bootstrap  TEXT NOT NULL,
         is_default       INTEGER NOT NULL DEFAULT 0
                          CHECK (is_default IN (0, 1)),
         created_at       TEXT NOT NULL
@@ -120,6 +122,7 @@ _MIGRATIONS: tuple[str, ...] = (
                                  REFERENCES identity(id) ON DELETE CASCADE,
         environment_name         TEXT NOT NULL,
         org_name                 TEXT NOT NULL,
+        client_secret            TEXT NOT NULL,
         client_secret_plaintext  TEXT NOT NULL,
         public_key_path          TEXT,
         private_key_path         TEXT,
@@ -187,13 +190,11 @@ _MIGRATIONS: tuple[str, ...] = (
     """,
     # 8 -> 9: Node implementation, updating environment table and adding tables for kafka properties and node (Phase 7).
     # Restrict delete of service account to prevent deletion of a node still in use.
-    # Node status defaults to state 'new'; node_id is initially null and assigned by the control-plane when node is first started.
+    # Node status defaults to state 'NEW'; node_id is initially null and assigned by the control-plane when node is first started.
     # cp_state is the node's state in the control-plane which can be stale.
     # cp_state_synced_at is the most recent time that the cp_state was updated.
     """
-    ALTER TABLE environment ADD COLUMN token_url TEXT;
-    ALTER TABLE environment ADD COLUMN schema_registry_url TEXT;
-    CREATE TABLE IF NOT EXISTS env_kafka_property (
+    CREATE TABLE IF NOT EXISTS env_kafka_property_override (
         environment_name  TEXT NOT NULL
                           REFERENCES environment(name)
                           ON UPDATE CASCADE ON DELETE CASCADE,
@@ -214,8 +215,8 @@ _MIGRATIONS: tuple[str, ...] = (
                           ON DELETE RESTRICT,
         port              INTEGER NOT NULL,
         pid               INTEGER,
-        status            TEXT NOT NULL DEFAULT 'new'
-                          CHECK (status IN ('new', 'running', 'stopped')),
+        state             TEXT NOT NULL DEFAULT 'NEW'
+                          CHECK (state IN ('NEW', 'RUNNING', 'STOPPED')),
         created_at        TEXT NOT NULL,
         UNIQUE (environment_name, org_name, org_node),
         FOREIGN KEY (environment_name, org_name)
@@ -231,7 +232,9 @@ _LOCAL_SEED = {
     "idp_base_url": "http://localhost:8080",
     "cp_base_url": "http://localhost:8082",
     "di_base_url": "http://localhost:8083",
-    "kafka_bootstrap": None,
+    "token_url": "http://localhost:8080/auth/service-account/authenticate",
+    "kafka_bootstrap": "localhost:9092",
+    "schema_reg_url": "http://localhost:8081"
 }
 
 
@@ -295,7 +298,9 @@ class Environment:
     idp_base_url: str
     cp_base_url: str
     di_base_url: str
-    kafka_bootstrap: str | None
+    token_url: str
+    kafka_bootstrap: str
+    schema_reg_url: str
     is_default: bool
     created_at: str
 
@@ -362,6 +367,7 @@ class SvcAcct:
     identity_id: int
     environment_name: str
     org_name: str
+    client_id: str
     client_secret_plaintext: str
     public_key_path: str | None
     private_key_path: str | None
@@ -407,7 +413,7 @@ class Node:
     svc_acct_id: int
     port: int
     pid: int | None
-    node_status: str
+    node_state: str
     created_at: str
 
 
@@ -476,9 +482,9 @@ def _seed_local(conn: sqlite3.Connection) -> None:
         return
     conn.execute(
         """
-        INSERT INTO environment (name, idp_base_url, cp_base_url, di_base_url,
+        INSERT INTO environment (name, idp_base_url, cp_base_url, di_base_url, token_url, schema_reg_url,
                                  kafka_bootstrap, is_default, created_at)
-        VALUES (:name, :idp_base_url, :cp_base_url, :di_base_url,
+        VALUES (:name, :idp_base_url, :cp_base_url, :di_base_url, :token_url, :schema_reg_url,
                 :kafka_bootstrap, 1, :created_at)
         """,
         {**_LOCAL_SEED, "created_at": _now()},
@@ -492,6 +498,8 @@ def _row_to_env(row: sqlite3.Row) -> Environment:
         idp_base_url=row["idp_base_url"],
         cp_base_url=row["cp_base_url"],
         di_base_url=row["di_base_url"],
+        token_url=row["token_url"],
+        schema_reg_url=row["schema_reg_url"],
         kafka_bootstrap=row["kafka_bootstrap"],
         is_default=bool(row["is_default"]),
         created_at=row["created_at"],
@@ -521,7 +529,9 @@ def add_environment(
     idp_base_url: str,
     cp_base_url: str,
     di_base_url: str,
-    kafka_bootstrap: str | None = None,
+    token_url: str,
+    schema_reg_url: str,
+    kafka_bootstrap: str,
 ) -> Environment:
     """Insert a new environment. Does not make it the default."""
     with _store() as conn:
@@ -532,9 +542,9 @@ def add_environment(
             )
         conn.execute(
             """
-            INSERT INTO environment (name, idp_base_url, cp_base_url, di_base_url,
+            INSERT INTO environment (name, idp_base_url, cp_base_url, di_base_url, token_url, schema_reg_url,
                                      kafka_bootstrap, is_default, created_at)
-            VALUES (:name, :idp_base_url, :cp_base_url, :di_base_url,
+            VALUES (:name, :idp_base_url, :cp_base_url, :di_base_url, :token_url, :schema_reg_url,
                     :kafka_bootstrap, 0, :created_at)
             """,
             {
@@ -542,6 +552,8 @@ def add_environment(
                 "idp_base_url": idp_base_url,
                 "cp_base_url": cp_base_url,
                 "di_base_url": di_base_url,
+                "token_url": token_url,
+                "schema_reg_url": schema_reg_url,
                 "kafka_bootstrap": kafka_bootstrap,
                 "created_at": _now(),
             },
@@ -610,6 +622,8 @@ def update_environment(
     idp_base_url: str | None = None,
     cp_base_url: str | None = None,
     di_base_url: str | None = None,
+    token_url: str | None = None,
+    schema_reg_url: str | None = None,
     kafka_bootstrap: str | None = None,
 ) -> Environment:
     """Partial update — only the non-``None`` fields are changed."""
@@ -619,6 +633,8 @@ def update_environment(
             "idp_base_url": idp_base_url,
             "cp_base_url": cp_base_url,
             "di_base_url": di_base_url,
+            "token_url": token_url,
+            "schema_reg_url": schema_reg_url,
             "kafka_bootstrap": kafka_bootstrap,
         }.items()
         if value is not None
@@ -1051,6 +1067,7 @@ def _row_to_svc_acct(row: sqlite3.Row) -> SvcAcct:
         identity_id=row["identity_id"],
         environment_name=row["environment_name"],
         org_name=row["org_name"],
+        client_id=row["client_id"],
         client_secret_plaintext=row["client_secret_plaintext"],
         public_key_path=row["public_key_path"],
         private_key_path=row["private_key_path"],
@@ -1064,6 +1081,7 @@ def set_svc_acct(
     identity_id: int,
     environment: str,
     org_name: str,
+    client_id: str,
     client_secret_plaintext: str,
     *,
     public_key_path: str | None = None,
@@ -1076,13 +1094,14 @@ def set_svc_acct(
         conn.execute(
             """
             INSERT INTO svc_acct
-                (identity_id, environment_name, org_name, client_secret_plaintext,
+                (identity_id, environment_name, org_name, client_id, client_secret_plaintext,
                  public_key_path, private_key_path, key_version, role)
-            VALUES (:identity_id, :environment_name, :org_name, :secret,
+            VALUES (:identity_id, :environment_name, :org_name, :client_id, :secret,
                     :public_key_path, :private_key_path, :key_version, :role)
             ON CONFLICT (identity_id) DO UPDATE SET
                 environment_name        = excluded.environment_name,
                 org_name                = excluded.org_name,
+                client_id               = excluded.client_id,
                 client_secret_plaintext = excluded.client_secret_plaintext,
                 public_key_path         = excluded.public_key_path,
                 private_key_path        = excluded.private_key_path,
@@ -1093,6 +1112,7 @@ def set_svc_acct(
                 "identity_id": identity_id,
                 "environment_name": environment,
                 "org_name": org_name,
+                "client_id": client_id,
                 "secret": client_secret_plaintext,
                 "public_key_path": public_key_path,
                 "private_key_path": private_key_path,
@@ -1371,7 +1391,7 @@ def _row_to_node(row: sqlite3.Row) -> Node:
         svc_acct_id=row["svc_acct_id"],
         port=row["port"],
         pid=row["pid"],
-        node_status=row["status"],
+        node_state=row["state"],
         created_at=row["created_at"]
     )
 
@@ -1395,10 +1415,10 @@ def add_node(environment_name: str, org_name: str, org_node: int, svc_acct_id: i
             )
         cursor = conn.execute(
             """
-            INSERT INTO node (environment_name, org_name, org_node, svc_acct_id, port, status, created_at)
+            INSERT INTO node (environment_name, org_name, org_node, svc_acct_id, port, state, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (environment_name, org_name, org_node, svc_acct_id, port, "new", _now()),
+            (environment_name, org_name, org_node, svc_acct_id, port, "NEW", _now()),
         )
         conn.commit()
         row = conn.execute(
@@ -1422,6 +1442,39 @@ def next_port() -> int:
             "SELECT MAX(port) FROM node"
         ).fetchone()
         return row[0] + 1 if row[0] is not None else 7001
+
+def get_node(environment_name: str, org_name: str, org_node: int) -> Node:
+    with _store() as conn:
+        row: sqlite3.Row | None = _node_row(conn, environment_name, org_name, org_node)
+        if row is None:
+            raise NodeNotFoundError()
+        return _row_to_node(row)
+
+
+def set_pid(node: Node, pid: int) -> Node:
+    with _store() as conn:
+        conn.execute(
+           "UPDATE node SET pid = ?, state = ? WHERE id = ?", (pid, "RUNNING", node.id,)
+        )
+        conn.commit()
+        row = conn.execute(
+        "SELECT * FROM node WHERE id = ?", (node.id,)
+        ).fetchone()
+        assert row is not None
+        return _row_to_node(row)
+
+def set_node_stopped(node: Node) -> Node:
+    with _store() as conn:
+        conn.execute(
+           "UPDATE node SET pid = ?, state = ? WHERE id = ?", (None, "STOPPED", node.id,)
+        )
+        conn.commit()
+        row = conn.execute(
+        "SELECT * FROM node WHERE id = ?", (node.id,)
+        ).fetchone()
+        assert row is not None
+        return _row_to_node(row)
+
 # --------------------------------------------------------------------------- #
 # Command history (`vl history`)
 # --------------------------------------------------------------------------- #

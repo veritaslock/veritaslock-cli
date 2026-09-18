@@ -56,14 +56,19 @@ def add(
     di_url: Annotated[
         str, typer.Option("--di-url", help="Data-ingestion base URL.")
     ],
+    token_url: Annotated[
+        str, typer.Option("--token-url", help="Token URL.")
+    ],
+    schema_reg_url: Annotated[
+        str, typer.Option("--schema-reg-url", help="Schema registry URL.")
+    ],
     kafka: Annotated[
-        str | None,
-        typer.Option("--kafka", help="Kafka bootstrap servers (optional)."),
-    ] = None,
+        str, typer.Option("--kafka", help="Kafka bootstrap servers.")
+    ]
 ) -> None:
     """Add a new environment (does not make it the default)."""
     with _report_errors():
-        env = store.add_environment(name, idp_url, cp_url, di_url, kafka)
+        env = store.add_environment(name, idp_url, cp_url, di_url, token_url, schema_reg_url, kafka)
     render(_env_row(env), title="Environment added")
 
 
@@ -107,6 +112,12 @@ def update(
     di_url: Annotated[
         str | None, typer.Option("--di-url", help="New data-ingestion base URL.")
     ] = None,
+    token_url: Annotated[
+        str | None, typer.Option("--token-url", help="New token URL.")
+    ] = None,
+    schema_reg_url: Annotated[
+        str | None, typer.Option("--schema-reg-url", help="New schema registry URL.")
+    ] = None,
     kafka: Annotated[
         str | None, typer.Option("--kafka", help="New Kafka bootstrap servers.")
     ] = None,
@@ -119,7 +130,7 @@ def update(
         )
         raise typer.Exit(1)
     with _report_errors():
-        env = store.update_environment(name, idp_url, cp_url, di_url, kafka)
+        env = store.update_environment(name, idp_url, cp_url, di_url, token_url, schema_reg_url, kafka)
     render(_env_row(env), title="Environment updated")
 
 
