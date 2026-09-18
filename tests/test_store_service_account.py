@@ -46,8 +46,8 @@ def test_v4_store_migrates_to_v5_preserving_rows(
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute(
             "INSERT INTO service_account_credential "
-            "(identity_id, environment_name, org_name, client_secret_plaintext, key_version) "
-            "VALUES (?, 'local', 'globo', 'old-secret', 7)",
+            "(identity_id, environment_name, org_name, client_id, client_secret_plaintext, key_version) "
+            "VALUES (?, 'local', 'globo', 'sa-1', 'old-secret', 7)",
             (sa_ident.id,),
         )
         conn.execute(
@@ -118,8 +118,8 @@ def test_v7_store_migrates_to_v8_adding_role_column(
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute(
             "INSERT INTO svc_acct "
-            "(identity_id, environment_name, org_name, client_secret_plaintext, key_version) "
-            "VALUES (?, 'local', 'globo', 'old', 3)",
+            "(identity_id, environment_name, org_name, client_id, client_secret_plaintext, key_version) "
+            "VALUES (?, 'local', 'globo', 'sa-1', 'old', 3)",
             (ident.id,),
         )
         conn.commit()
