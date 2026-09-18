@@ -7,6 +7,7 @@ token flow throughout. See vl-node-spec.md.
 from __future__ import annotations
 
 import secrets
+import signal
 from typing import Annotated, Any
 
 import typer
@@ -282,11 +283,87 @@ def start(
     """Start the node """
     with report_errors():
         environment = store.get_environment(env)
-        org_dto = resolve_org(environment, org)
-        org_name = str(org_dto["name"])
+        org_name = store.get_organization(environment.name, org).name
         node = store.get_node(environment.name, org_name, org_node)
         check_node_state(node)
         node_root = populate_node_dir(environment, org_name, org_node, node)
         start_verilock(node, node_root, org_name, org_node)
 
 
+def is_running(node: store.Node) -> bool:
+    assert node.pid is not None
+    try:
+        os.kill(node.pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def shutdown_node(node: store.Node) -> bool:
+    assert node.pid is not None
+    pid = node.pid
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        note(f"{pid} was not running or was already terminated")
+        return True
+
+    # Step 2: Poll using kill -0
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)  # kill -0 probe
+        except ProcessLookupError:
+            note(f"{pid} was shutdown.")
+            return True
+        except PermissionError:
+            # Process exists but cannot be signaled; treat as alive
+            pass
+
+        time.sleep(0.25)
+
+    # Step 3: Still alive → SIGKILL
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        note(f"{pid} was terminated")
+        return True
+    except PermissionError:
+        pass
+    # Step 4: Brief pause to allow kernel to reap
+    time.sleep(0.1)
+
+    # Final check
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        note(f"{pid} was terminated")
+        return True
+    except PermissionError:
+        pass
+
+    note(f"Failure to shutdown node {node.org_node} with pid:{pid}.")
+    return False
+
+
+@app.command("stop")
+def stop(
+    org: Annotated[str, typer.Argument(help="Organization name.")],
+    org_node: Annotated[int, typer.Argument(help="Node number to stop")],
+    env: EnvOption = None
+) -> None:
+    """Stop the node """
+    with report_errors():
+        environment = store.get_environment(env)
+        org_name = store.get_organization(environment.name, org).name
+        node = store.get_node(environment.name, org_name, org_node)
+        if node.pid is None:
+            note("not running (or not started by vl).")
+        elif is_running(node):
+            if shutdown_node(node):
+                store.set_node_stopped(node)
+        else:
+            store.set_node_stopped(node)
+            note("done")
