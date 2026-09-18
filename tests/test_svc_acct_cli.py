@@ -130,7 +130,7 @@ def test_show_masks_secret_unless_revealed() -> None:
     _caller()
     ident = store.add_identity("local", "SERVICE_ACCOUNT", "sa-1", "sa-1", "bot")
     store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
-    store.set_svc_acct(ident.id, "local", "globo", "top-secret", key_version=2)
+    store.set_svc_acct(ident.id, "local", "globo", "sa-1", "top-secret", key_version=2)
     respx.get(f"{IDP}/v1/service-accounts/sa-1").mock(
         return_value=httpx.Response(200, json={"id": "sa-1", "displayName": "Bot", "role": "NODE", "status": "ACTIVE", "keyVersion": 2})
     )
@@ -157,7 +157,7 @@ def test_list_local_by_default() -> None:
     _caller()
     store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
     ident = store.add_identity("local", "SERVICE_ACCOUNT", "sa-9", "sa-9", "bot")
-    store.set_svc_acct(ident.id, "local", "globo", "s", key_version=2, role="NODE")
+    store.set_svc_acct(ident.id, "local", "globo", "sa-9", "s", key_version=2, role="NODE")
 
     # No respx mock — the local listing must not hit the server.
     result = runner.invoke(app, ["svc-acct", "list"], env={"VL_OUTPUT": "json"})
@@ -170,7 +170,7 @@ def test_list_local_role_dash_when_unknown() -> None:
     _caller()
     store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
     ident = store.add_identity("local", "SERVICE_ACCOUNT", "sa-old", "sa-old", "bot")
-    store.set_svc_acct(ident.id, "local", "globo", "s")  # no role (older cache)
+    store.set_svc_acct(ident.id, "local", "globo", "sa-old", "s")  # no role (older cache)
 
     result = runner.invoke(app, ["svc-acct", "list"], env={"VL_OUTPUT": "json"})
     assert result.exit_code == 0, result.stdout
@@ -182,9 +182,9 @@ def test_list_local_filtered_by_org() -> None:
     for name in ("globo", "acme"):
         store.upsert_organization("local", name, f"o-{name}", name, active=True)
     g = store.add_identity("local", "SERVICE_ACCOUNT", "sa-g", "sa-g", "gbot")
-    store.set_svc_acct(g.id, "local", "globo", "s", key_version=1)
+    store.set_svc_acct(g.id, "local", "globo", "sa-g", "s", key_version=1)
     a = store.add_identity("local", "SERVICE_ACCOUNT", "sa-a", "sa-a", "abot")
-    store.set_svc_acct(a.id, "local", "acme", "s", key_version=1)
+    store.set_svc_acct(a.id, "local", "acme", "sa-a", "s", key_version=1)
 
     result = runner.invoke(
         app, ["svc-acct", "list", "--org", "acme"], env={"VL_OUTPUT": "json"}
@@ -251,7 +251,7 @@ def test_list_remote_backfills_cached_role_and_key_version() -> None:
     _caller()
     store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
     ident = store.add_identity("local", "SERVICE_ACCOUNT", "sa-1", "sa-1", "bot")
-    store.set_svc_acct(ident.id, "local", "globo", "s")  # role/key_version unknown
+    store.set_svc_acct(ident.id, "local", "globo", "sa-1", "s")  # role/key_version unknown
     respx.get(f"{IDP}/v1/service-accounts").mock(
         return_value=httpx.Response(200, json={"items": [
             {"id": "sa-1", "displayName": "B", "role": "INGEST_CLIENT", "status": "ACTIVE", "keyVersion": 4, "orgId": "org-1"},
@@ -278,7 +278,7 @@ def test_show_all_backfills_cached_role() -> None:
     _caller()
     store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
     ident = store.add_identity("local", "SERVICE_ACCOUNT", "sa-1", "sa-1", "bot")
-    store.set_svc_acct(ident.id, "local", "globo", "s", key_version=1)
+    store.set_svc_acct(ident.id, "local", "globo", "sa-1", "s", key_version=1)
     respx.get(f"{IDP}/v1/service-accounts/sa-1").mock(
         return_value=httpx.Response(200, json={
             "id": "sa-1", "displayName": "B", "role": "INGEST_CLIENT",
@@ -298,7 +298,7 @@ def test_update_partial() -> None:
     _caller()
     store.add_identity("local", "SERVICE_ACCOUNT", "sa-1", "sa-1", "bot")
     store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
-    store.set_svc_acct(store.get_identity("local", "bot").id, "local", "globo", "s")
+    store.set_svc_acct(store.get_identity("local", "bot").id, "local", "globo", "sa-1", "s")
     patch = respx.patch(f"{IDP}/v1/service-accounts/sa-1").mock(
         return_value=httpx.Response(200, json={"id": "sa-1", "displayName": "Renamed", "role": "NODE", "status": "SUSPENDED", "keyVersion": 1})
     )
@@ -317,7 +317,7 @@ def test_update_role_syncs_local_cache() -> None:
     store.add_identity("local", "SERVICE_ACCOUNT", "sa-1", "sa-1", "bot")
     store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
     ident = store.get_identity("local", "bot").id
-    store.set_svc_acct(ident, "local", "globo", "s", role="ACCOUNT")
+    store.set_svc_acct(ident, "local", "globo", "sa-1", "s", role="ACCOUNT")
     respx.patch(f"{IDP}/v1/service-accounts/sa-1").mock(
         return_value=httpx.Response(200, json={"id": "sa-1", "displayName": "b", "role": "NODE", "status": "ACTIVE", "keyVersion": 1})
     )
@@ -359,7 +359,7 @@ def test_delete_removes_local_identity_and_keys() -> None:
 
     key_dir = store.keys_root() / "sa-1"
     keylib.generate_keypair(key_dir)
-    store.set_svc_acct(ident.id, "local", "globo", "s")
+    store.set_svc_acct(ident.id, "local", "globo", "sa-1", "s")
     route = respx.delete(f"{IDP}/v1/service-accounts/sa-1").mock(
         return_value=httpx.Response(204)
     )
@@ -381,7 +381,7 @@ def test_get_assertion_signs_with_stored_key() -> None:
     key_dir = store.keys_root() / "sa-1"
     priv, _ = keylib.generate_keypair(key_dir)
     store.set_svc_acct(
-        ident.id, "local", "globo", "s", private_key_path=str(priv), key_version=1
+        ident.id, "local", "globo", "sa-1", "s", private_key_path=str(priv), key_version=1
     )
 
     result = runner.invoke(app, ["svc-acct", "get-assertion", "bot"])
@@ -400,7 +400,7 @@ def test_get_assertion_errors_without_key_path() -> None:
     _caller()
     ident = store.add_identity("local", "SERVICE_ACCOUNT", "sa-1", "sa-1", "bot")
     store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
-    store.set_svc_acct(ident.id, "local", "globo", "s")
+    store.set_svc_acct(ident.id, "local", "globo", "sa-1", "s")
 
     result = runner.invoke(app, ["svc-acct", "get-assertion", "bot"])
     assert result.exit_code == 1
@@ -529,7 +529,7 @@ def test_use_and_clear_removes_keys() -> None:
     store.ensure_local_environment_seeded()
     store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
     ident = store.add_identity("local", "SERVICE_ACCOUNT", "sa-1", "sa-1", "sys")
-    store.set_svc_acct(ident.id, "local", "globo", "s")
+    store.set_svc_acct(ident.id, "local", "globo", "sa-1", "s")
     from vl.lib import keys as keylib
 
     key_dir = store.keys_root() / "sa-1"

@@ -27,6 +27,9 @@ def test_add_then_show() -> None:
             "--idp-url", "http://idp",
             "--cp-url", "http://cp",
             "--di-url", "http://di",
+            "--token-url", "http://token",
+            "--schema-reg-url", "http://schema",
+            "--kafka", "k:1",
         ],
     )
     assert add.exit_code == 0, add.stdout
@@ -40,6 +43,7 @@ def test_add_duplicate_fails_cleanly() -> None:
     args = [
         "env", "add", "dev",
         "--idp-url", "http://i", "--cp-url", "http://c", "--di-url", "http://d",
+        "--token-url", "http://t", "--schema-reg-url", "http://s", "--kafka", "k:1",
     ]
     assert runner.invoke(app, args).exit_code == 0
     dup = runner.invoke(app, args)
@@ -54,6 +58,7 @@ def test_add_does_not_become_default() -> None:
         [
             "env", "add", "dev",
             "--idp-url", "http://i", "--cp-url", "http://c", "--di-url", "http://d",
+            "--token-url", "http://t", "--schema-reg-url", "http://s", "--kafka", "k:1",
         ],
     )
     result = runner.invoke(app, ["env", "show", "dev"])
@@ -67,6 +72,7 @@ def test_use_sets_default() -> None:
         [
             "env", "add", "dev",
             "--idp-url", "http://i", "--cp-url", "http://c", "--di-url", "http://d",
+            "--token-url", "http://t", "--schema-reg-url", "http://s", "--kafka", "k:1",
         ],
     )
     use = runner.invoke(app, ["env", "use", "dev"])
@@ -106,6 +112,7 @@ def test_delete_non_default() -> None:
         [
             "env", "add", "dev",
             "--idp-url", "http://i", "--cp-url", "http://c", "--di-url", "http://d",
+            "--token-url", "http://t", "--schema-reg-url", "http://s", "--kafka", "k:1",
         ],
     )
     result = runner.invoke(app, ["env", "delete", "dev"])

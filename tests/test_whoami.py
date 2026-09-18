@@ -59,7 +59,7 @@ def test_whoami_service_account_has_no_role() -> None:
     store.ensure_local_environment_seeded()
     store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
     ident = store.add_identity("local", "SERVICE_ACCOUNT", "sa-1", "sa-1", "sys")
-    store.set_svc_acct(ident.id, "local", "globo", "s", key_version=1)
+    store.set_svc_acct(ident.id, "local", "globo", "sa-1", "s", key_version=1)
     store.set_default_identity("local", "sys")
 
     result = runner.invoke(app, ["whoami"], env={"VL_OUTPUT": "json"})

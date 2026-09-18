@@ -122,7 +122,7 @@ _MIGRATIONS: tuple[str, ...] = (
                                  REFERENCES identity(id) ON DELETE CASCADE,
         environment_name         TEXT NOT NULL,
         org_name                 TEXT NOT NULL,
-        client_secret            TEXT NOT NULL,
+        client_id                TEXT NOT NULL,
         client_secret_plaintext  TEXT NOT NULL,
         public_key_path          TEXT,
         private_key_path         TEXT,

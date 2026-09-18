@@ -77,7 +77,7 @@ def test_v4_store_migrates_to_v5_preserving_rows(
 def test_set_get_credential(isolated_store: Path) -> None:
     ident = _seed()
     store.set_svc_acct(
-        ident.id, "local", "globo", "shh",
+        ident.id, "local", "globo", "sa-1", "shh",
         public_key_path="/k/pub", private_key_path="/k/priv", key_version=2,
     )
     cred = store.get_svc_acct(ident.id)
@@ -90,14 +90,14 @@ def test_set_get_credential(isolated_store: Path) -> None:
 
 def test_set_credential_upserts(isolated_store: Path) -> None:
     ident = _seed()
-    store.set_svc_acct(ident.id, "local", "globo", "one", key_version=1)
-    store.set_svc_acct(ident.id, "local", "globo", "two", key_version=1)
+    store.set_svc_acct(ident.id, "local", "globo", "sa-1", "one", key_version=1)
+    store.set_svc_acct(ident.id, "local", "globo", "sa-1", "two", key_version=1)
     assert store.get_svc_acct(ident.id).client_secret_plaintext == "two"
 
 
 def test_role_stored_and_updated(isolated_store: Path) -> None:
     ident = _seed()
-    store.set_svc_acct(ident.id, "local", "globo", "s", role="ACCOUNT")
+    store.set_svc_acct(ident.id, "local", "globo", "sa-1", "s", role="ACCOUNT")
     assert store.get_svc_acct(ident.id).role == "ACCOUNT"
 
     store.update_svc_acct_role(ident.id, "SYSTEM")
@@ -105,7 +105,7 @@ def test_role_stored_and_updated(isolated_store: Path) -> None:
 
     # role is optional — a credential written without one reads back None
     other = store.add_identity("local", "SERVICE_ACCOUNT", "sa-2", "sa-2", "sa2")
-    store.set_svc_acct(other.id, "local", "globo", "s")
+    store.set_svc_acct(other.id, "local", "globo", "sa-2", "s")
     assert store.get_svc_acct(other.id).role is None
 
 
@@ -137,7 +137,7 @@ def test_v7_store_migrates_to_v8_adding_role_column(
 
 def test_update_keys_only(isolated_store: Path) -> None:
     ident = _seed()
-    store.set_svc_acct(ident.id, "local", "globo", "shh", key_version=1)
+    store.set_svc_acct(ident.id, "local", "globo", "sa-1", "shh", key_version=1)
     store.update_svc_acct_keys(ident.id, "/k/pub2", "/k/priv2", 2)
     cred = store.get_svc_acct(ident.id)
     assert (cred.public_key_path, cred.private_key_path, cred.key_version) == ("/k/pub2", "/k/priv2", 2)
@@ -147,12 +147,12 @@ def test_update_keys_only(isolated_store: Path) -> None:
 def test_credential_org_fk_enforced(isolated_store: Path) -> None:
     ident = _seed()
     with pytest.raises(sqlite3.IntegrityError):
-        store.set_svc_acct(ident.id, "local", "ghost-org", "shh")
+        store.set_svc_acct(ident.id, "local", "ghost-org", "sa-1", "shh")
 
 
 def test_delete_identity_cascades_credential(isolated_store: Path) -> None:
     ident = _seed()
-    store.set_svc_acct(ident.id, "local", "globo", "shh")
+    store.set_svc_acct(ident.id, "local", "globo", "sa-1", "shh")
     store.delete_identity("local", "sys")
     with sqlite3.connect(isolated_store) as conn:
         assert conn.execute("SELECT COUNT(*) FROM svc_acct").fetchone()[0] == 0

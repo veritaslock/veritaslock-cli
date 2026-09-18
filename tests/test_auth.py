@@ -92,7 +92,7 @@ def test_service_account_identity_uses_symmetric_token(isolated_store: Path) -> 
     store.ensure_local_environment_seeded()
     store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
     ident = store.add_identity("local", "SERVICE_ACCOUNT", "sa-1", "sa-1", "sys")
-    store.set_svc_acct(ident.id, "local", "globo", "shh", key_version=1)
+    store.set_svc_acct(ident.id, "local", "globo", "sa-1", "shh", key_version=1)
 
     route = respx.post(f"{IDP}/auth/service-account/token").mock(
         return_value=httpx.Response(200, json={"accessToken": "sa-jwt", "expiresIn": 600})

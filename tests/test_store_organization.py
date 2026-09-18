@@ -110,7 +110,7 @@ def test_upsert_inserts_then_updates_same_row(isolated_store: Path) -> None:
 
 def test_cache_is_scoped_per_environment(isolated_store: Path) -> None:
     store.ensure_local_environment_seeded()
-    store.add_environment("dev", "http://i", "http://c", "http://d")
+    store.add_environment("dev", "http://i", "http://c", "http://d", "http://t", "http://s", "k:1")
 
     store.upsert_organization("local", "globo", "org-local", "Globo", active=True)
     store.upsert_organization("dev", "globo", "org-dev", "Globo", active=True)

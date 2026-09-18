@@ -31,7 +31,7 @@ def test_auto_seed_creates_single_local_default(isolated_store: Path) -> None:
     assert local.idp_base_url == "http://localhost:8080"
     assert local.cp_base_url == "http://localhost:8082"
     assert local.di_base_url == "http://localhost:8083"
-    assert local.kafka_bootstrap is None
+    assert local.kafka_bootstrap == "localhost:9092"
     assert isolated_store.exists()
 
 
@@ -49,7 +49,7 @@ def test_auto_seed_does_not_recreate_after_user_deletes_local(
     isolated_store: Path,
 ) -> None:
     # Add a second env, make it default, delete local, then re-open the store.
-    store.add_environment("dev", "http://i", "http://c", "http://d")
+    store.add_environment("dev", "http://i", "http://c", "http://d", "http://t", "http://s", "k:1")
     store.set_default_environment("dev")
     store.delete_environment("local")
 
@@ -91,6 +91,8 @@ def test_add_environment(isolated_store: Path) -> None:
         "http://idp",
         "http://cp",
         "http://di",
+        token_url="http://token",
+        schema_reg_url="http://schema",
         kafka_bootstrap="localhost:9092",
     )
     assert env.name == "dev"
@@ -99,14 +101,14 @@ def test_add_environment(isolated_store: Path) -> None:
 
 
 def test_add_duplicate_name_is_rejected(isolated_store: Path) -> None:
-    store.add_environment("dev", "http://i", "http://c", "http://d")
+    store.add_environment("dev", "http://i", "http://c", "http://d", "http://t", "http://s", "k:1")
     with pytest.raises(store.EnvironmentExistsError):
-        store.add_environment("dev", "http://x", "http://y", "http://z")
+        store.add_environment("dev", "http://x", "http://y", "http://z", "http://t", "http://s", "k:1")
 
 
 def test_add_duplicate_local_is_rejected(isolated_store: Path) -> None:
     with pytest.raises(store.EnvironmentExistsError):
-        store.add_environment("local", "http://i", "http://c", "http://d")
+        store.add_environment("local", "http://i", "http://c", "http://d", "http://t", "http://s", "k:1")
 
 
 # --------------------------------------------------------------------------- #
@@ -115,7 +117,7 @@ def test_add_duplicate_local_is_rejected(isolated_store: Path) -> None:
 
 
 def test_use_moves_the_single_default(isolated_store: Path) -> None:
-    store.add_environment("dev", "http://i", "http://c", "http://d")
+    store.add_environment("dev", "http://i", "http://c", "http://d", "http://t", "http://s", "k:1")
     store.set_default_environment("dev")
 
     defaults = [e.name for e in store.list_environments() if e.is_default]
@@ -135,8 +137,8 @@ def test_use_nonexistent_raises_and_keeps_current_default(
 def test_use_is_repeatable_and_always_leaves_exactly_one_default(
     isolated_store: Path,
 ) -> None:
-    store.add_environment("a", "http://i", "http://c", "http://d")
-    store.add_environment("b", "http://i", "http://c", "http://d")
+    store.add_environment("a", "http://i", "http://c", "http://d", "http://t", "http://s", "k:1")
+    store.add_environment("b", "http://i", "http://c", "http://d", "http://t", "http://s", "k:1")
 
     for name in ("a", "b", "a", "local", "b"):
         store.set_default_environment(name)
@@ -145,7 +147,7 @@ def test_use_is_repeatable_and_always_leaves_exactly_one_default(
 
 
 def test_get_environment_by_name(isolated_store: Path) -> None:
-    store.add_environment("dev", "http://i", "http://c", "http://d")
+    store.add_environment("dev", "http://i", "http://c", "http://d", "http://t", "http://s", "k:1")
     assert store.get_environment("dev").name == "dev"
 
 
@@ -176,7 +178,8 @@ def test_get_environment_no_default_raises(isolated_store: Path) -> None:
 
 def test_update_changes_only_supplied_fields(isolated_store: Path) -> None:
     store.add_environment(
-        "dev", "http://i", "http://c", "http://d", kafka_bootstrap="k:1"
+        "dev", "http://i", "http://c", "http://d",
+        token_url="http://t", schema_reg_url="http://s", kafka_bootstrap="k:1",
     )
     env = store.update_environment("dev", cp_base_url="http://cp-new")
 
@@ -192,7 +195,7 @@ def test_update_nonexistent_raises(isolated_store: Path) -> None:
 
 
 def test_update_does_not_touch_default_flag(isolated_store: Path) -> None:
-    store.add_environment("dev", "http://i", "http://c", "http://d")
+    store.add_environment("dev", "http://i", "http://c", "http://d", "http://t", "http://s", "k:1")
     store.update_environment("dev", idp_base_url="http://i2")
     assert store.get_environment().name == "local"
 
@@ -203,7 +206,7 @@ def test_update_does_not_touch_default_flag(isolated_store: Path) -> None:
 
 
 def test_delete_non_default_environment(isolated_store: Path) -> None:
-    store.add_environment("dev", "http://i", "http://c", "http://d")
+    store.add_environment("dev", "http://i", "http://c", "http://d", "http://t", "http://s", "k:1")
     store.delete_environment("dev")
     assert [e.name for e in store.list_environments()] == ["local"]
 
@@ -225,7 +228,7 @@ def test_delete_referenced_environment_raises_typed_error(
     """A FK restriction (here: a cached organization row) surfaces as
     EnvironmentInUseError, never a raw sqlite3.IntegrityError.
     """
-    store.add_environment("dev", "http://i", "http://c", "http://d")
+    store.add_environment("dev", "http://i", "http://c", "http://d", "http://t", "http://s", "k:1")
     store.upsert_organization("dev", "globo", "org-1", "Globo", active=True)
 
     with pytest.raises(store.EnvironmentInUseError):
