@@ -69,6 +69,8 @@ def test_v1_store_is_migrated_in_place_preserving_data(
     envs = store.list_environments()
 
     assert [e.name for e in envs] == ["local"]  # existing data intact
+    assert envs[0].token_url == ""  # backfilled by the v9 -> v10 migration
+    assert envs[0].schema_reg_url == ""
     assert {"organization", "identity"} <= _tables(isolated_store)
     with _open_raw(isolated_store) as conn:
         assert (

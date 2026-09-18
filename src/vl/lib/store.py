@@ -13,6 +13,8 @@ and bumping ``SCHEMA_VERSION`` (§8 of the ``vl env`` spec):
 * v6 — ``team`` cache + ``team_member`` join + ``vl team`` (Phase 6).
 * v7 — ``command_history`` ring buffer + ``vl history``.
 * v8 — ``svc_acct.role`` column (shown by ``vl svc-acct list`` / ``show``).
+* v9 — ``env_kafka_property_override`` + ``node`` tables, ``vl node`` (Phase 7).
+* v10 — ``environment.token_url`` / ``schema_reg_url`` columns (vl-env-spec.md §3).
 
 On open, every migration between the store's ``PRAGMA user_version`` and
 ``SCHEMA_VERSION`` is applied in order; a store from a *newer* `vl` is rejected
@@ -33,7 +35,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # Treat a cached token as expired this many seconds before its real expiry, to
 # avoid handing a command a token that dies mid-request.
@@ -51,8 +53,6 @@ _MIGRATIONS: tuple[str, ...] = (
         idp_base_url     TEXT NOT NULL,
         cp_base_url      TEXT NOT NULL,
         di_base_url      TEXT NOT NULL,
-        token_url        TEXT NOT NULL,
-        schema_reg_url   TEXT NOT NULL,
         kafka_bootstrap  TEXT NOT NULL,
         is_default       INTEGER NOT NULL DEFAULT 0
                          CHECK (is_default IN (0, 1)),
@@ -188,7 +188,7 @@ _MIGRATIONS: tuple[str, ...] = (
     """
     ALTER TABLE svc_acct ADD COLUMN role TEXT;
     """,
-    # 8 -> 9: Node implementation, updating environment table and adding tables for kafka properties and node (Phase 7).
+    # 8 -> 9: Node implementation, adding tables for kafka properties and node (Phase 7).
     # Restrict delete of service account to prevent deletion of a node still in use.
     # Node status defaults to state 'NEW'; node_id is initially null and assigned by the control-plane when node is first started.
     # cp_state is the node's state in the control-plane which can be stale.
@@ -223,6 +223,46 @@ _MIGRATIONS: tuple[str, ...] = (
             REFERENCES organization(environment_name, name)
             ON UPDATE CASCADE ON DELETE RESTRICT
     );
+    """,
+    # 9 -> 10: token_url/schema_reg_url on environment (vl-env-spec.md §3), added
+    # after v1 originally shipped without them. A plain ALTER TABLE ADD COLUMN
+    # can only append at the end of the table, so this rebuilds `environment`
+    # instead (SQLite's documented pattern for schema changes ADD COLUMN can't
+    # express) to keep the URL columns grouped together — idp/cp/di_base_url,
+    # token_url, schema_reg_url, then kafka_bootstrap — for every store, fresh
+    # or pre-existing. Backfilled to '' for existing rows (also covers a
+    # genuinely pre-v10 row's NULL kafka_bootstrap, nullable before this same
+    # rework made it NOT NULL); a store upgraded from before this migration
+    # will need `vl env update <name> --token-url ... --schema-reg-url ...
+    # --kafka ...` to fill in real values. foreign_keys is toggled off/on
+    # around the rebuild per SQLite's own recommendation, since environment is
+    # a parent table in several FK relationships (organization, identity,
+    # team, node, env_kafka_property_override).
+    """
+    PRAGMA foreign_keys = OFF;
+
+    CREATE TABLE environment_new (
+        name             TEXT PRIMARY KEY,
+        idp_base_url     TEXT NOT NULL,
+        cp_base_url      TEXT NOT NULL,
+        di_base_url      TEXT NOT NULL,
+        token_url        TEXT NOT NULL,
+        schema_reg_url   TEXT NOT NULL,
+        kafka_bootstrap  TEXT NOT NULL,
+        is_default       INTEGER NOT NULL DEFAULT 0
+                         CHECK (is_default IN (0, 1)),
+        created_at       TEXT NOT NULL
+    );
+    INSERT INTO environment_new
+        (name, idp_base_url, cp_base_url, di_base_url, token_url, schema_reg_url,
+         kafka_bootstrap, is_default, created_at)
+        SELECT name, idp_base_url, cp_base_url, di_base_url, '', '',
+               COALESCE(kafka_bootstrap, ''), is_default, created_at
+        FROM environment;
+    DROP TABLE environment;
+    ALTER TABLE environment_new RENAME TO environment;
+
+    PRAGMA foreign_keys = ON;
     """,
 )
 
@@ -477,29 +517,38 @@ def _init_schema(conn: sqlite3.Connection) -> None:
 
 
 def _seed_local(conn: sqlite3.Connection) -> None:
-    """Create the ``local`` row if the table is empty (idempotent)."""
+    """Create the ``local`` row if the table is empty (idempotent).
+
+    Only inserts columns the ``environment`` table actually has: a real store
+    always runs every migration before this is ever called, so this is a
+    no-op restriction in practice — it only matters for tests that cap
+    ``SCHEMA_VERSION`` to build a store frozen at some earlier version (e.g.
+    before v10 added ``token_url``/``schema_reg_url``).
+    """
     if conn.execute("SELECT COUNT(*) FROM environment").fetchone()[0]:
         return
+    seed = {**_LOCAL_SEED, "is_default": 1, "created_at": _now()}
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(environment)")}
+    fields = [field for field in seed if field in existing_columns]
     conn.execute(
-        """
-        INSERT INTO environment (name, idp_base_url, cp_base_url, di_base_url, token_url, schema_reg_url,
-                                 kafka_bootstrap, is_default, created_at)
-        VALUES (:name, :idp_base_url, :cp_base_url, :di_base_url, :token_url, :schema_reg_url,
-                :kafka_bootstrap, 1, :created_at)
-        """,
-        {**_LOCAL_SEED, "created_at": _now()},
+        f"INSERT INTO environment ({', '.join(fields)}) "
+        f"VALUES ({', '.join(f':{field}' for field in fields)})",
+        seed,
     )
     conn.commit()
 
 
 def _row_to_env(row: sqlite3.Row) -> Environment:
+    # `token_url`/`schema_reg_url` arrived in v10 — tolerate their absence on a
+    # store pinned older (same pattern as `svc_acct.role`, added in v8).
+    keys = row.keys()
     return Environment(
         name=row["name"],
         idp_base_url=row["idp_base_url"],
         cp_base_url=row["cp_base_url"],
         di_base_url=row["di_base_url"],
-        token_url=row["token_url"],
-        schema_reg_url=row["schema_reg_url"],
+        token_url=row["token_url"] if "token_url" in keys else "",
+        schema_reg_url=row["schema_reg_url"] if "schema_reg_url" in keys else "",
         kafka_bootstrap=row["kafka_bootstrap"],
         is_default=bool(row["is_default"]),
         created_at=row["created_at"],
