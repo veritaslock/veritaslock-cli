@@ -42,40 +42,13 @@ def test_fresh_store_is_at_latest_version_with_both_tables(
         assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
 
 
-def test_v1_store_is_migrated_in_place_preserving_data(
-    isolated_store: Path,
-) -> None:
-    # Build a v1-shaped store by hand: environment table only, user_version = 1.
-    isolated_store.parent.mkdir(parents=True, exist_ok=True)
-    with _open_raw(isolated_store) as conn:
-        conn.executescript(
-            """
-            CREATE TABLE environment (
-                name TEXT PRIMARY KEY,
-                idp_base_url TEXT NOT NULL,
-                cp_base_url TEXT NOT NULL,
-                di_base_url TEXT NOT NULL,
-                kafka_bootstrap TEXT,
-                is_default INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
-            );
-            INSERT INTO environment VALUES
-                ('local', 'http://x', 'http://y', 'http://z', NULL, 1, '2026-01-01');
-            PRAGMA user_version = 1;
-            """
-        )
-        conn.commit()
-
-    envs = store.list_environments()
-
-    assert [e.name for e in envs] == ["local"]  # existing data intact
-    assert envs[0].token_url == ""  # backfilled by the v9 -> v10 migration
-    assert envs[0].schema_reg_url == ""
-    assert {"organization", "identity"} <= _tables(isolated_store)
-    with _open_raw(isolated_store) as conn:
-        assert (
-            conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
-        )
+# NOTE: there used to be a test here (`test_v1_store_is_migrated_in_place_preserving_data`)
+# that hand-built a genuinely pre-`token_url`/`schema_reg_url` `environment` table and
+# checked that migrating it forward preserved its data. That guarantee no longer holds —
+# see the module docstring in `vl.lib.store` for why (schema changes to `environment` /
+# `svc_acct` are currently made by editing their original migration in place, a
+# deliberate call while `store.db` is a disposable dev artifact). A store built before
+# that column existed will now fail to open at all; delete and recreate it instead.
 
 
 def test_store_from_a_newer_vl_is_rejected(isolated_store: Path) -> None:
