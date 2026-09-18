@@ -156,7 +156,7 @@ def generate_veritaslock_config (environment: store.Environment, dest_config_dir
         veritaslock_config.write(f"control.plane.base.url={environment.cp_base_url}\n")
         veritaslock_config.write(f"identity.provider.base.url={environment.idp_base_url}\n")
         veritaslock_config.write(f"http.port={node.port}\n")
-        veritaslock_config.write(f"org_node={node.org_node}")
+        veritaslock_config.write(f"org.node={node.org_node}")
 
 
 def populate_bin_dir(node_root: Path, src_dir: Path) -> None:
@@ -231,8 +231,8 @@ def print_tail(path: Path, n: int = 50) -> None:
 
 
 def check_liveness(node: store.Node, proc: subprocess.Popen[bytes], log_path: Path) -> None:
-    # Match the harness's brief pause
-    time.sleep(0.25)
+    # Wait 1 second to ensure that the node starts correctly
+    time.sleep(1)
 
     # If poll() returns something other than None, the process is dead
     if proc.poll() is not None:
@@ -259,7 +259,7 @@ def start_verilock(node: store.Node, node_root: Path, org: str, org_node: int) -
     )
     # Open log file for stdout+stderr redirection
     # Spawn detached process
-    with open(log_path, "a") as log_file:
+    with open(log_path, "w") as log_file:
         proc = subprocess.Popen(
             [str(bin_path)],
             stdout=log_file,
