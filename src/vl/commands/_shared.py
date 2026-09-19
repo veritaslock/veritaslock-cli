@@ -87,7 +87,7 @@ def cache_team(
 
 def resolve_org(environment: store.Environment, name: str) -> dict[str, Any]:
     """`GET /v1/organizations?name=` (public), cache it, return the DTO."""
-    with api.IdpClient(environment.idp_base_url) as client:
+    with api.AppClient(environment.idp_base_url) as client:
         dto: dict[str, Any] = client.get("/v1/organizations", params={"name": name})
     cache_org(environment.name, dto)
     return dto
@@ -96,7 +96,7 @@ def resolve_org(environment: store.Environment, name: str) -> dict[str, Any]:
 def fetch_org_by_id(base_url: str, org_id: str) -> dict[str, Any] | None:
     """`GET /v1/organizations/{id}` (public). ``None`` if it can't be resolved."""
     try:
-        with api.IdpClient(base_url) as client:
+        with api.AppClient(base_url) as client:
             dto: dict[str, Any] = client.get(f"/v1/organizations/{org_id}")
         return dto
     except api.ApiError:
@@ -133,7 +133,7 @@ def fetch_all_orgs(environment: store.Environment) -> list[dict[str, Any]]:
     """
     orgs: list[dict[str, Any]] = []
     page = 0
-    with api.IdpClient(environment.idp_base_url) as client:
+    with api.AppClient(environment.idp_base_url) as client:
         while True:
             body: dict[str, Any] = client.get(
                 "/v1/organizations", params={"page": page}

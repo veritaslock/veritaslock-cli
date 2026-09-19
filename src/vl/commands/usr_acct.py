@@ -273,7 +273,7 @@ def add(
         display_name = " ".join(p for p in (first, last) if p)
         user_id = str(uuid.uuid4())
 
-        def _call(client: api.IdpClient) -> tuple[dict[str, Any], dict[str, Any]]:
+        def _call(client: api.AppClient) -> tuple[dict[str, Any], dict[str, Any]]:
             org_dto: dict[str, Any] = client.get(
                 "/v1/organizations", params={"name": org_name_arg}
             )

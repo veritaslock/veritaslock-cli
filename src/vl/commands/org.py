@@ -56,7 +56,7 @@ def show(
     """Show an organization."""
     with report_errors():
         environment = store.get_environment(env)
-        with api.IdpClient(environment.idp_base_url) as client:
+        with api.AppClient(environment.idp_base_url) as client:
             dto = client.get("/v1/organizations", params={"name": name})
         org = _cache_from_dto(environment.name, dto)
     render(_org_row(org), title=f"Organization: {name}")
@@ -79,7 +79,7 @@ def list_(
         params: dict[str, Any] = {"page": page}
         if active is not None:
             params["active"] = str(active).lower()
-        with api.IdpClient(environment.idp_base_url) as client:
+        with api.AppClient(environment.idp_base_url) as client:
             body = client.get("/v1/organizations", params=params)
         items: list[dict[str, Any]] = body.get("items", [])
         for item in items:

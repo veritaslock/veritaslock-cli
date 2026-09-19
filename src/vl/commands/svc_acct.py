@@ -116,7 +116,7 @@ def create_svc_acct(display_name: str | None, description: str | None, client_se
                     environment: store.Environment, identity_label: str, org_name_arg: str | None, caller: store.Identity,
                     role: ServiceAccountRole) -> tuple[dict[str, Any], int]:
 
-    with api.IdpClient(environment.idp_base_url) as client:
+    with api.AppClient(environment.idp_base_url) as client:
         org_dto = client.get("/v1/organizations", params={"name": org_name_arg})
     org_name = cache_org(environment.name, org_dto)
 
@@ -173,7 +173,7 @@ def _provision_public_key(
     last_error: api.ApiError | None = None
     for _ in range(2):
         try:
-            with api.IdpClient(base_url) as client:
+            with api.AppClient(base_url) as client:
                 client.patch(
                     f"/v1/service-accounts/{sa_id}/public-key",
                     params={"bootstrapHash": bootstrap_hash},
@@ -215,7 +215,7 @@ def cache(
         token = api.service_account_token(
             environment.idp_base_url, client_id, secret
         ).access_token
-        with api.IdpClient(environment.idp_base_url, token=token) as client:
+        with api.AppClient(environment.idp_base_url, token=token) as client:
             sa_dto = client.get(f"/v1/service-accounts/{client_id}")
 
         identity_label = label or slugify(str(sa_dto.get("displayName") or ""))

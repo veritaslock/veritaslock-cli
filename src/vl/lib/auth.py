@@ -86,7 +86,8 @@ def get_token(
 def authed_call(
     identity: store.Identity,
     idp_base_url: str,
-    call: Callable[[api.IdpClient], T],
+    call: Callable[[api.AppClient], T],
+    svc_base_url: str | None = None,
     *,
     allow_prompt: bool | None = None,
 ) -> T:
@@ -95,14 +96,16 @@ def authed_call(
     ``call`` may issue several requests — on a retry it runs again in full, so keep
     it free of side effects other than the HTTP it performs.
     """
+    if svc_base_url is None:
+        svc_base_url = idp_base_url
     token = get_token(identity, idp_base_url, allow_prompt=allow_prompt)
     try:
-        with api.IdpClient(idp_base_url, token=token) as client:
+        with api.AppClient(svc_base_url, token=token) as client:
             return call(client)
     except api.ApiError as exc:
         if exc.status_code != 401:
             raise
         store.clear_cached_token(identity.id)
         token = _reauthenticate(identity, idp_base_url, allow_prompt=allow_prompt)
-        with api.IdpClient(idp_base_url, token=token) as client:
+        with api.AppClient(svc_base_url, token=token) as client:
             return call(client)

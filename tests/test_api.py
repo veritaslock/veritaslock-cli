@@ -16,7 +16,7 @@ def test_get_returns_parsed_json() -> None:
     respx.get(f"{BASE}/v1/organizations", params={"name": "globo"}).mock(
         return_value=httpx.Response(200, json={"id": "org-1", "name": "globo"})
     )
-    with api.IdpClient(BASE) as client:
+    with api.AppClient(BASE) as client:
         assert client.get("/v1/organizations", params={"name": "globo"})["id"] == "org-1"
 
 
@@ -25,7 +25,7 @@ def test_204_returns_none() -> None:
     respx.delete(f"{BASE}/v1/organizations/org-1/members/u-1").mock(
         return_value=httpx.Response(204)
     )
-    with api.IdpClient(BASE, token="t") as client:
+    with api.AppClient(BASE, token="t") as client:
         assert client.delete("/v1/organizations/org-1/members/u-1") is None
 
 
@@ -42,7 +42,7 @@ def test_problem_json_becomes_api_error() -> None:
             },
         )
     )
-    with api.IdpClient(BASE, token="t") as client:
+    with api.AppClient(BASE, token="t") as client:
         with pytest.raises(api.ApiError) as excinfo:
             client.post("/v1/organizations", json={"name": "globo"})
 
@@ -65,7 +65,7 @@ def test_validation_fields_are_captured() -> None:
             },
         )
     )
-    with api.IdpClient(BASE, token="t") as client:
+    with api.AppClient(BASE, token="t") as client:
         with pytest.raises(api.ApiError) as excinfo:
             client.post("/v1/organizations", json={})
     assert excinfo.value.invalid_fields == [{"field": "displayName", "message": "blank"}]
@@ -74,7 +74,7 @@ def test_validation_fields_are_captured() -> None:
 @respx.mock
 def test_transport_failure_becomes_api_error() -> None:
     respx.get(f"{BASE}/v1/organizations").mock(side_effect=httpx.ConnectError("boom"))
-    with api.IdpClient(BASE) as client:
+    with api.AppClient(BASE) as client:
         with pytest.raises(api.ApiError) as excinfo:
             client.get("/v1/organizations")
     assert excinfo.value.status_code == 0

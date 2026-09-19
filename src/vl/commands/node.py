@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import secrets
 import signal
+import sys
+from os import mkdir
 from typing import Annotated, Any
 
 import typer
@@ -21,9 +23,9 @@ from vl.commands._shared import (
     AsOption,
     EnvOption,
     report_errors,
-    resolve_org, assert_label_free,
+    resolve_org, assert_label_free, CliError,
 )
-from vl.lib import store, roles
+from vl.lib import store, roles, api, auth
 from vl.lib.cli import HelpOnErrorGroup
 from vl.lib.output import render, note
 from pathlib import Path
@@ -367,3 +369,87 @@ def stop(
         else:
             store.set_node_stopped(node)
             note("done")
+
+def fetch_node_by_id(environment: store.Environment, node: store.Node) -> dict[str, Any] | None:
+    """`GET /v1/nodes/{id}` """
+    acct = store.get_svc_acct(node.svc_acct_id)
+    assert acct is not None
+    assert acct.client_id is not None
+    identity = store.get_identity_by_server_id(environment.name, acct.client_id,"SERVICE_ACCOUNT")
+    assert identity is not None
+    result: dict[str, Any] = auth.authed_call(
+        identity,
+        environment.idp_base_url,
+        lambda c: c.get(
+            "/v1/nodes", params={"orgNode": node.org_node}
+        ),
+        environment.cp_base_url
+    )
+    return result
+
+
+def node_is_up(environment: store.Environment, node: store.Node) -> bool:
+    node_dto = fetch_node_by_id(environment, node)
+    assert node_dto is not None
+    state: str = node_dto["state"]
+    return state != "DOWN"
+
+
+def delete_data_dir(node_root: Path) -> None:
+    data_dir = node_root / "data"
+    shutil.rmtree(data_dir, ignore_errors=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+
+@app.command("reset")
+def reset(
+    org: Annotated[str, typer.Argument(help="Organization name.")],
+    org_node: Annotated[int, typer.Argument(help="Node number to reset")],
+    yes: Annotated[
+        bool | None,
+        typer.Option("--yes", help="reset node by clearing data directory."),
+    ] = None,
+    env: EnvOption = None
+) -> None:
+    """Reset the node """
+    with report_errors():
+        environment = store.get_environment(env)
+        org_name = store.get_organization(environment.name, org).name
+        node = store.get_node(environment.name, org_name, org_node)
+        if node.node_state != "NEW" and node_is_up(environment, node):
+            raise CliError(f"{org_name} node{org_node} is still UP — stop it first")
+        if not yes:
+            if not sys.stdin.isatty():
+                raise CliError("vl node reset requires confirmation; pass --yes to run non-interactively")
+            yes = typer.confirm(
+                f"Reset {org_name}/node{org_node}'s data directory? This permanently deletes all "
+                f"local blockchain state. Are you sure?",
+                default=False,
+            )
+
+        if yes:
+            node_root = Path.home() / "orgs" / org_name / "nodes" / f"node{org_node}"
+            delete_data_dir(node_root)
+
+
+@app.command("list")
+def list(
+    org: Annotated[
+        str | None,
+        typer.Option(
+            "--org",
+            help="Filter to nodes based on org."
+        ),
+    ] = None,
+    env: EnvOption = None
+) -> None:
+    """Lists the nodes """
+    with report_errors():
+        environment = store.get_environment(env)
+        if org is not None:
+            organization = store.get_organization(environment.name, org)
+            nodes = store.get_nodes(environment, organization)
+            render([_node_row(node) for node in nodes], title=f"nodes in {environment.name}-{organization.name}")
+        else:
+            nodes = store.get_nodes(environment)
+            render([_node_row(node) for node in nodes], title=f"nodes in {environment.name}")

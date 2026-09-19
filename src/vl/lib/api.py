@@ -79,7 +79,7 @@ def _raise_for_problem(resp: httpx.Response) -> None:
     )
 
 
-class IdpClient:
+class AppClient:
     """A short-lived client bound to one environment's IdP base URL."""
 
     def __init__(
@@ -98,7 +98,7 @@ class IdpClient:
             transport=transport,
         )
 
-    def __enter__(self) -> IdpClient:
+    def __enter__(self) -> AppClient:
         return self
 
     def __exit__(

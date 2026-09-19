@@ -1486,6 +1486,27 @@ def set_node_stopped(node: Node) -> Node:
         assert row is not None
         return _row_to_node(row)
 
+
+def get_nodes(environment: Environment, org: Organization | None = None) -> list[Node]:
+    with _store() as conn:
+        if org is None:
+            rows = conn.execute(
+                "SELECT * FROM node WHERE environment_name = ? order by org_name, org_node",
+                (environment.name,),
+            ).fetchall()
+            return [
+                _row_to_node(row) for row in rows
+            ]
+        else:
+            rows = conn.execute(
+                "SELECT * FROM node WHERE environment_name = ? and org_name = ? order by org_node",
+                (environment.name, org.name),
+            ).fetchall()
+            return [
+                _row_to_node(row) for row in rows
+            ]
+
+
 # --------------------------------------------------------------------------- #
 # Command history (`vl history`)
 # --------------------------------------------------------------------------- #
