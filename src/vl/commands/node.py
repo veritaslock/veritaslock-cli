@@ -42,6 +42,7 @@ def _node_row(node: store.Node) -> dict[str, Any]:
         "org": node.org_name,
         "org_node": node.org_node,
         "port": node.port,
+        "pid": node.pid,
         "state": node.node_state,
         "created_at": node.created_at,
     }
@@ -433,7 +434,7 @@ def reset(
 
 
 @app.command("list")
-def list(
+def list_(
     org: Annotated[
         str | None,
         typer.Option(
@@ -453,3 +454,31 @@ def list(
         else:
             nodes = store.get_nodes(environment)
             render([_node_row(node) for node in nodes], title=f"nodes in {environment.name}")
+
+@app.command("show")
+def show(
+    org: Annotated[str, typer.Argument(help="Organization name.")],
+    org_node: Annotated[int, typer.Argument(help="Node number to show")],
+    env: EnvOption = None
+) -> None:
+    """Show details for a specific node"""
+    with report_errors():
+        environment = store.get_environment(env)
+        org_name = store.get_organization(environment.name, org).name
+        node = store.get_node(environment.name, org_name, org_node)
+        acct = store.get_svc_acct(node.svc_acct_id)
+        assert acct is not None
+        assert acct.client_id is not None
+        assert acct.private_key_path is not None
+        assert acct.public_key_path is not None
+        row: dict[str, Any] = {
+            "org_node": node.org_node,
+            "port": node.port,
+            "pid": node.pid,
+            "state": node.node_state,
+            "created_at": node.created_at,
+            "client_id": acct.client_id,
+            "private_key_path": acct.private_key_path,
+            "public_key_path": acct.public_key_path
+        }
+        render(row, title=f"Org: {org_name}, Node: {org_node}")
