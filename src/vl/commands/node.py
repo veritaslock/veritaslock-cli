@@ -59,8 +59,14 @@ def _resolve_port(port: int | None = None) -> int:
         port = store.next_port()
     return port
 
+def check_node_dir_exists(org: str, n: int) -> None:
+    node_root = Path.home() / "orgs" / org / "nodes" / f"node{n}"
+    if node_root.exists():
+        raise CliError(
+            f"{node_root} already exists — remove it manually before creating this node."
+        )
 
-def create_node_dir(org: str, n: int) -> Path:
+def create_node_dir(org: str, n: int) -> None:
     node_root = Path.home() / "orgs" / org / "nodes" / f"node{n}"
     node_bin_dir = node_root / "bin"
     node_etc_dir = node_root / "etc"
@@ -68,18 +74,14 @@ def create_node_dir(org: str, n: int) -> Path:
     node_identity_dir = node_root / "identity"
     node_lib_dir = node_root / "lib"
     node_snapshots_dir = node_root / "snapshots"
-    if node_root.exists():
-        note(f"Warning: Directory already exists: {node_root}")
-    else:
-        node_root.mkdir(parents=True)
-        node_bin_dir.mkdir()
-        node_etc_dir.mkdir()
-        node_data_dir.mkdir()
-        node_identity_dir.mkdir()
-        node_lib_dir.mkdir()
-        node_snapshots_dir.mkdir()
-        note(f"Created: {node_root}")
-    return node_root
+    node_root.mkdir(parents=True)
+    node_bin_dir.mkdir()
+    node_etc_dir.mkdir()
+    node_data_dir.mkdir()
+    node_identity_dir.mkdir()
+    node_lib_dir.mkdir()
+    node_snapshots_dir.mkdir()
+    note(f"Created: {node_root}")
 
 
 @app.command("create")
@@ -111,8 +113,9 @@ def create(
         role = roles.ServiceAccountRole.NODE
         client_secret = secrets.token_hex(16)
         assert_label_free(environment.name, identity_label)
+        check_node_dir_exists(org_name, org_node)
         _, identity_id = svc_acct.create_svc_acct(display_name, f"svc-acct for {display_name}", client_secret,
-                                 environment, identity_label, org_name, caller, role)
+                            environment, identity_label, org_name, caller, role)
         create_node_dir(org_name, org_node)
         _node = store.add_node(environment.name, org_name, org_node, identity_id, resolved_port)
     render(_node_row(_node), title="Node created")
