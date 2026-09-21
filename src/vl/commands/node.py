@@ -59,12 +59,6 @@ def _resolve_port(port: int | None = None) -> int:
         port = store.next_port()
     return port
 
-def check_node_dir_exists(org: str, n: int) -> None:
-    node_root = Path.home() / "orgs" / org / "nodes" / f"node{n}"
-    if node_root.exists():
-        raise CliError(
-            f"{node_root} already exists — remove it manually before creating this node."
-        )
 
 def create_node_dir(org: str, n: int) -> None:
     node_root = Path.home() / "orgs" / org / "nodes" / f"node{n}"
@@ -113,7 +107,11 @@ def create(
         role = roles.ServiceAccountRole.NODE
         client_secret = secrets.token_hex(16)
         assert_label_free(environment.name, identity_label)
-        check_node_dir_exists(org_name, org_node)
+
+        node_root = Path.home() / "orgs" / org_name / "nodes" / f"node{org_node}"
+        if node_root.exists():
+            raise CliError(f"{node_root} already exists — remove it manually before creating this node.")
+
         _, identity_id = svc_acct.create_svc_acct(display_name, f"svc-acct for {display_name}", client_secret,
                             environment, identity_label, org_name, caller, role)
         create_node_dir(org_name, org_node)
