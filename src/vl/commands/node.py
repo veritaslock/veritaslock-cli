@@ -69,7 +69,7 @@ def create_node_dir(org: str, n: int) -> Path:
     node_lib_dir = node_root / "lib"
     node_snapshots_dir = node_root / "snapshots"
     if node_root.exists():
-        note(f"WARNING: Directory already exists: {node_root}")
+        note(f"Warning: Directory already exists: {node_root}")
     else:
         node_root.mkdir(parents=True)
         node_bin_dir.mkdir()
@@ -117,18 +117,22 @@ def create(
         _node = store.add_node(environment.name, org_name, org_node, identity_id, resolved_port)
     render(_node_row(_node), title="Node created")
 
-class ProcessStillRunningError(Exception):
-    pass
 
-def check_node_state(node: store.Node) -> None:
+def is_node_down(node: store.Node) -> bool:
+    return_value = True
     if node.node_state == "RUNNING" and node.pid is not None:
         try:
             os.kill(node.pid, 0)
-            raise ProcessStillRunningError(f"{node.org_name} node{node.org_node} is already running (pid {node.pid})")
+            note (f"{node.org_name} node{node.org_node} is already running (pid {node.pid})")
+            return_value = False
         except ProcessLookupError:
             note("Process does not exist.")
+            return_value = True
         except PermissionError:
             note("Process exists but cannot be signaled.")
+            return_value = False
+
+    return return_value
 
 
 def create_sym_link(private_key_link: Path, private_key_path: str) -> None:
@@ -192,15 +196,15 @@ def populate_config_dir(environment: store.Environment, node_root: Path, src_dir
 
 def populate_identity_dir(node: store.Node, node_root: Path) -> None:
     svc_acct_id = node.svc_acct_id
-    svc_acct = store.get_svc_acct(svc_acct_id)
-    if svc_acct is not None:
-        private_key_path = svc_acct.private_key_path
-        public_key_path = svc_acct.public_key_path
+    svc_acct_ = store.get_svc_acct(svc_acct_id)
+    if svc_acct_ is not None:
+        private_key_path = svc_acct_.private_key_path
+        public_key_path = svc_acct_.public_key_path
         assert private_key_path is not None
         assert public_key_path is not None
 
         identity_dir = node_root / "identity"
-        client_id = svc_acct.client_id
+        client_id = svc_acct_.client_id
         client_id_file = identity_dir / "client_id"
         with client_id_file.open("w") as f:
             f.write(client_id)
@@ -275,6 +279,7 @@ def start_verilock(node: store.Node, node_root: Path, org: str, org_node: int) -
 
     store.set_pid(node, proc.pid)
     check_liveness(node, proc, log_path)
+    note(f"Started {org}/node{org_node} (pid: {proc.pid}).")
 
 
 @app.command("start")
@@ -288,9 +293,10 @@ def start(
         environment = store.get_environment(env)
         org_name = store.get_organization(environment.name, org).name
         node = store.get_node(environment.name, org_name, org_node)
-        check_node_state(node)
-        node_root = populate_node_dir(environment, org_name, org_node, node)
-        start_verilock(node, node_root, org_name, org_node)
+
+        if is_node_down(node):
+            node_root = populate_node_dir(environment, org_name, org_node, node)
+            start_verilock(node, node_root, org_name, org_node)
 
 
 def is_running(node: store.Node) -> bool:
@@ -319,7 +325,7 @@ def shutdown_node(node: store.Node) -> bool:
         try:
             os.kill(pid, 0)  # kill -0 probe
         except ProcessLookupError:
-            note(f"{pid} was shutdown.")
+            note(f"Stopped {node.org_name}/node{node.org_node} (pid: {pid}).")
             return True
         except PermissionError:
             # Process exists but cannot be signaled; treat as alive
@@ -331,7 +337,7 @@ def shutdown_node(node: store.Node) -> bool:
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
-        note(f"{pid} was terminated")
+        note(f"Terminated {node.org_name}/node{node.org_node} (pid: {pid}).")
         return True
     except PermissionError:
         pass
@@ -342,12 +348,12 @@ def shutdown_node(node: store.Node) -> bool:
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        note(f"{pid} was terminated")
+        note(f"Terminated {node.org_name}/node{node.org_node} (pid: {pid}).")
         return True
     except PermissionError:
         pass
 
-    note(f"Failure to shutdown node {node.org_node} with pid:{pid}.")
+    note(f"Failure to shutdown {node.org_name}/node{node.org_node} (pid: {pid}).")
     return False
 
 
@@ -363,7 +369,7 @@ def stop(
         org_name = store.get_organization(environment.name, org).name
         node = store.get_node(environment.name, org_name, org_node)
         if node.pid is None:
-            note("not running (or not started by vl).")
+            note(f"{org_name}/node{node.org_node} is not running (or not started by vl).")
         elif is_running(node):
             if shutdown_node(node):
                 store.set_node_stopped(node)
@@ -411,15 +417,16 @@ def reset(
         typer.Option("--yes", help="reset node by clearing data directory."),
     ] = None,
     env: EnvOption = None
-) -> None:
+    ) -> None:
     """Reset the node """
     with report_errors():
         environment = store.get_environment(env)
         org_name = store.get_organization(environment.name, org).name
         node = store.get_node(environment.name, org_name, org_node)
         if node.node_state != "NEW" and node_is_up(environment, node):
-            raise CliError(f"{org_name} node{org_node} is still UP — stop it first")
-        if not yes:
+            note(f"{org_name}/node{org_node} is still reported UP by the control plane — stop it first or try again.")
+            return
+        if yes is None:
             if not sys.stdin.isatty():
                 raise CliError("vl node reset requires confirmation; pass --yes to run non-interactively")
             yes = typer.confirm(
@@ -431,6 +438,7 @@ def reset(
         if yes:
             node_root = Path.home() / "orgs" / org_name / "nodes" / f"node{org_node}"
             delete_data_dir(node_root)
+            note(f"Deleted {org_name}/node{org_node}'s data directory.")
 
 
 @app.command("list")
