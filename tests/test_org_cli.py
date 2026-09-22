@@ -19,6 +19,7 @@ ORG_DTO = {
     "name": "globo",
     "displayName": "Globo Corp",
     "active": True,
+    "createdAt": "2026-01-01T00:00:00Z",
     "createdBy": "u-0",
     "owner": "u-0",
 }

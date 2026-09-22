@@ -229,7 +229,7 @@ def test_delete_referenced_environment_raises_typed_error(
     EnvironmentInUseError, never a raw sqlite3.IntegrityError.
     """
     store.add_environment("dev", "http://i", "http://c", "http://d", "http://t", "http://s", "k:1")
-    store.upsert_organization("dev", "globo", "org-1", "Globo", active=True)
+    store.upsert_organization("dev", "globo", "org-1", "Globo", active=True, created_at="2026-01-01T00:00:00Z")
 
     with pytest.raises(store.EnvironmentInUseError):
         store.delete_environment("dev")

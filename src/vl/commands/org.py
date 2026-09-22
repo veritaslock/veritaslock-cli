@@ -34,6 +34,7 @@ def _org_row(org: store.Organization) -> dict[str, str]:
         "server_org_id": org.server_org_id,
         "active": "yes" if org.active else "no",
         "synced_at": org.synced_at,
+        "created_at": org.created_at,
     }
 
 
@@ -44,6 +45,7 @@ def _cache_from_dto(environment_name: str, dto: dict[str, Any]) -> store.Organiz
         dto["id"],
         dto["displayName"],
         bool(dto["active"]),
+        dto["createdAt"],
     )
 
 
@@ -250,10 +252,10 @@ def reset(
     org: Annotated[
         str, typer.Argument(help="Canonical org name (sent to the server as-is).")
     ],
-        yes: Annotated[
-            bool | None,
-            typer.Option("--yes", help="reset all nodes in org by clearing node's data directory."),
-        ] = None,
+    yes: Annotated[
+        bool | None,
+        typer.Option("--yes", help="reset all nodes in org by clearing node's data directory."),
+    ] = None,
     env: EnvOption = None) -> None:
     """Resets all nodes in an organization."""
     with report_errors():

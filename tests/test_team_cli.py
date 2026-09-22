@@ -15,7 +15,7 @@ from vl.lib import store
 
 runner = CliRunner()
 IDP = "http://localhost:8080"
-ORG_DTO = {"id": "org-1", "name": "globo", "displayName": "Globo", "active": True}
+ORG_DTO = {"id": "org-1", "name": "globo", "displayName": "Globo", "active": True, "createdAt": "2026-01-01T00:00:00Z"}
 TEAM_DTO = {
     "id": "t-1",
     "name": "ingest",
@@ -107,7 +107,7 @@ def test_show_unknown_team_errors() -> None:
     assert "No team 'nope'" in result.stdout
 
 
-FULCRUM_DTO = {"id": "org-2", "name": "fulcrum", "displayName": "Fulcrum", "active": True}
+FULCRUM_DTO = {"id": "org-2", "name": "fulcrum", "displayName": "Fulcrum", "active": True, "createdAt": "2026-01-01T00:00:00Z"}
 FULCRUM_TEAM = {**TEAM_DTO, "id": "t-2", "name": "leverage", "orgId": "org-2"}
 
 
@@ -134,7 +134,7 @@ def _caller_with_orgs(orgs: list[dict[str, str]]) -> store.Identity:
 @respx.mock
 def test_list_org_member_lists_own_orgs_and_caches() -> None:
     _caller_with_orgs([{"orgId": "org-1", "role": "USER"}])
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True, created_at="2026-01-01T00:00:00Z")
     route = respx.get(f"{IDP}/v1/teams", params={"orgId": "org-1"}).mock(
         return_value=httpx.Response(200, json={"items": [TEAM_DTO], "nextCursor": None})
     )
@@ -155,8 +155,8 @@ def test_list_multi_org_member_aggregates_across_its_orgs() -> None:
             {"orgId": "org-2", "role": "KEY_READER"},
         ]
     )
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
-    store.upsert_organization("local", "fulcrum", "org-2", "Fulcrum", active=True)
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True, created_at="2026-01-01T00:00:00Z")
+    store.upsert_organization("local", "fulcrum", "org-2", "Fulcrum", active=True, created_at="2026-01-01T00:00:00Z")
     respx.get(f"{IDP}/v1/teams", params={"orgId": "org-1"}).mock(
         return_value=httpx.Response(200, json={"items": [TEAM_DTO]})
     )
@@ -195,7 +195,7 @@ def test_list_platform_admin_lists_every_org() -> None:
 @respx.mock
 def test_list_passes_name_filter_through() -> None:
     _caller_with_orgs([{"orgId": "org-1", "role": "USER"}])
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True, created_at="2026-01-01T00:00:00Z")
     route = respx.get(f"{IDP}/v1/teams").mock(
         return_value=httpx.Response(200, json={"items": [TEAM_DTO]})
     )
@@ -224,7 +224,7 @@ def test_list_service_account_caller_sees_nothing() -> None:
 @respx.mock
 def test_update_uses_cached_team_id() -> None:
     _caller()
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True, created_at="2026-01-01T00:00:00Z")
     store.upsert_team("local", "globo", "ingest", "t-1")
     _mock_org()
     patch = respx.patch(f"{IDP}/v1/teams/t-1").mock(
@@ -252,7 +252,7 @@ def test_update_requires_a_field() -> None:
 @respx.mock
 def test_update_rename_recaches_and_drops_old_row() -> None:
     _caller()
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True, created_at="2026-01-01T00:00:00Z")
     store.upsert_team("local", "globo", "ingest", "t-1")
     _mock_org()
     respx.patch(f"{IDP}/v1/teams/t-1").mock(
@@ -271,7 +271,7 @@ def test_update_rename_recaches_and_drops_old_row() -> None:
 @respx.mock
 def test_delete_resolves_then_drops_local() -> None:
     _caller()
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True, created_at="2026-01-01T00:00:00Z")
     store.upsert_team("local", "globo", "ingest", "t-1")
     _mock_org()
     route = respx.delete(f"{IDP}/v1/teams/t-1").mock(return_value=httpx.Response(204))

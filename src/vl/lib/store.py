@@ -80,6 +80,7 @@ _MIGRATIONS: tuple[str, ...] = (
         server_org_id     TEXT NOT NULL,
         display_name      TEXT NOT NULL,
         active            INTEGER NOT NULL CHECK (active IN (0, 1)),
+        created_at        TEXT NOT NULL,
         synced_at         TEXT NOT NULL,
         PRIMARY KEY (environment_name, name)
     );
@@ -325,6 +326,7 @@ class Organization:
     server_org_id: str
     display_name: str
     active: bool
+    created_at: str
     synced_at: str
 
 
@@ -705,6 +707,7 @@ def _row_to_org(row: sqlite3.Row) -> Organization:
         server_org_id=row["server_org_id"],
         display_name=row["display_name"],
         active=bool(row["active"]),
+        created_at=row["created_at"],
         synced_at=row["synced_at"],
     )
 
@@ -715,6 +718,7 @@ def upsert_organization(
     server_org_id: str,
     display_name: str,
     active: bool,
+    created_at: str,
 ) -> Organization:
     """Insert or refresh a cached organization row, stamping ``synced_at``.
 
@@ -725,13 +729,14 @@ def upsert_organization(
         conn.execute(
             """
             INSERT INTO organization (environment_name, name, server_org_id,
-                                      display_name, active, synced_at)
+                                      display_name, active, created_at, synced_at)
             VALUES (:environment_name, :name, :server_org_id, :display_name,
-                    :active, :synced_at)
+                    :active, :created_at, :synced_at)
             ON CONFLICT (environment_name, name) DO UPDATE SET
                 server_org_id = excluded.server_org_id,
                 display_name  = excluded.display_name,
                 active        = excluded.active,
+                created_at    = excluded.created_at,
                 synced_at     = excluded.synced_at
             """,
             {
@@ -740,6 +745,7 @@ def upsert_organization(
                 "server_org_id": server_org_id,
                 "display_name": display_name,
                 "active": 1 if active else 0,
+                "created_at": created_at,
                 "synced_at": _now(),
             },
         )
@@ -766,6 +772,18 @@ def get_organization(environment_name: str, name: str) -> Organization:
             )
         return _row_to_org(row)
 
+def get_organization_by_id(environment_name: str, org_id: int) -> Organization:
+    """A cached organization, or ``OrganizationNotFoundError``."""
+    with _store() as conn:
+        row = conn.execute(
+            "SELECT * FROM organization WHERE environment_name = ? AND  server_org_id = ?",
+            (environment_name, org_id),
+        ).fetchone()
+        if row is None:
+            raise OrganizationNotFoundError(
+                f"No organization found by {org_id!r} in environment {environment_name!r}. "
+            )
+        return _row_to_org(row)
 
 def list_organizations(environment_name: str) -> list[Organization]:
     """All cached organizations for an environment, ordered by name."""
@@ -776,6 +794,14 @@ def list_organizations(environment_name: str) -> list[Organization]:
         ).fetchall()
         return [_row_to_org(row) for row in rows]
 
+def get_organizations(environment_name: str) -> list[Organization]:
+    """All cached organizations for an environment, ordered by created_at."""
+    with _store() as conn:
+        rows = conn.execute(
+            "SELECT * FROM organization WHERE environment_name = ? ORDER BY created_at",
+            (environment_name,),
+        ).fetchall()
+        return [_row_to_org(row) for row in rows]
 
 # --------------------------------------------------------------------------- #
 # Public API — identities, credentials, memberships, token cache (Phase 3)

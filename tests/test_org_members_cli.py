@@ -19,6 +19,7 @@ ORG_DTO = {
     "name": "globo",
     "displayName": "Globo Corp",
     "active": True,
+    "createdAt": "2026-01-01T00:00:00Z",
     "createdBy": "u-0",
     "owner": "u-0",
 }
@@ -97,7 +98,7 @@ def test_members_add_accepts_key_reader_role() -> None:
 def test_members_set_role_patches_and_syncs_local() -> None:
     _caller()
     ident = store.add_identity("local", "USER", "u-9", "jdoe", "jdoe")
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True, created_at="2026-01-01T00:00:00Z")
     store.upsert_org_membership(ident.id, "local", "globo", "USER")
     _mock_org()
     patch = respx.patch(f"{IDP}/v1/organizations/org-1/members/u-9").mock(

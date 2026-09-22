@@ -69,12 +69,12 @@ def test_store_from_a_newer_vl_is_rejected(isolated_store: Path) -> None:
 def test_upsert_inserts_then_updates_same_row(isolated_store: Path) -> None:
     store.ensure_local_environment_seeded()
 
-    first = store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    first = store.upsert_organization("local", "globo", "org-1", "Globo", active=True, created_at="2026-01-01T00:00:00Z")
     assert first.server_org_id == "org-1"
     assert first.active is True
 
     second = store.upsert_organization(
-        "local", "globo", "org-1", "Globo Renamed", active=False
+        "local", "globo", "org-1", "Globo Renamed", active=False, created_at="2026-01-01T00:00:00Z"
     )
     assert second.display_name == "Globo Renamed"
     assert second.active is False
@@ -87,8 +87,8 @@ def test_cache_is_scoped_per_environment(isolated_store: Path) -> None:
     store.ensure_local_environment_seeded()
     store.add_environment("dev", "http://i", "http://c", "http://d", "http://t", "http://s", "k:1")
 
-    store.upsert_organization("local", "globo", "org-local", "Globo", active=True)
-    store.upsert_organization("dev", "globo", "org-dev", "Globo", active=True)
+    store.upsert_organization("local", "globo", "org-local", "Globo", active=True, created_at="2026-01-01T00:00:00Z")
+    store.upsert_organization("dev", "globo", "org-dev", "Globo", active=True, created_at="2026-01-01T00:00:00Z")
 
     assert store.get_organization("local", "globo").server_org_id == "org-local"
     assert store.get_organization("dev", "globo").server_org_id == "org-dev"
@@ -105,4 +105,4 @@ def test_upsert_against_unknown_environment_is_rejected(
 ) -> None:
     store.ensure_local_environment_seeded()
     with pytest.raises(sqlite3.IntegrityError):
-        store.upsert_organization("ghost-env", "globo", "org-1", "Globo", active=True)
+        store.upsert_organization("ghost-env", "globo", "org-1", "Globo", active=True, created_at="2026-01-01T00:00:00Z")

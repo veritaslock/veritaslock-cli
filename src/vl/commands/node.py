@@ -370,7 +370,7 @@ def stop(
         org_name = store.get_organization(environment.name, org).name
         node = store.get_node(environment.name, org_name, org_node)
         if node.pid is None:
-            note(f"{org_name}/node{node.org_node} is not running (or not started by vl).")
+            note(f"{org_name}/node{node.org_node} is not running.")
         elif is_running(node):
             if shutdown_node(node):
                 store.set_node_stopped(node)

@@ -16,8 +16,8 @@ from vl.lib import store
 runner = CliRunner()
 IDP = "http://localhost:8080"
 
-GLOBO = {"id": "org-1", "name": "globo", "displayName": "Globo", "active": True}
-FULCRUM = {"id": "org-2", "name": "fulcrum", "displayName": "Fulcrum", "active": True}
+GLOBO = {"id": "org-1", "name": "globo", "displayName": "Globo", "active": True, "createdAt": "2026-01-01T00:00:00Z"}
+FULCRUM = {"id": "org-2", "name": "fulcrum", "displayName": "Fulcrum", "active": True, "createdAt": "2026-01-01T00:00:00Z"}
 TEAM = {"id": "t-1", "name": "ingest", "description": "", "orgId": "org-1"}
 FULCRUM_TEAM = {"id": "t-2", "name": "ingest", "description": "", "orgId": "org-2"}
 
@@ -43,7 +43,7 @@ def _caller(orgs: list[dict[str, str]] | None = None) -> store.Identity:
 
 
 def _cache_globo() -> None:
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True, created_at="2026-01-01T00:00:00Z")
 
 
 def _mock_team_lookup(org_id: str = "org-1", team: dict | None = None) -> None:
@@ -110,8 +110,8 @@ def test_list_refreshes_local_team_member_cache() -> None:
 @respx.mock
 def test_list_ambiguous_team_name_errors() -> None:
     _caller([{"orgId": "org-1", "role": "USER"}, {"orgId": "org-2", "role": "USER"}])
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
-    store.upsert_organization("local", "fulcrum", "org-2", "Fulcrum", active=True)
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True, created_at="2026-01-01T00:00:00Z")
+    store.upsert_organization("local", "fulcrum", "org-2", "Fulcrum", active=True, created_at="2026-01-01T00:00:00Z")
     _mock_team_lookup("org-1")
     respx.get(f"{IDP}/v1/teams", params={"orgId": "org-2", "name": "ingest"}).mock(
         return_value=httpx.Response(200, json={"items": [FULCRUM_TEAM]})

@@ -35,6 +35,7 @@ Same `store.db` as Phase 1. This document adds one table.
 | server_org_id | text | the id IdP assigned |
 | display_name | text | |
 | active | integer | 0/1 |
+| created_at | text | ISO8601 — mirrors the server's own `organization.created_at`, captured the same way `display_name`/`active` are on every upsert; not this row's own local creation time. Exists specifically so `vl network start`/`stop`/`reset` can determine org iteration order (`vl-network-spec.md` §3.0) from `store.db` alone, without a network round-trip just to ask the server what order its own orgs were created in. |
 | synced_at | text | ISO8601 — updated every time this row is touched by a successful `vl org` call |
 
 `PRIMARY KEY (environment_name, name)`. Scoped per environment rather than globally, because `local` and `dev` (and later `test`/`stage`/`prod`/`demo`) are separate IdP instances — an org named `globo` in two different environments is two different orgs with two different `server_org_id` values, even though the name happens to match.

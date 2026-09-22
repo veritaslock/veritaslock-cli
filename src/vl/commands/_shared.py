@@ -66,6 +66,7 @@ def cache_org(environment_name: str, dto: dict[str, Any]) -> str:
         dto["id"],
         dto["displayName"],
         bool(dto["active"]),
+        dto["createdAt"],
     )
     return str(dto["name"])
 

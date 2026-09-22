@@ -19,7 +19,7 @@ from _helpers import fake_jwt
 runner = CliRunner()
 IDP = "http://localhost:8080"
 
-ORG_DTO = {"id": "org-1", "name": "globo", "displayName": "Globo", "active": True}
+ORG_DTO = {"id": "org-1", "name": "globo", "displayName": "Globo", "active": True, "createdAt": "2026-01-01T00:00:00Z"}
 
 
 def _caller(label: str = "root", *, kind: str = "USER") -> store.Identity:
@@ -225,7 +225,7 @@ def test_add_surfaces_403_from_server() -> None:
 
 def test_show_local_by_default_masks_secret() -> None:
     _caller()
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True, created_at="2026-01-01T00:00:00Z")
     target = store.add_identity("local", "USER", "u-5", "jdoe", "jdoe")
     store.set_user_acct(target.id, "local-pw")
     store.upsert_org_membership(target.id, "local", "globo", "USER")
@@ -244,7 +244,7 @@ def test_show_local_by_default_masks_secret() -> None:
 @respx.mock
 def test_show_all_merges_server_and_local() -> None:
     _caller()
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True, created_at="2026-01-01T00:00:00Z")
     target = store.add_identity("local", "USER", "u-5", "jdoe", "jdoe")
     store.set_user_acct(target.id, "local-pw")
     store.upsert_org_membership(target.id, "local", "globo", "USER")
@@ -308,7 +308,7 @@ def test_leaf_command_missing_arg_prints_command_help() -> None:
 
 def test_list_local_by_default() -> None:
     _caller()
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True, created_at="2026-01-01T00:00:00Z")
     ident = store.add_identity("local", "USER", "u-5", "jdoe", "jdoe")
     store.set_user_acct(ident.id, "pw")
 
@@ -322,7 +322,7 @@ def test_list_local_by_default() -> None:
 def test_list_local_filtered_by_org() -> None:
     _caller()
     for name in ("globo", "acme"):
-        store.upsert_organization("local", name, f"o-{name}", name, active=True)
+        store.upsert_organization("local", name, f"o-{name}", name, active=True, created_at="2026-01-01T00:00:00Z")
     a = store.add_identity("local", "USER", "u-a", "aa", "aa")
     store.set_user_acct(a.id, "pw")
     store.upsert_org_membership(a.id, "local", "globo", "USER")
@@ -413,8 +413,8 @@ def test_list_remote_pagination_hint_shown_in_table_mode() -> None:
 @respx.mock
 def test_list_remote_orgs_column_from_local_cache() -> None:
     _caller()
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
-    store.upsert_organization("local", "acme", "org-2", "Acme", active=True)
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True, created_at="2026-01-01T00:00:00Z")
+    store.upsert_organization("local", "acme", "org-2", "Acme", active=True, created_at="2026-01-01T00:00:00Z")
     cached = store.add_identity("local", "USER", "u-1", "a", "alpha")
     store.upsert_org_membership(cached.id, "local", "globo", "ORG_ADMIN")
     store.upsert_org_membership(cached.id, "local", "acme", "USER")
@@ -608,7 +608,7 @@ def test_use_rejects_service_account() -> None:
 @respx.mock
 def test_add_defaults_org_to_callers_org() -> None:
     caller = _caller()
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True, created_at="2026-01-01T00:00:00Z")
     store.upsert_org_membership(caller.id, "local", "globo", "ORG_ADMIN")
     respx.get(f"{IDP}/v1/organizations", params={"name": "globo"}).mock(
         return_value=httpx.Response(200, json=ORG_DTO)
@@ -626,7 +626,7 @@ def test_add_defaults_org_to_callers_org() -> None:
 def test_add_errors_when_org_ambiguous() -> None:
     caller = _caller()
     for n in ("globo", "acme"):
-        store.upsert_organization("local", n, f"o-{n}", n, active=True)
+        store.upsert_organization("local", n, f"o-{n}", n, active=True, created_at="2026-01-01T00:00:00Z")
         store.upsert_org_membership(caller.id, "local", n, "USER")
 
     result = runner.invoke(app, ["usr-acct", "add", "jdoe", "--email", "j@x.com"])

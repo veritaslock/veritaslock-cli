@@ -42,7 +42,7 @@ def test_whoami_honours_as_flag() -> None:
 
 def test_whoami_shows_org_and_role_from_single_membership() -> None:
     store.ensure_local_environment_seeded()
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True, created_at="2026-01-01T00:00:00Z")
     ident = store.add_identity("local", "USER", "u-1", "alice", "alice")
     store.set_user_acct(ident.id, "pw")
     store.upsert_org_membership(ident.id, "local", "globo", "KEY_READER")
@@ -57,7 +57,7 @@ def test_whoami_shows_org_and_role_from_single_membership() -> None:
 
 def test_whoami_service_account_has_no_role() -> None:
     store.ensure_local_environment_seeded()
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True, created_at="2026-01-01T00:00:00Z")
     ident = store.add_identity("local", "SERVICE_ACCOUNT", "sa-1", "sa-1", "sys")
     store.set_svc_acct(ident.id, "local", "globo", "sa-1", "s", key_version=1)
     store.set_default_identity("local", "sys")
@@ -71,7 +71,7 @@ def test_whoami_service_account_has_no_role() -> None:
 def test_whoami_ambiguous_org() -> None:
     store.ensure_local_environment_seeded()
     for name in ("globo", "acme"):
-        store.upsert_organization("local", name, f"o-{name}", name, active=True)
+        store.upsert_organization("local", name, f"o-{name}", name, active=True, created_at="2026-01-01T00:00:00Z")
     ident = store.add_identity("local", "USER", "u-1", "alice", "alice")
     store.set_user_acct(ident.id, "pw")
     store.upsert_org_membership(ident.id, "local", "globo", "USER")

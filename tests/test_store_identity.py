@@ -13,7 +13,7 @@ from vl.lib import store
 
 def _seed_org(env: str = "local", name: str = "globo") -> None:
     store.ensure_local_environment_seeded()
-    store.upsert_organization(env, name, f"srv-{name}", name.title(), active=True)
+    store.upsert_organization(env, name, f"srv-{name}", name.title(), active=True, created_at="2026-01-01T00:00:00Z")
 
 
 def _mk_identity(label: str = "alice", *, env: str = "local", server_id: str = "u-1") -> store.Identity:

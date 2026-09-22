@@ -20,7 +20,7 @@ def _tables(db_path: Path) -> set[str]:
 
 def _seed() -> store.Identity:
     store.ensure_local_environment_seeded()
-    store.upsert_organization("local", "globo", "org-1", "Globo", active=True)
+    store.upsert_organization("local", "globo", "org-1", "Globo", active=True, created_at="2026-01-01T00:00:00Z")
     return store.add_identity("local", "SERVICE_ACCOUNT", "sa-1", "sa-1", "sys")
 
 
