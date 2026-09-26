@@ -121,8 +121,11 @@ Standing up a new org with its own dedicated admin is a three-step bootstrap
 
 ```bash
 vl org add anchorpoint --display-name "AnchorPoint" --as admin
-vl usr-acct add Ana Reyes --org anchorpoint --role ORG_ADMIN --phone +15555550123 --as admin
-vl org update anchorpoint --owner <new user's server id> --as admin
+vl usr-acct add areyes --org anchorpoint --role ORG_ADMIN --first Ana --last Reyes \
+    --email ana@acme.com --phone +15555550123 --as admin
+# Must run as areyes, not admin -- PATCH /v1/organizations requires a real ORG_ADMIN row on this
+# exact org; admin's PLATFORM_ADMIN standing alone no longer satisfies it (see vl-org-spec.md §4.8).
+vl org update anchorpoint --owner <new user's server id> --as areyes
 ```
 
 If the intended admin is an *existing* user, `vl org add … --initial-admin <user-id>`

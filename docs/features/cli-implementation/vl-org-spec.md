@@ -103,7 +103,12 @@ vl org add anchorpoint --display-name "AnchorPoint" --as admin
 vl usr-acct add <username> --email <email> --org anchorpoint --role ORG_ADMIN --first <First> --last <Last> --phone <number> --as admin
 
 # 3. Hand ownership to the new admin, correcting the temporary state from step 1.
-vl org update anchorpoint --owner <new user's server id> --as admin
+#    Must run as <username> (the admin created in step 2), not admin -- PATCH /v1/organizations
+#    requires a real ORG_ADMIN row on this exact org (idp-org-admin-safety-spec.md §7); admin's
+#    PLATFORM_ADMIN standing alone no longer satisfies it, and step 1 deliberately left admin
+#    with zero real ORG_ADMIN rows here. <username>'s password was cached locally by step 2, so
+#    --as <username> just works.
+vl org update anchorpoint --owner <new user's server id> --as <username>
 
 # 4. Create the org's event-encryption key -- the last step, per vl-org-keys-spec.md.
 #    send_events.sh and the node fetch it via the API directly; vl's role ends at creation.
