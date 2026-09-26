@@ -92,3 +92,30 @@ extended the pattern to service-account keys.
   `vl svc-acct add`), accepting the new client id / server id.
 - `vl svc-acct cache --private-key-path` imports an *existing* key; it never
   re-keys the server, so it is unaffected by this gap.
+
+## New dependency: node ownership lock (control-plane-service)
+
+As of the (org_id, org_node) ownership check added to `POST /v1/nodes` and
+`PATCH /v1/nodes/{id}/up` (control-plane-service, `node.owner_service_account_id`,
+V42 migration), a node's CP row permanently remembers the `client_id` of the
+service account that first registered it, and rejects register/markNodeUp calls
+from any other service account (`409 NOT_OWNER`) for that same `org_node`.
+
+Because deprovision + re-provision (this doc's interim guidance above) mints a
+**new** `client_id`, the recovered node's next `register()` call will now hit
+`NOT_OWNER` — the CP row still remembers the *old*, deleted service account as
+owner. There is currently no API to clear this; recovering a node after a
+lost/compromised key additionally requires a manual DB fix:
+
+```sql
+UPDATE node SET owner_service_account_id = NULL
+WHERE org_id = '<org-id>' AND org_node = <n>;
+```
+
+so the newly-provisioned service account's next register() call claims the row.
+
+Once true key rotation lands (same service account, same `client_id`, new key),
+this stops being an issue for the lost/compromised-key case: the node keeps
+registering as the account it always was, so `owner_service_account_id` never
+needs to change. This is one more reason to prioritize the rotation work above,
+not a reason to build a separate reclaim endpoint in the meantime.
