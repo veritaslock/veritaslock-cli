@@ -293,6 +293,8 @@ class NoResolvedIdentityError(StoreError):
 class TeamNotFoundError(StoreError):
     """Named team is not in the local cache."""
 
+class StudyNotFoundError(StoreError):
+    """Named study does not exist or is not visible to the caller."""
 
 class NodeNotFoundError(StoreError):
     """Named node is not in the local cache."""
@@ -869,8 +871,7 @@ def get_identity(environment: str, label: str) -> Identity:
         row = _identity_row(conn, environment, label)
         if row is None:
             raise IdentityNotFoundError(
-                f"No identity {label!r} in environment {environment!r}. Run "
-                f"`vl identity list` to see what's stored."
+                f"No identity {label!r} in environment {environment!r}."
             )
         return _row_to_identity(row)
 
@@ -960,7 +961,7 @@ def resolve_identity(environment: str, explicit_label: str | None) -> Identity:
                 source = "--as" if explicit_label else "VL_IDENTITY"
                 raise IdentityNotFoundError(
                     f"No identity {label!r} in environment {environment!r} "
-                    f"(from {source}). Run `vl identity list`."
+                    f"(from {source}). Run `vl usr-acct list` or 'vl svc-acct list'."
                 )
             return _row_to_identity(row)
 
