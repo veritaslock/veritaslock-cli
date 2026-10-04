@@ -25,7 +25,7 @@ from vl.commands._shared import (
     refuse_duplicate_account,
     report_errors,
     resolve_membership_org,
-    resolve_org,
+    resolve_org, CliError,
 )
 from vl.lib import api, auth, passwords, store
 from vl.lib.cli import HelpOnErrorGroup
@@ -53,7 +53,12 @@ def _require_user_caller(identity: store.Identity) -> None:
 
 
 def _local_user(environment_name: str, username: str) -> store.Identity:
-    identity = store.get_identity(environment_name, username)
+    try:
+        identity = store.get_identity(environment_name, username)
+    except store.IdentityNotFoundError:
+        raise CliError(f"User {username!r} in environment {environment_name!r} not found."
+                       f"  Run 'vl usr-acct list' to see what's stored.")
+
     if identity.kind != "USER":
         raise store.IdentityNotFoundError(
             f"{username!r} is a {identity.kind} identity, not a user."

@@ -71,7 +71,7 @@ def get_network_status(as_: str | None, env: str | None) -> list[dict[str, Any]]
         caller,
         environment.idp_base_url,
         lambda c: c.get(
-            "/v1/nodes"
+            "/v1/nodes", params={"scope": "all"}
         ),
         environment.cp_base_url,
     )

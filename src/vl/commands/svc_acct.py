@@ -54,7 +54,12 @@ class ServiceAccountError(CliError):
 
 
 def _local_sa(environment_name: str, label: str) -> store.Identity:
-    identity = store.get_identity(environment_name, label)
+    try:
+        identity = store.get_identity(environment_name, label)
+    except store.IdentityNotFoundError:
+        raise CliError(f"Service account {label!r} in environment {environment_name!r} not found."
+                       f"  Run 'vl svc-acct list' to see what's stored.")
+
     if identity.kind != "SERVICE_ACCOUNT":
         raise ServiceAccountError(
             f"{label!r} is a {identity.kind} identity, not a service account."

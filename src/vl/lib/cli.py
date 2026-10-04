@@ -5,11 +5,16 @@ from __future__ import annotations
 from typing import Any, NoReturn
 
 import typer._click as click
+from typer import BadParameter
+from typer._click.exceptions import MissingParameter
 from typer.core import TyperGroup
 
 
 class HelpOnErrorGroup(TyperGroup):
     """Answer any incomplete or wrong invocation with ``--help``, at every level.
+
+    Exception: a ``BadParameter`` (a value was given but is invalid — e.g. a path that doesn't exist) is re-raised.
+    A ``MissingParameter`` still gets help.
 
     A bare group (``vl``, ``vl usr-acct``), an unknown subcommand
     (``vl usr-acct blah``), a leaf command missing a required argument
@@ -49,6 +54,8 @@ class HelpOnErrorGroup(TyperGroup):
         try:
             return super().invoke(ctx)
         except click.exceptions.UsageError as err:
+            if isinstance(err, BadParameter) and not isinstance(err, MissingParameter):
+                raise
             self._help_and_exit(
                 err.ctx or ctx,
                 already_printed=isinstance(err, click.exceptions.NoArgsIsHelpError),
