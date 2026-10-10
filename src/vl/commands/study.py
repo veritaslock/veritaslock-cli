@@ -287,9 +287,6 @@ def update(
 def delete(
     org: Annotated[str, typer.Argument(help="Organization name.")],
     study_id: Annotated[str, typer.Argument(help="StudyId.")],
-    force: Annotated[
-        bool, typer.Option("--force", help="Performs a hard delete.")
-    ] = False,
     yes: Annotated[
         bool | None, typer.Option("--yes", help="Perform delete without prompting the user.")
     ] = None,
@@ -301,43 +298,28 @@ def delete(
         environment = store.get_environment(env)
         caller = store.resolve_identity(environment.name, as_)
         study_dto = get_study_dto(environment, caller, org, study_id)
-        deleted = study_dto["deleted"]
-        state = study_dto["studyState"]
-        if deleted and not force:
-            raise CliError("Study was already soft-deleted; use --force to remove it permanently")
+        already_deleted = study_dto["deleted"]
+        if already_deleted:
+            note(f"Study {org}/{study_id} is already deleted")
+            return
 
         if yes is None:
             if not sys.stdin.isatty():
                 raise CliError("vl study delete requires confirmation; pass --yes to run non-interactively")
 
-            if force:
-                msg = f"Delete {org}/{study_id}? This permanently removes the study from the control plane. Are you sure?"
-            else:
-                msg = f"Delete {org}/{study_id}? This removes the study from the control plane. Are you sure?"
-
             yes = typer.confirm(
-                  msg,
-                  default=False,
+                f"Delete {org}/{study_id}? It will be hidden from listings and can no longer be modified or restored. Are you sure?",
+                default=False,
             )
 
         if yes:
             event_id = study_dto["eventId"]
 
-            if force:
-                auth.authed_call(
-                    caller,
-                    environment.idp_base_url,
-                    lambda c: c.delete(f"/v1/studies/{event_id}", params={"studyId": study_id, "force": force}),
-                    environment.cp_base_url
-                )
-                note(f"Study {study_id} was permanently deleted.")
-            else:
-                delete_patch: dict[str, Any] = {"deleted": True}
-                auth.authed_call(
-                    caller,
-                    environment.idp_base_url,
-                    lambda c: c.patch(f"/v1/studies/{event_id}", params={"studyId": study_id}, json=delete_patch),
-                    environment.cp_base_url
-                )
-                note(f"Study {study_id} was deleted.")
-
+            delete_patch: dict[str, Any] = {"deleted": True}
+            auth.authed_call(
+                caller,
+                environment.idp_base_url,
+                lambda c: c.patch(f"/v1/studies/{event_id}", params={"studyId": study_id}, json=delete_patch),
+                environment.cp_base_url
+            )
+            note(f"Study {org}/{study_id} was deleted.")
