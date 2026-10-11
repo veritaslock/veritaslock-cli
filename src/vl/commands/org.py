@@ -204,7 +204,8 @@ def start(
                 note(f"Warning: {e}")
 
 
-def stop_and_optionally_reset_nodes(environment: Environment, nodes: list[Node], organization: Organization, reset_: bool | None = None) -> None:
+def stop_and_optionally_reset_nodes(environment: Environment, nodes: list[Node], organization: Organization,
+                                    include_snapshots: bool = False, reset_: bool | None = None) -> None:
     nodes.reverse()
     for idx, node_ in enumerate(nodes):
         try:
@@ -225,7 +226,7 @@ def stop_and_optionally_reset_nodes(environment: Environment, nodes: list[Node],
                 cnt += 1
 
             if reset_ and node_stopped:
-                node.reset(organization.name, node_.org_node, True, environment.name)
+                node.reset(organization.name, node_.org_node, include_snapshots=include_snapshots, yes=True, env=environment.name)
 
             if not node_stopped:
                 note (f"Warning: {organization.name}-node{node_.org_node} is still reported UP by the control plane.")
@@ -252,25 +253,33 @@ def reset(
     org: Annotated[
         str, typer.Argument(help="Canonical org name (sent to the server as-is).")
     ],
+    *,
+    include_snapshots: Annotated[
+        bool,
+        typer.Option("--include-snapshots", help="clear the snapshots directory along with the data directory."),
+    ] = False,
     yes: Annotated[
         bool | None,
-        typer.Option("--yes", help="reset all nodes in org by clearing node's data directory."),
+        typer.Option("--yes", help="Skip the confirmation prompt."),
     ] = None,
     env: EnvOption = None) -> None:
     """Resets all nodes in an organization."""
     with report_errors():
         environment = store.get_environment(env)
         organization = store.get_organization(environment.name, org)
-        org_name =organization.name
+        org_name = organization.name
         if not yes:
             if not sys.stdin.isatty():
                 raise CliError("vl org reset requires confirmation; pass --yes to run non-interactively")
+            prompt_prefix = f"Reset all nodes in org '{org_name}'?"
+            if include_snapshots:
+                prompt_prefix = f"Reset all nodes in org '{org_name}' including snapshots?"
             yes = typer.confirm(
-                f"Reset ALL nodes in org {org_name}? Any that are running will be stopped and "
+                f"{prompt_prefix} Any that are running will be stopped and "
                 f"all local blockchain state will be deleted. Are you sure?",
                 default=False,
             )
 
         if yes:
             nodes = store.get_nodes(environment, organization)
-            stop_and_optionally_reset_nodes(environment, nodes, organization, True)
+            stop_and_optionally_reset_nodes(environment, nodes, organization, include_snapshots, True)

@@ -403,19 +403,28 @@ def node_is_up(environment: store.Environment, node: store.Node) -> bool:
     return state != "DOWN"
 
 
-def delete_data_dir(node_root: Path) -> None:
+def reset_node(node_root: Path, include_snapshots: bool) -> None:
     data_dir = node_root / "data"
     shutil.rmtree(data_dir, ignore_errors=True)
     data_dir.mkdir(parents=True, exist_ok=True)
+    if include_snapshots:
+        snapshots_dir = node_root / "snapshots"
+        shutil.rmtree(snapshots_dir, ignore_errors=True)
+        snapshots_dir.mkdir(parents=True, exist_ok=True)
 
 
 @app.command("reset")
 def reset(
     org: Annotated[str, typer.Argument(help="Organization name.")],
     org_node: Annotated[int, typer.Argument(help="Node number to reset")],
+    *,
+    include_snapshots: Annotated[
+        bool,
+        typer.Option("--include-snapshots", help="clear the snapshots directory along with the data directory."),
+    ] = False,
     yes: Annotated[
         bool | None,
-        typer.Option("--yes", help="reset node by clearing data directory."),
+        typer.Option("--yes", help="Skip the confirmation prompt."),
     ] = None,
     env: EnvOption = None
     ) -> None:
@@ -430,16 +439,23 @@ def reset(
         if yes is None:
             if not sys.stdin.isatty():
                 raise CliError("vl node reset requires confirmation; pass --yes to run non-interactively")
+            if include_snapshots:
+                prompt_prefix = f"Reset {org_name}/node{org_node}'s data and snapshots directories?"
+            else:
+                prompt_prefix = f"Reset {org_name}/node{org_node}'s data directory?"
             yes = typer.confirm(
-                f"Reset {org_name}/node{org_node}'s data directory? This permanently deletes all "
-                f"local blockchain state. Are you sure?",
+                f"{prompt_prefix} This permanently deletes all local blockchain state. Are you sure?",
                 default=False,
             )
 
         if yes:
             node_root = Path.home() / "orgs" / org_name / "nodes" / f"node{org_node}"
-            delete_data_dir(node_root)
-            note(f"Deleted {org_name}/node{org_node}'s data directory.")
+            reset_node(node_root, include_snapshots)
+            if include_snapshots:
+                msg_suffix = "data and snapshots directories."
+            else:
+                msg_suffix = "data directory."
+            note(f"Deleted {org_name}/node{org_node}'s {msg_suffix}")
 
 
 @app.command("list")

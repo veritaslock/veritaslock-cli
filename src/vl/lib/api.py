@@ -30,6 +30,7 @@ class ApiError(Exception):
         status_code: int,
         detail: str,
         *,
+        context: dict[str, Any] | None = None,
         error_code: str | None = None,
         invalid_fields: list[Any] | None = None,
         correlation_id: str | None = None,
@@ -37,6 +38,7 @@ class ApiError(Exception):
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
+        self.context = context or {}
         self.error_code = error_code
         self.invalid_fields = invalid_fields or []
         self.correlation_id = correlation_id
@@ -55,6 +57,7 @@ def _raise_for_problem(resp: httpx.Response) -> None:
     detail = f"request failed with HTTP {resp.status_code}"
     error_code: str | None = None
     invalid_fields: list[Any] = []
+    context: dict[str, Any] = {}
 
     try:
         body = resp.json()
@@ -64,8 +67,9 @@ def _raise_for_problem(resp: httpx.Response) -> None:
     if isinstance(body, dict):
         detail = body.get("detail") or body.get("title") or detail
         error_code = body.get("errorCode")
-        context = body.get("context")
-        if isinstance(context, dict):
+        raw_ctxt = body.get("context")
+        if isinstance(raw_ctxt, dict):
+            context = raw_ctxt
             fields = context.get("invalidFields")
             if isinstance(fields, list):
                 invalid_fields = fields
@@ -73,6 +77,7 @@ def _raise_for_problem(resp: httpx.Response) -> None:
     raise ApiError(
         resp.status_code,
         detail,
+        context=context,
         error_code=error_code,
         invalid_fields=invalid_fields,
         correlation_id=correlation_id,

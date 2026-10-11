@@ -13,7 +13,7 @@ import typer
 
 from vl.commands import org
 from vl.commands._shared import AsOption, EnvOption, report_errors, CliError, org_name_resolver
-from vl.lib import auth, store
+from vl.lib import auth, store, api
 from vl.lib.cli import HelpOnErrorGroup
 from vl.lib.output import note, render
 from vl.lib.store import Environment, Organization
@@ -79,54 +79,81 @@ def get_network_status(as_: str | None, env: str | None) -> list[dict[str, Any]]
     return items
 
 
-def confirm_all_nodes_are_down(as_: str | None, env: str | None, environment: Environment) -> None:
-    node_dtos = get_network_status(as_, env)
+def reset_cp_state(caller: store.Identity, environment: Environment, *, dry_run: bool) -> dict[str, Any]:
 
-    nodes_not_down : list[str] = []
-    resolve_org = org_name_resolver(environment)
-
-    for dto in node_dtos:
-        org_name = resolve_org(dto["orgId"])
-        if dto["state"] != "DOWN":
-            nodes_not_down.append(f"{org_name}/node{dto['orgNode']}")
-
-    if nodes_not_down:
-        node_list = ", ".join(nodes_not_down)
-        raise CliError(
-            f"Nodes still up: {node_list}. Please issue a vl network stop first."
+    try:
+        body: dict[str, Any] = auth.authed_call(
+            caller,
+            environment.idp_base_url,
+            lambda c: c.post(
+                "/v1/network/reset", params={"dryRun": dry_run}
+            ),
+            environment.cp_base_url,
         )
+    except api.ApiError as exc:
+        if exc.status_code == 403:
+            raise CliError("--as must be a PLATFORM_ADMIN user (a service account isn't accepted)")
+        elif exc.status_code == 404:
+            raise CliError("This environment doesn't allow network reset (the control plane's network.reset.supported isn't enabled).")
+        elif exc.status_code == 409:
+            nodes = exc.context.get("nodes", [])
+
+            not_down = ", ".join(
+                f"{n['orgName']}/node{n['orgNode']} ({n['state']})"
+                for n in nodes
+            )
+
+            if not_down:
+                raise CliError(f"The following nodes are not down: {not_down}")
+            else:
+                raise
+        else:
+            raise
+
+    return body
 
 
 @app.command("reset")
 def reset(
     yes: Annotated[
         bool | None,
-        typer.Option("--yes", help="reset all nodes in org by clearing node's data directory."),
+        typer.Option("--yes", help="Skip the confirmation prompt."),
     ] = None,
     env: EnvOption = None,
     as_: AsOption = None) -> None:
-    """Resets all orgs in network."""
+    """
+    Clears control-plane study and block data and resets all nodes in network.
+    Requires all nodes in the network to be down.
+    """
     with report_errors():
         environment = store.get_environment(env)
-        confirm_all_nodes_are_down(as_, env, environment)
+        caller = store.resolve_identity(environment.name, as_)
         if not yes:
             if not sys.stdin.isatty():
-                raise CliError("vl org reset requires confirmation; pass --yes to run non-interactively")
+                raise CliError("vl network reset requires confirmation; pass --yes to run non-interactively")
+            body = reset_cp_state(caller, environment, dry_run=True)
+            counts = ", ".join(f"{table}: {n}" for table, n in body["deleted"].items() if n)
+            if counts:
+                deleted = f" ({counts}) "
+            else:
+                deleted = " "
             yes = typer.confirm(
-                f"Reset ALL nodes in {environment.name}? "
-                f"This permanently deletes local blockchain state for every node. Are you sure?",
+                f"Reset ALL nodes in environment '{environment.name}'?\n"
+                f"This permanently deletes the control plane's study and block data{deleted}"
+                f"and the local blockchain state for every node, including its snapshots.\n"
+                f"Are you sure?",
                 default=False,
             )
 
         if yes:
+            reset_cp_state(caller, environment, dry_run=False)
             orgs = curate_orgs(environment)
             orgs.reverse()
             for org_ in orgs:
                 try:
-                    org.reset(org_.name, True, environment.name)
+                    org.reset(org_.name, include_snapshots=True, yes=True, env=environment.name)
                 except Exception as e:
                     note(f"Warning: {e}")
-
 
 
 @app.command("status")

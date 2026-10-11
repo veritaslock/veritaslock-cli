@@ -72,6 +72,37 @@ def test_validation_fields_are_captured() -> None:
 
 
 @respx.mock
+def test_problem_context_is_kept() -> None:
+    nodes = [{"orgName": "globo", "orgNode": 1, "state": "UP"}]
+    respx.post(f"{BASE}/v1/network/reset").mock(
+        return_value=httpx.Response(409, json={"detail": "Not DOWN.", "context": {"nodes": nodes}})
+    )
+    with api.AppClient(BASE, token="t") as client:
+        with pytest.raises(api.ApiError) as excinfo:
+            client.post("/v1/network/reset")
+    assert excinfo.value.context == {"nodes": nodes}
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(409, json={"detail": "no context"}),
+        httpx.Response(409, json={"detail": "list context", "context": ["oops"]}),
+        httpx.Response(502, text="<html>Bad Gateway</html>"),
+        httpx.Response(409, json=["not", "an", "object"]),
+    ],
+    ids=["missing", "not-a-dict", "not-json", "json-list-body"],
+)
+def test_problem_context_defaults_to_empty_dict(response: httpx.Response) -> None:
+    respx.post(f"{BASE}/v1/network/reset").mock(return_value=response)
+    with api.AppClient(BASE, token="t") as client:
+        with pytest.raises(api.ApiError) as excinfo:
+            client.post("/v1/network/reset")
+    assert excinfo.value.context == {}
+
+
+@respx.mock
 def test_transport_failure_becomes_api_error() -> None:
     respx.get(f"{BASE}/v1/organizations").mock(side_effect=httpx.ConnectError("boom"))
     with api.AppClient(BASE) as client:

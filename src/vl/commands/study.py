@@ -288,7 +288,7 @@ def delete(
     org: Annotated[str, typer.Argument(help="Organization name.")],
     study_id: Annotated[str, typer.Argument(help="StudyId.")],
     yes: Annotated[
-        bool | None, typer.Option("--yes", help="Perform delete without prompting the user.")
+        bool | None, typer.Option("--yes", help="Skip the confirmation prompt.")
     ] = None,
     env: EnvOption = None,
     as_: AsOption = None,
