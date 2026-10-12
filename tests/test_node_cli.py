@@ -147,3 +147,38 @@ def test_start_precheck_refuses_when_its_own_process_runs(kills: Kills) -> None:
     row = _node(pid=4312)
     kills.alive.add(4312)
     assert not node_cmd.is_node_down(row)
+
+
+# --------------------------------------------------------------------------- #
+# repair on read (§4c): RUNNING rows whose process is gone become STOPPED
+# --------------------------------------------------------------------------- #
+
+
+def test_repair_stops_a_running_row_whose_process_is_gone(kills: Kills) -> None:
+    _org()
+    row = _node(pid=4312)
+
+    repaired = node_cmd.repair(row)
+
+    assert repaired.node_state == "STOPPED" and repaired.pid is None
+    stored = store.get_node("local", "globo", 1)
+    assert stored.node_state == "STOPPED" and stored.pid is None  # persisted
+    assert kills.calls == []  # nothing signalled
+
+
+def test_repair_leaves_a_live_running_row_alone(kills: Kills) -> None:
+    _org()
+    row = _node(pid=4312)
+    kills.alive.add(4312)
+
+    assert node_cmd.repair(row) == row
+    assert store.get_node("local", "globo", 1).node_state == "RUNNING"
+
+
+def test_repair_leaves_new_and_stopped_rows_alone(kills: Kills) -> None:
+    _org()
+    new = _node(n=1)
+    stopped = store.set_node_stopped(_node(n=2, port=7002))
+
+    assert node_cmd.repair(new) == new
+    assert node_cmd.repair(stopped) == stopped

@@ -132,6 +132,15 @@ def is_our_process(node: store.Node) -> bool:
     return proc.is_our_process(node.pid, node_executable(node))
 
 
+def repair(node: store.Node) -> store.Node:
+    """§4c repair on read: a ``RUNNING`` row whose pid isn't this node's own live
+    process becomes ``STOPPED`` with no pid. Persisted, local, no control-plane call.
+    """
+    if node.node_state == "RUNNING" and not is_our_process(node):
+        return store.set_node_stopped(node)
+    return node
+
+
 def is_node_down(node: store.Node) -> bool:
     if node.node_state == "RUNNING" and is_our_process(node):
         note(f"{node.org_name} node{node.org_node} is already running (pid {node.pid})")
@@ -458,10 +467,10 @@ def list_(
         environment = store.get_environment(env)
         if org is not None:
             organization = store.get_organization(environment.name, org)
-            nodes = store.get_nodes(environment, organization)
+            nodes = [repair(n) for n in store.get_nodes(environment, organization)]
             render([_node_row(node) for node in nodes], title=f"nodes in {environment.name}-{organization.name}")
         else:
-            nodes = store.get_nodes(environment)
+            nodes = [repair(n) for n in store.get_nodes(environment)]
             render([_node_row(node) for node in nodes], title=f"nodes in {environment.name}")
 
 @app.command("show")
@@ -474,7 +483,7 @@ def show(
     with report_errors():
         environment = store.get_environment(env)
         org_name = store.get_organization(environment.name, org).name
-        node = store.get_node(environment.name, org_name, org_node)
+        node = repair(store.get_node(environment.name, org_name, org_node))
         acct = store.get_svc_acct(node.svc_acct_id)
         assert acct is not None
         assert acct.client_id is not None
