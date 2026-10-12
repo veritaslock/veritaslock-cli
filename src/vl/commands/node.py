@@ -25,7 +25,7 @@ from vl.commands._shared import (
     report_errors,
     resolve_org, assert_label_free, CliError,
 )
-from vl.lib import store, roles, api, auth
+from vl.lib import store, roles, api, auth, proc
 from vl.lib.cli import HelpOnErrorGroup
 from vl.lib.output import render, note
 from pathlib import Path
@@ -119,21 +119,24 @@ def create(
     render(_node_row(_node), title="Node created")
 
 
-def is_node_down(node: store.Node) -> bool:
-    return_value = True
-    if node.node_state == "RUNNING" and node.pid is not None:
-        try:
-            os.kill(node.pid, 0)
-            note (f"{node.org_name} node{node.org_node} is already running (pid {node.pid})")
-            return_value = False
-        except ProcessLookupError:
-            note("Process does not exist.")
-            return_value = True
-        except PermissionError:
-            note("Process exists but cannot be signaled.")
-            return_value = False
+def node_root_dir(org: str, n: int) -> Path:
+    return Path.home() / "orgs" / org / "nodes" / f"node{n}"
 
-    return return_value
+
+def node_executable(node: store.Node) -> Path:
+    """The binary a process must be running to count as this node's own (§4c)."""
+    return node_root_dir(node.org_name, node.org_node) / "bin" / "verilock"
+
+
+def is_our_process(node: store.Node) -> bool:
+    return proc.is_our_process(node.pid, node_executable(node))
+
+
+def is_node_down(node: store.Node) -> bool:
+    if node.node_state == "RUNNING" and is_our_process(node):
+        note(f"{node.org_name} node{node.org_node} is already running (pid {node.pid})")
+        return False
+    return True
 
 
 def create_sym_link(private_key_link: Path, private_key_path: str) -> None:
@@ -300,18 +303,12 @@ def start(
             start_verilock(node, node_root, org_name, org_node)
 
 
-def is_running(node: store.Node) -> bool:
-    assert node.pid is not None
-    try:
-        os.kill(node.pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-
-
 def shutdown_node(node: store.Node) -> bool:
+    """SIGTERM, poll, then SIGKILL. Only call this for a pid that passed :func:`is_our_process`.
+
+    Polls with the same §4c check, so a zombie or a pid that's been reused counts
+    as gone and is never signalled again.
+    """
     assert node.pid is not None
     pid = node.pid
     try:
@@ -320,21 +317,14 @@ def shutdown_node(node: store.Node) -> bool:
         note(f"{pid} was not running or was already terminated")
         return True
 
-    # Step 2: Poll using kill -0
     deadline = time.time() + 10.0
     while time.time() < deadline:
-        try:
-            os.kill(pid, 0)  # kill -0 probe
-        except ProcessLookupError:
+        if not is_our_process(node):
             note(f"Stopped {node.org_name}/node{node.org_node} (pid: {pid}).")
             return True
-        except PermissionError:
-            # Process exists but cannot be signaled; treat as alive
-            pass
-
         time.sleep(0.25)
 
-    # Step 3: Still alive → SIGKILL
+    # Still alive after the timeout: SIGKILL, then a brief pause for the kernel to reap.
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -342,17 +332,11 @@ def shutdown_node(node: store.Node) -> bool:
         return True
     except PermissionError:
         pass
-    # Step 4: Brief pause to allow kernel to reap
     time.sleep(0.1)
 
-    # Final check
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+    if not is_our_process(node):
         note(f"Terminated {node.org_name}/node{node.org_node} (pid: {pid}).")
         return True
-    except PermissionError:
-        pass
 
     note(f"Failure to shutdown {node.org_name}/node{node.org_node} (pid: {pid}).")
     return False
@@ -371,7 +355,7 @@ def stop(
         node = store.get_node(environment.name, org_name, org_node)
         if node.pid is None:
             note(f"{org_name}/node{node.org_node} is not running.")
-        elif is_running(node):
+        elif is_our_process(node):
             if shutdown_node(node):
                 store.set_node_stopped(node)
         else:
