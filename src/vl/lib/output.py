@@ -15,6 +15,7 @@ from rich.console import Console
 from rich.table import Table
 
 console = Console()
+err_console = Console(stderr=True)
 
 Row = dict[str, Any]
 
@@ -28,6 +29,11 @@ def note(message: str) -> None:
     if _fmt() == "json":
         return
     console.print(f"[dim]{message}[/dim]")
+
+
+def warn(message: str) -> None:
+    """Print a warning to stderr, in every output mode: JSON on stdout stays parseable."""
+    err_console.print(f"[yellow]{message}[/yellow]")
 
 
 def render(data: Row | list[Row], *, title: str | None = None) -> None:

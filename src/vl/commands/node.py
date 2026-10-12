@@ -25,9 +25,9 @@ from vl.commands._shared import (
     report_errors,
     resolve_org, assert_label_free, CliError,
 )
-from vl.lib import store, roles, api, auth, proc
+from vl.lib import store, roles, api, auth, host, node_state, proc
 from vl.lib.cli import HelpOnErrorGroup
-from vl.lib.output import render, note
+from vl.lib.output import render, note, warn
 from pathlib import Path
 
 app = typer.Typer(
@@ -451,6 +451,110 @@ def reset(
             note(f"Deleted {org_name}/node{org_node}'s {msg_suffix}")
 
 
+# --------------------------------------------------------------------------- #
+# list / show: local rows, repaired, with the control plane's view overlaid (§5.5)
+# --------------------------------------------------------------------------- #
+
+CP_UNREACHABLE_WARNING = "warning: control plane unreachable; showing local state only"
+
+
+def _scope_org_names(environment: store.Environment, caller: store.Identity) -> set[str] | None:
+    """The orgs whose nodes ``caller`` may list (§5.5 step 2); ``None`` means every org.
+
+    A user's cached ``org_membership`` rows, or every org if one of them is
+    platform-wide; a service account's own org. Mirrors what the CP returns for
+    the same identity, so both views cover the same nodes.
+    """
+    if caller.kind == "SERVICE_ACCOUNT":
+        sa = store.get_svc_acct(caller.id)
+        return {sa.org_name} if sa is not None else set()
+    memberships = [
+        m for m in store.list_org_memberships(caller.id) if m.environment_name == environment.name
+    ]
+    if any(m.role == roles.OrgRole.PLATFORM_ADMIN.value for m in memberships):
+        return None
+    return {m.org_name for m in memberships}
+
+
+def _in_scope(node: store.Node, scope: set[str] | None) -> bool:
+    return scope is None or node.org_name in scope
+
+
+def _fetch_cp_nodes(
+    environment: store.Environment, caller: store.Identity
+) -> list[dict[str, Any]] | None:
+    """Every node the CP shows ``caller`` (list form, no ``scope=all``), paged to the end.
+
+    ``None`` when the CP is unreachable (connection failure, timeout, ``5xx``),
+    after warning. Any other error, ``401``/``403`` included, is raised: a
+    rejection means this caller isn't entitled to the view, so there is no
+    falling back to local rows.
+    """
+
+    def page_all(client: api.AppClient) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            body: dict[str, Any] = client.get(
+                "/v1/nodes", params={"cursor": cursor} if cursor else None
+            )
+            items.extend(body.get("items") or [])
+            cursor = body.get("nextCursor")
+            if not cursor:
+                return items
+
+    try:
+        return auth.authed_call(caller, environment.idp_base_url, page_all, environment.cp_base_url)
+    except api.ApiError as exc:
+        if exc.status_code == 0 or exc.status_code >= 500:
+            warn(CP_UNREACHABLE_WARNING)
+            return None
+        raise
+
+
+def _cp_by_node(
+    environment: store.Environment, cp_rows: list[dict[str, Any]] | None
+) -> dict[tuple[str, int], node_state.CpNode] | None:
+    """CP rows keyed by ``(org name, org_node)``, via ``organization.server_org_id``."""
+    if cp_rows is None:
+        return None
+    org_names = {o.server_org_id: o.name for o in store.list_organizations(environment.name)}
+    by_node: dict[tuple[str, int], node_state.CpNode] = {}
+    for dto in cp_rows:
+        name = org_names.get(str(dto.get("orgId")))
+        org_node = dto.get("orgNode")
+        if name is None or not isinstance(org_node, int):
+            continue  # an org this store has never cached has no local rows to match
+        by_node[(name, org_node)] = node_state.cp_node_from_dto(dto)
+    return by_node
+
+
+class _Overlay:
+    """Computes displayed states, gathering this machine's addresses at most once."""
+
+    def __init__(self, cp: dict[tuple[str, int], node_state.CpNode] | None) -> None:
+        self._cp = cp
+        self._local: set[str] | None = None
+
+    def cp_for(self, node: store.Node) -> node_state.CpNode | None:
+        return None if self._cp is None else self._cp.get((node.org_name, node.org_node))
+
+    def state(self, node: store.Node) -> str:
+        cp = self.cp_for(node)
+        if cp is None:
+            return node.node_state
+        if self._local is None:
+            self._local = host.local_identities()
+        return node_state.displayed_state(
+            node.node_state,
+            node.pid,
+            cp,
+            on_this_machine=host.is_this_machine(cp.host, self._local),
+            cp_pid_alive=proc.is_cp_process(cp.pid),
+            local_age_seconds=proc.process_age_seconds(node.pid) if node.node_state == "RUNNING" else None,
+        )
+
+
 @app.command("list")
 def list_(
     org: Annotated[
@@ -460,18 +564,37 @@ def list_(
             help="Filter to nodes based on org."
         ),
     ] = None,
-    env: EnvOption = None
+    env: EnvOption = None,
+    as_: AsOption = None,
 ) -> None:
-    """Lists the nodes """
+    """List this machine's nodes, reconciled with the control plane's view."""
     with report_errors():
         environment = store.get_environment(env)
+        caller = store.resolve_identity(environment.name, as_)
+        scope = _scope_org_names(environment, caller)
         if org is not None:
             organization = store.get_organization(environment.name, org)
-            nodes = [repair(n) for n in store.get_nodes(environment, organization)]
-            render([_node_row(node) for node in nodes], title=f"nodes in {environment.name}-{organization.name}")
+            local = store.get_nodes(environment, organization)
+            title = f"nodes in {environment.name}-{organization.name}"
         else:
-            nodes = [repair(n) for n in store.get_nodes(environment)]
-            render([_node_row(node) for node in nodes], title=f"nodes in {environment.name}")
+            local = store.get_nodes(environment)
+            title = f"nodes in {environment.name}"
+        nodes = [repair(n) for n in local if _in_scope(n, scope)]
+
+        overlay = _Overlay(_cp_by_node(environment, _fetch_cp_nodes(environment, caller)))
+        rows = [
+            {
+                "org": n.org_name,
+                "node": n.org_node,
+                "port": n.port,
+                "state": overlay.state(n),
+                "pid": n.pid,
+                "created_at": n.created_at,
+            }
+            for n in nodes
+        ]
+        render(rows, title=title)
+
 
 @app.command("show")
 def show(
