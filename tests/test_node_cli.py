@@ -508,3 +508,135 @@ def test_list_unreachable_cp_warns_and_shows_local_state(kills: Kills, machine: 
     assert "warning: control plane unreachable; showing local state only" in result.stderr
     assert "warning" not in result.stdout  # JSON on stdout stays parseable
     assert _states(result) == {("globo", 1): "RUNNING", ("globo", 2): "STOPPED"}
+
+
+# --------------------------------------------------------------------------- #
+# show (§5.6): the same identity, scope and CP handling as list
+# --------------------------------------------------------------------------- #
+
+
+def _show(*args: str, json_out: bool = False) -> Any:
+    env = {"VL_OUTPUT": "json"} if json_out else WIDE
+    return runner.invoke(app, ["node", "show", *args], env=env)
+
+
+@respx.mock
+def test_show_prints_the_spec_fields_and_no_reason_when_states_agree(kills: Kills, machine: dict) -> None:
+    _org()
+    _user(memberships={"globo": "ORG_ADMIN"})
+    _node(pid=4312)
+    kills.alive.add(4312)
+    respx.get(CP_NODES).mock(return_value=_cp(_cp_row("org-1", 1, "UP", pid="4312")))
+
+    result = _show("globo", "1", json_out=True)
+
+    assert result.exit_code == 0, result.output
+    row = _json.loads(result.stdout)
+    assert list(row) == [
+        "org_node", "port", "pid", "state", "created_at",
+        "client_id", "private_key_path", "public_key_path",
+    ]
+    assert row["state"] == "RUNNING" and row["pid"] == 4312
+    assert row["client_id"] == "client-globo-1"
+    assert row["private_key_path"] == "/keys/globo-1/private.key"
+
+
+@respx.mock
+def test_show_explains_a_label(kills: Kills, machine: dict) -> None:
+    _org()
+    _user(memberships={"globo": "ORG_ADMIN"})
+    _node(pid=4312)
+    kills.alive.add(4312)
+    respx.get(CP_NODES).mock(return_value=_cp(_cp_row("org-1", 1, "DOWN", pid="4312")))
+
+    table = _show("globo", "1")
+    as_json = _show("globo", "1", json_out=True)
+
+    reason = "stored RUNNING; control plane DOWN on 192.168.8.2, pid 4312 (this node: pid 4312)"
+    assert table.exit_code == 0, table.output
+    assert "NO_HEARTBEAT" in table.stdout and reason in table.stdout
+    row = _json.loads(as_json.stdout)
+    assert row["state"] == "NO_HEARTBEAT" and row["reason"] == reason
+
+
+@respx.mock
+def test_show_explains_remote_with_unknown_values(machine: dict) -> None:
+    _org()
+    _user(memberships={"globo": "ORG_ADMIN"})
+    store.set_node_stopped(_node())
+    respx.get(CP_NODES).mock(return_value=_cp(_cp_row("org-1", 1, "UP", host="10.0.0.9", pid=None)))
+
+    row = _json.loads(_show("globo", "1", json_out=True).stdout)
+
+    assert row["state"] == "REMOTE"
+    assert row["reason"] == "stored STOPPED; control plane UP on 10.0.0.9, pid unknown (this node: no pid)"
+
+
+@respx.mock
+def test_show_agrees_with_list(kills: Kills, machine: dict) -> None:
+    _org()
+    _user(memberships={"globo": "ORG_ADMIN"})
+    _node(pid=4312)
+    kills.alive.add(4312)
+    respx.get(CP_NODES).mock(return_value=_cp(_cp_row("org-1", 1, "UP", pid="9999")))
+
+    listed = _states(_list())[("globo", 1)]
+    shown = _json.loads(_show("globo", "1", json_out=True).stdout)["state"]
+    assert listed == shown == "UNKNOWN"
+
+
+def test_show_outside_the_identitys_scope_is_not_found(machine: dict) -> None:
+    _two_orgs()
+    _user(memberships={"acme": "USER"})
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.get(CP_NODES).mock(return_value=_cp())
+        result = _show("globo", "1")
+    assert result.exit_code == 1
+    assert "No node globo/node1" in result.output and "visible to 'ops'" in result.output
+    assert not route.called
+
+
+def test_show_missing_node_is_not_found(machine: dict) -> None:
+    _org()
+    _user(memberships={"globo": "ORG_ADMIN"})
+    with respx.mock(assert_all_called=False):
+        result = _show("globo", "7")
+    assert result.exit_code == 1
+    assert "No node globo/node7" in result.output
+
+
+def test_show_without_an_identity_fails(machine: dict) -> None:
+    _org()
+    _node()
+    result = _show("globo", "1")
+    assert result.exit_code == 1
+    assert "No identity selected" in result.output
+
+
+@respx.mock
+def test_show_403_prints_the_cp_error_and_nothing_else(machine: dict) -> None:
+    _org()
+    _user(memberships={"globo": "ORG_ADMIN"})
+    _node()
+    respx.get(CP_NODES).mock(return_value=httpx.Response(403, json={"detail": "Not authorized."}))
+
+    result = _show("globo", "1")
+
+    assert result.exit_code == 1
+    assert "Not authorized." in result.output
+    assert "client_id" not in result.output and "Org: globo" not in result.output
+
+
+def test_show_unreachable_cp_warns_and_shows_repaired_local_state(kills: Kills, machine: dict) -> None:
+    _org()
+    _user(memberships={"globo": "ORG_ADMIN"})
+    _node(pid=4312)  # dead
+
+    with respx.mock:
+        respx.get(CP_NODES).mock(side_effect=httpx.ConnectError("refused"))
+        result = _show("globo", "1", json_out=True)
+
+    assert result.exit_code == 0, result.output
+    assert "warning: control plane unreachable; showing local state only" in result.stderr
+    row = _json.loads(result.stdout)
+    assert row["state"] == "STOPPED" and row["pid"] is None and "reason" not in row

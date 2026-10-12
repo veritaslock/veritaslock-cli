@@ -124,3 +124,14 @@ def displayed_state(
             return UNMANAGED
 
     return stored_state
+
+
+def explain(stored_state: str, stored_pid: int | None, cp: CpNode) -> str:
+    """Why the displayed state differs from the stored one, quoting the raw values.
+
+    e.g. ``stored RUNNING; control plane DOWN on 192.168.8.2, pid 4312 (this node: pid 4312)``.
+    """
+    cp_host = cp.host or "an unknown host"
+    cp_pid = "unknown" if cp.pid is None else str(cp.pid)
+    ours = "no pid" if stored_pid is None else f"pid {stored_pid}"
+    return f"stored {stored_state}; control plane {cp.state} on {cp_host}, pid {cp_pid} (this node: {ours})"

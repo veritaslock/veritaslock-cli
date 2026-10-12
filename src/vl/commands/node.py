@@ -27,7 +27,7 @@ from vl.commands._shared import (
 )
 from vl.lib import store, roles, api, auth, host, node_state, proc
 from vl.lib.cli import HelpOnErrorGroup
-from vl.lib.output import render, note, warn
+from vl.lib.output import is_json, render, note, warn
 from pathlib import Path
 
 app = typer.Typer(
@@ -600,26 +600,51 @@ def list_(
 def show(
     org: Annotated[str, typer.Argument(help="Organization name.")],
     org_node: Annotated[int, typer.Argument(help="Node number to show")],
-    env: EnvOption = None
+    env: EnvOption = None,
+    as_: AsOption = None,
 ) -> None:
-    """Show details for a specific node"""
+    """Show one node, reconciled with the control plane's view (same as list)."""
     with report_errors():
         environment = store.get_environment(env)
+        caller = store.resolve_identity(environment.name, as_)
         org_name = store.get_organization(environment.name, org).name
-        node = repair(store.get_node(environment.name, org_name, org_node))
+        not_found = store.NodeNotFoundError(
+            f"No node {org_name}/node{org_node} in environment {environment.name!r} "
+            f"visible to {caller.label!r}."
+        )
+        try:
+            local = store.get_node(environment.name, org_name, org_node)
+        except store.NodeNotFoundError:
+            raise not_found from None
+        if not _in_scope(local, _scope_org_names(environment, caller)):
+            raise not_found
+        node = repair(local)
+
+        # The org-scoped list form, filtered here to this (org, org_node): the
+        # orgNode form derives org_id from a single-org token, which a user's isn't.
+        overlay = _Overlay(_cp_by_node(environment, _fetch_cp_nodes(environment, caller)))
+        state = overlay.state(node)
+        cp = overlay.cp_for(node)
+        reason = (
+            node_state.explain(node.node_state, node.pid, cp)
+            if cp is not None and state != node.node_state
+            else None
+        )
+
         acct = store.get_svc_acct(node.svc_acct_id)
         assert acct is not None
-        assert acct.client_id is not None
-        assert acct.private_key_path is not None
-        assert acct.public_key_path is not None
         row: dict[str, Any] = {
             "org_node": node.org_node,
             "port": node.port,
             "pid": node.pid,
-            "state": node.node_state,
+            "state": state,
             "created_at": node.created_at,
             "client_id": acct.client_id,
             "private_key_path": acct.private_key_path,
-            "public_key_path": acct.public_key_path
+            "public_key_path": acct.public_key_path,
         }
+        if reason is not None and is_json():
+            row["reason"] = reason
         render(row, title=f"Org: {org_name}, Node: {org_node}")
+        if reason is not None:
+            note(reason)

@@ -24,6 +24,11 @@ def _fmt() -> str:
     return os.environ.get("VL_OUTPUT", "table").lower()
 
 
+def is_json() -> bool:
+    """Whether output is JSON (``VL_OUTPUT=json``) rather than a table."""
+    return _fmt() == "json"
+
+
 def note(message: str) -> None:
     """Print a dim advisory line, suppressed in JSON mode so output stays parseable."""
     if _fmt() == "json":
