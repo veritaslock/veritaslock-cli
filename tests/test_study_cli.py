@@ -253,6 +253,50 @@ def test_delete_leaves_the_state_check_to_the_control_plane(
     assert "was deleted" not in result.output
 
 
+HINT = "To delete it, first run: vl study update globo s-1 --disable"
+
+
+@pytest.mark.parametrize("state", ["ACCEPTED", "ACTIVE"])
+def test_delete_refused_for_a_running_study_hints_to_disable_first(
+    cp: respx.MockRouter, ops: store.Identity, state: str
+) -> None:
+    _lookup(cp, _dto(studyState=state))
+    patch = _patch(cp, _problem(400, "Only a DISABLED or REJECTED study can be deleted."))
+
+    result = _invoke("delete", "globo", STUDY_ID, "--yes")
+
+    assert result.exit_code == 1
+    assert patch.call_count == 1
+    assert "Error: Only a DISABLED or REJECTED study can be deleted. (HTTP 400)" in result.output
+    assert HINT in result.output
+
+
+@pytest.mark.parametrize("state", ["DISABLED", "REJECTED", "FINALIZED", "ARCHIVED"])
+def test_delete_refused_in_other_states_has_no_hint(
+    cp: respx.MockRouter, ops: store.Identity, state: str
+) -> None:
+    _lookup(cp, _dto(studyState=state))
+    _patch(cp, _problem(400, "Refused."))
+
+    result = _invoke("delete", "globo", STUDY_ID, "--yes")
+
+    assert result.exit_code == 1
+    assert "Error: Refused. (HTTP 400)" in result.output
+    assert "--disable" not in result.output
+
+
+@pytest.mark.parametrize("status", [403, 409])
+def test_delete_hint_is_only_for_a_400(cp: respx.MockRouter, ops: store.Identity, status: int) -> None:
+    _lookup(cp, _dto(studyState="ACTIVE"))
+    _patch(cp, _problem(status, "Refused."))
+
+    result = _invoke("delete", "globo", STUDY_ID, "--yes")
+
+    assert result.exit_code == 1
+    assert f"Error: Refused. (HTTP {status})" in result.output
+    assert "--disable" not in result.output
+
+
 def test_delete_refuses_a_study_in_another_org(cp: respx.MockRouter, ops: store.Identity) -> None:
     _lookup(cp, _dto(organization="acme"))
     patch = _patch(cp)
@@ -591,6 +635,17 @@ def test_add_refuses_a_file_without_an_org_name(
 
     assert result.exit_code == 1
     assert "study.json does not contain an orgName." in result.output
+    assert len(cp.calls) == 0
+
+
+@pytest.mark.parametrize("text", ['[{"orgName": "globo"}]', '"globo"', "42", "null"])
+def test_add_refuses_a_file_that_is_not_a_json_object(
+    cp: respx.MockRouter, ops: store.Identity, tmp_path: Path, text: str
+) -> None:
+    result = _invoke("add", "globo", str(_study_file(tmp_path, text=text)))
+
+    assert result.exit_code == 1
+    assert "study.json must contain a JSON object." in result.output
     assert len(cp.calls) == 0
 
 

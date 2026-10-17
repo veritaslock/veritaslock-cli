@@ -70,14 +70,15 @@ def add(
             payload = get_json(file)
         except json.JSONDecodeError as e:
             raise CliError(f"Invalid JSON: {file.name} - {e.lineno}:{e.colno}")
-        if isinstance(payload, dict):
-            file_org_name = payload.get("orgName")
-            if file_org_name != org:
-                if file_org_name is None:
-                    msg = f"{file.name} does not contain an orgName."
-                else:
-                    msg = f"orgName in file ({file_org_name}) does not match {org} specified on cmd line."
-                raise CliError(msg)
+        if not isinstance(payload, dict):
+            raise CliError(f"{file.name} must contain a JSON object.")
+        file_org_name = payload.get("orgName")
+        if file_org_name != org:
+            if file_org_name is None:
+                msg = f"{file.name} does not contain an orgName."
+            else:
+                msg = f"orgName in file ({file_org_name}) does not match {org} specified on cmd line."
+            raise CliError(msg)
 
         result: dict[str, Any] = auth.authed_call(
             caller,
@@ -320,10 +321,18 @@ def delete(
             event_id = study_dto["eventId"]
 
             delete_patch: dict[str, Any] = {"deleted": True}
-            auth.authed_call(
-                caller,
-                environment.idp_base_url,
-                lambda c: c.patch(f"/v1/studies/{event_id}", params={"studyId": study_id}, json=delete_patch),
-                environment.cp_base_url
-            )
+            try:
+                auth.authed_call(
+                    caller,
+                    environment.idp_base_url,
+                    lambda c: c.patch(f"/v1/studies/{event_id}", params={"studyId": study_id}, json=delete_patch),
+                    environment.cp_base_url
+                )
+            except api.ApiError as exc:
+                # The state from the resolve step only words the error; the CP decides.
+                if exc.status_code == 400 and study_dto["studyState"] in ("ACCEPTED", "ACTIVE"):
+                    raise CliError(
+                        f"{exc}\nTo delete it, first run: vl study update {org} {study_id} --disable"
+                    ) from exc
+                raise
             note(f"Study {org}/{study_id} was deleted.")
