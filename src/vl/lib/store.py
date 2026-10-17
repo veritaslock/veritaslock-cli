@@ -972,7 +972,8 @@ def resolve_identity(environment: str, explicit_label: str | None) -> Identity:
         if row is None:
             raise NoResolvedIdentityError(
                 f"No identity selected for environment {environment!r}. Pass "
-                f"`--as <label>`, set VL_IDENTITY, or run `vl identity use <label>`."
+                f"`--as <label>`, set VL_IDENTITY, or run `vl usr-acct use <username>` "
+                f"(or `vl svc-acct use <label>`)."
             )
         return _row_to_identity(row)
 
