@@ -1,206 +1,287 @@
-# veritaslock-cli (`vl`) — Command Restructure
+# veritaslock-cli (`vl`) — Phase 7: `vl node`
 
-**Status:** Implemented.
-**Not a design change** to what the commands *do* — a rename of the command surface
-for consistency, plus one auth-model unification. The earlier phase specs
-(`vl-identity-user-spec.md`, `vl-service-account-spec.md`, `vl-org-spec.md`,
-`vl-team-spec.md`) still hold for behaviour, schema, and rationale; only the
-command *names* and `vl org`'s auth flow changed. This document is the mapping.
+**Status:** Draft for implementation
+**Part of:** the larger `vl-cli-phase1-crud-spec.md` effort, broken out as its own standalone document.
+**Depends on:** `vl-env-spec.md` (Phase 1, for `environment`, including `token_url`/`schema_reg_url`/`kafka_bootstrap` — this document consumes that schema as-is, no longer extends it), `vl-service-account-spec.md` (Phase 4, for `identity`/`svc_acct` — `vl node create` creates a `NODE`-role service account via the same code path `vl svc-acct add` uses, not a parallel one), `vl-org-spec.md` (Phase 2, for the `organization` cache table `node.org_name` FKs against), `vl-org-phase2-spec.md` §8 (the org-scoped `start`/`stop`/`reset` orchestration built on top of this document's `vl node` verbs — not yet merged into `vl-org-spec.md` itself, see that document's own scope note).
+**See also:** `cp-node-identity-spec.md` — the control-plane redesign (`(org_id, org_node)` identity, idempotent registration, the `(org_id, org_node)`-keyed status lookup `vl` now uses instead of `(host, port)`) this document's `org_node` column is shaped around; `verilock-node-startup-spec.md` — the `verilock`-side changes (self-reported `host`, `(org_id, org_node)` lookup at startup, config file rendering) `vl node start`/`stop`/`reset` depend on. Neither is `vl`-side work, but both directly inform what's in this document (§4b, §5.2).
+**Builds on:** `start_test_harness.sh` — this phase re-implements that script's per-node start/stop/reset mechanics (spawn, kill, CP-status check) as the `vl node` verbs, using `store.db` as the source of truth for node identity and configuration instead of files staged under each node's `VERITAS_INSTALL_ROOT`. Fleet-level orchestration (the script's start/shutdown loops and their ordering/stagger) is specced separately in `vl-network-spec.md` (Phase 8) and `vl-org-phase2-spec.md` §8, both built on top of this document's verbs rather than repeating their mechanics.
+**Schema baseline:** current store schema version is `6` (post `vl team` migration). This document bumps to `7`.
 
 ---
 
-## 1. `vl identity` is gone; its verbs move under the two account nouns
+## 1. Scope
 
-`vl identity` was kind-agnostic (a stored credential is "something `vl` can
-authenticate as," user or service account). In practice users think in users and
-service accounts, so it folded into those.
+This document covers:
+- A new `env_kafka_property_override` table — sparse per-environment overrides for the librdkafka consumer/producer properties that ship as a static file in the `verilock` node repo (`enable.auto.commit`, `session.timeout.ms`, etc.); schema only in this phase, not yet consumed (§6 Open Items).
+- A new `node` table — one row per provisioned node, scoped to an org.
+- The `vl node` command group: `create`, `start`, `stop`, `reset`, `list`, `show`. (No `update`/`delete` in this phase — see §6 Open Items.)
 
-| old | new |
-|---|---|
-| `vl identity import --kind USER …` | `vl usr-acct cache --username <u>` |
-| `vl identity import --kind SERVICE_ACCOUNT …` | `vl svc-acct cache --client-id <id> --secret <s> --label <l>` |
-| `vl identity login <username>` | `vl usr-acct login <username>` |
-| `vl identity use <label>` | `vl usr-acct use <username>` / `vl svc-acct use <label>` |
-| `vl identity forget <label>` | `vl usr-acct clear <username>` / `vl svc-acct clear <label>` |
-| `vl identity list` | folded into `vl usr-acct list` / `vl svc-acct list` (see §3) |
-| `vl identity show <label>` | folded into `vl usr-acct show <username>` / `vl svc-acct show <label>` (see §3) |
+**Not covered here:** fleet-level orchestration. `vl org start`/`stop`/`reset` is specced in `vl-org-phase2-spec.md` §8, and `vl network start`/`stop`/`reset` in `vl-network-spec.md` (Phase 8) — both are thin orchestration layered on top of this document's `vl node` verbs, kept in their own documents so `vl org`'s and `vl network`'s command surfaces are each documented in one place.
 
-- `import` → **`cache`**: it stores a *copy* of the account locally (identity row +
-  credential + cached memberships), not a pointer — `cache` says that; `import`
-  was too generic and `link` implied a reference.
-- `forget` → **`clear`**: pairs with `cache`.
-- `login` stays: it *is* "authenticate to establish a token," and unlike `cache`
-  it does **not** persist the password. `vl svc-acct` has no `login` (service
-  accounts have no token-only tier).
-- `--kind` disappears — the noun carries it.
-- The `identity` table (and `user_acct` / `svc_acct` / `org_membership` /
-  `token_cache`) are unchanged. The user just never types "identity" any more.
+**Explicitly out of scope:** `send_events.sh`'s migration (staying bash for now, ported to read `store.db` directly rather than hardcoded paths — separate, independent effort), and any Docker-based node runtime (the filesystem-rooted `$HOME/orgs/<org>/nodes/node<n>` layout below is understood to be transitional).
 
-## 2. `vl user` → `vl usr-acct`, `vl service-account` → `vl svc-acct`
+**Planned fast-follow, not part of this phase:** remote node execution via SSH — running these same verbs against a node on another machine, given network connectivity and a pre-established SSH keypair. §7 lays out the direction — note that it now needs an address field `vl` doesn't otherwise carry (§4b dropped `host` from this document's schema), since SSH administration and CP-registered runtime address turn out to be different concerns; see §7's revised note.
 
-3-char prefixes on both, symmetry with the store table names. Every subcommand
-from the phase specs keeps its name under the new noun (`add`, `show`, `list`,
-`update`, `delete`, `get-assertion`, …), and its behaviour except where noted
-here: `list` / `show` default to the local view (§3), and `usr-acct add` took a
-new argument shape (`vl-identity-user-spec.md` §9.1 — `<username>` positional,
-`--email` required, `--role` optional defaulting to `USER`, `--first` / `--last`
-/ `--password` added). (`svc-acct rotate-keys` was later removed — see
-[svc-acct-key-rotation-gap.md](svc-acct-key-rotation-gap.md).)
+---
 
-`usr-acct` is the canonical noun, but **`user` and `user-acct` are accepted as
-silent synonyms** — the same sub-app is mounted under all three names, with the
-two aliases hidden from `vl --help` and carrying no deprecation notice. `svc-acct`
-has no such aliases.
+## 2. `environment` (no longer extended here)
 
-Every command group (root and nested) uses `HelpOnErrorGroup` (`vl.lib.cli`). Any
-incomplete or wrong invocation — a bare group, an unknown subcommand
-(`vl usr-acct blah`), a leaf command missing a required argument
-(`vl usr-acct login`), an unknown option — prints the failing command's full
-`--help` to stdout and exits `0`, exactly as if `--help` had been passed. No
-usage hint, no red error box, no `Error:` line. `parse_args` handles a group's
-own `no_args_is_help` / option errors; `invoke` on the outermost group handles
-everything raised deeper (unknown subcommand, a leaf command's argument errors)
-as it bubbles up. Only genuine command failures (`report_errors` → `Exit(1)`,
-API/auth/store errors) still exit non-zero.
+`token_url`, `schema_reg_url`, and `kafka_bootstrap` — all `NOT NULL`, required at `vl env add` — are specced in `vl-env-spec.md` §3 as part of the base `environment` schema, not as an addition from this document. (An earlier draft of this document treated them as additive columns layered on top of a Phase 1 baseline that didn't yet have them; that's now resolved upstream, so this document just consumes the six-column URL/bootstrap set as-is: `idp_base_url`, `cp_base_url`, `di_base_url`, `token_url`, `schema_reg_url`, `kafka_bootstrap`.)
 
-**No `--label` for users.** A user's local handle is its **username** — `usr-acct`
-commands take a `<username>` argument, and `cache` / `add` set `identity.label`
-to the username automatically. `svc-acct` keeps `--label` because a service
-account's `principal_name` is its client-id UUID, which isn't a usable handle. The
-`identity` table's `label` column is unchanged.
+## 3. Schema: `env_kafka_property_override`
 
-## 3. `list` / `show` default to the local view
+| Field | Type | Notes |
+|---|---|---|
+| environment_name | text | `REFERENCES environment(name) ON UPDATE CASCADE ON DELETE CASCADE` |
+| key | text | e.g. `session.timeout.ms`, `auto.offset.reset` |
+| value | text | |
 
-`vl usr-acct list` / `vl svc-acct list` and `… show <label>` now show the **local
-cached** view by default — no server call. Flags:
+`PRIMARY KEY (environment_name, key)` — natural uniqueness (no duplicate property per env), and an easy `INSERT OR REPLACE` upsert pattern when seeding or updating.
 
-- `--remote` — the server-side listing / record instead (authenticated).
-- `--all` — the server record merged with local metadata.
-- `--org <name>` (`list` only) — filter by org. On the default local listing:
-  for `usr-acct`, accounts with an `org_membership` in that org; for `svc-acct`,
-  accounts whose `svc_acct.org_name` matches. With `--remote` / `--all` it's
-  resolved to the org's id (`GET /v1/organizations?name=`, public) and sent as
-  the `orgId` query param that `GET /v1/users` and `GET /v1/service-accounts` now
-  accept — for `usr-acct` the server matches any-role membership in that org; for
-  `svc-acct`, the account's flat `orgId`.
+`ON DELETE CASCADE` here (unlike `environment`'s own `RESTRICT` against most referencing tables, §3 of `vl-env-spec.md`) — a property row has no independent meaning without its parent environment, same reasoning as `team_member`'s cascade from `team`.
 
-Both `list`s render an org column in every mode:
+**Overlay, not the full property set.** Almost all of `verilock-kafka-consumer.conf`'s properties are fixed regardless of environment and ship as a static file in the `verilock` node repo (staged to `$HOME/.veritaslock/etc` by that repo's own install target) — this table exists only for the rare property that genuinely needs to differ per environment. A row here means "override this one key's value for this one environment"; an environment with no rows uses the static file entirely as shipped.
 
-- `usr-acct` → `orgs`: every cached `org_membership` for the account, joined as
-  `org:role`. `GET /v1/users` returns no membership data, so on `--remote` /
-  `--all` this is still the local cache and reads `-` for uncached accounts (a
-  dim note says so).
-- `svc-acct` → `org`: the account's one org. On `--remote` / `--all` the row's
-  `orgId` is resolved to a name via a public `GET /v1/organizations/{id}` (memoised
-  per invocation), falling back to the raw id. `svc-acct list` also shows `role`
-  (an `svc_acct.role` column, v8).
+No per-node override in this phase — sparse enough already that a per-node layer isn't warranted; if the need arises, a `node_kafka_property_override` table with the same shape, consulted first and falling back to this one, is a purely additive follow-up.
 
-The `--remote` / `--all` listing for both nouns carries a `cached` column
-(`yes` / `no`) flagging which server rows `vl` has a local credential for.
-`svc-acct` keeps its `label` column alongside it (the local label, `*` if the
-default identity).
+No CLI commands to manage this table in this phase — populated by seed/migration only, per the schema bump noted in the header above. **Not yet consumed by `vl node start` either** — see §6 Open Items. The table exists so the schema is ready whenever an override is actually needed, without a future migration to add it.
 
-`svc-acct list` / `show` on `--remote` / `--all` **backfill the local cache** with
-the server-owned fields (`role`, `key_version`) for any account `vl` already has a
-credential row for — so an account cached before v8 (role `NULL`) self-heals on
-its first server view.
+## 4. Schema: `node`
 
-`vl identity list`'s cross-kind "what can I `--as`?" view is replaced by top-level
-**`vl whoami`** plus the two per-kind local `list`s.
+| Field | Type | Notes |
+|---|---|---|
+| id | integer | `PRIMARY KEY AUTOINCREMENT` — surrogate key |
+| environment_name | text | `REFERENCES environment(name) ON UPDATE CASCADE ON DELETE RESTRICT` |
+| org_name | text | `REFERENCES organization(environment_name, name)` (composite, via `environment_name` above), same pattern as `team.org_name` |
+| org_node | integer | the node's number within its org — `1`, `2`, etc. Not a free-text name (see §4b): this is the same value the control plane addresses the node by (`(org_id, org_node)`, per the CP-side redesign — see `cp-node-identity-spec.md`), so `vl` and the CP always agree on what "node1" means without any parsing or translation between them |
+| host | text | nullable, no default, **not populated or used by any `vl node` command in this phase**. Reserved for the planned SSH fast-follow (§7); left in the schema deliberately rather than added back later — see §4b |
+| svc_acct_id | integer | `NOT NULL`, `REFERENCES svc_acct(identity_id) ON DELETE RESTRICT` — the `NODE`-role service account created alongside this row (§5.1); named for the table it points at, even though the column it targets is `svc_acct.identity_id` (that table's PK, `vl-service-account-spec.md` §2). `client_id`, and the node's keypair (`svc_acct.private_key_path`/`public_key_path`), are read via this FK, not duplicated onto `node` |
+| port | integer | `NOT NULL` — auto-assigned starting at `7001`, globally unique across the *entire store* (every node, in every org and every environment — see §4b), not just within one environment; overridable via `--port` at creation |
+| pid | integer | nullable — set on successful `start`, cleared on `stop`/detected-dead |
+| state | text | `NOT NULL DEFAULT 'NEW'`, `CHECK (state IN ('NEW', 'RUNNING', 'STOPPED'))` |
+| created_at | text | ISO8601 |
 
-### `vl whoami` output
+`UNIQUE (environment_name, org_name, org_node)`.
 
-A single row (no server call), fields:
+`ON DELETE RESTRICT` on `svc_acct_id` (rather than `CASCADE`, unlike most of this store's identity-owned children) — a `node` row is the more significant, longer-lived record here; deleting the underlying service account out from under an existing node should fail loudly rather than silently orphan the node's credentials. There's no `vl node delete` in this phase (§6, item 3) to make this concrete yet, but the constraint is worth setting correctly now rather than defaulting to `CASCADE` and revisiting later.
 
-| field | value |
-|---|---|
-| `environment` | the resolved target environment |
-| `acting_as` | the resolved identity's label (or a "(none — …)" hint if nothing resolves) |
-| `kind` | `USER` / `SERVICE_ACCOUNT` (`-` if none) |
-| `org` | the identity's **default org** (§3a), or a hint: `(none or ambiguous — pass --org)` for a user, `(unknown — re-cache the account)` for a service account |
-| `role` | the identity's role in that org, from the cached `org_membership` row; `-` for a service account or when there's no single default org |
+`state` is tracked as an explicit column rather than derived purely from `pid IS NOT NULL` — mildly redundant, but makes `WHERE state = 'RUNNING'` queries and CLI table output direct, and leaves room for a future state (`CRASHED`) without a schema change. `vl` is the sole writer of `pid`/`state`, and the only things it ever writes into them are what it can verify itself about a process it spawned on this machine — including correcting a `RUNNING` row whose process has gone (§4c). It never imports the control plane's view into these columns; that view is only ever *displayed* alongside them (§4c, §5.5). A node started or killed outside `vl` (e.g. under a debugger, per §5.3) is still not tracked by this bookkeeping, but it is no longer silent: it is reported (`UNMANAGED`, `REMOTE`).
 
-`--as <label>` resolves as if that identity were selected. There is **no**
-`idp_base_url` field (dropped — it's environment config, not identity state).
+**`NEW` is distinct from `STOPPED`**, not a synonym for it: a node's control-plane counterpart doesn't exist until `vl node start` actually runs it for the first time — the CP has no row for a node that's only ever been `vl node create`d — so `STOPPED` (which implies "was running, isn't now") would be a misleading state for a node that has never been started at all. `NEW` is the only state set by `create` (§5.1); `start`'s first successful run (§5.2) is what transitions a node out of `NEW` for good, to `RUNNING`, and it never returns to `NEW` afterward — `STOPPED` (from `stop`, §5.3) is the only state a subsequent `start` finds it in. `vl node reset` (§5.4) treats `NEW` as a special case (see that section) since there's no CP-side node yet to check status against.
 
-## 3a. Default org
+**`vl node start` (§5.2) never needed `host` for spawning** — spawning is always local to the machine `vl` runs on in this phase (`subprocess.Popen`, no remote-exec support). None of `vl node`'s CP status lookups (`stop`/`reset`, §5.3–§5.4) use it either — those query the CP by `(org_id, org_node)` instead, which `vl` already has locally without needing to track where `verilock` last registered from. `host` stays on the table only as a reserved, currently-unused column (§4b) — not read or written by anything in this phase.
 
-An identity has an implicit **default org**: a `SERVICE_ACCOUNT`'s single org, or a
-`USER`'s sole cached `org_membership` (none if it has zero or several). Implemented
-as `store.default_org_for_identity()`. `vl whoami` shows it, and `--org` on
-`vl usr-acct add` / `vl svc-acct add` is now optional — omitted, it uses the
-acting identity's default org (clear error if that's ambiguous). `vl org` still
-takes a positional `<org>`; so do `vl team add` / `show` / `update` / `delete`,
-but **`vl team list` dropped it** — see §6.
+### 4b. `org_node` and `host` — corrections from an earlier draft of this document
 
-## 4. `vl org` uses the resolved identity like everything else
+Two decisions in an earlier version of this schema turned out to be wrong once the control-plane side was thought through properly (see `cp-node-identity-spec.md` for the full CP redesign this section summarizes the `vl`-side consequences of):
 
-`vl org add` / `update` / `members …` dropped `--auth-user` / `--auth-password`
-(the interim pre-Phase-3 flow, `vl-org-spec.md` §5) and now authenticate as the
-`--as` / `VL_IDENTITY` / default identity, same as `vl usr-acct` / `vl svc-acct` /
-`vl team`. `vl org show` / `list` stay unauthenticated.
+**`host` defaulting to `127.0.0.1` was a real bug, not a placeholder.** The CP's own node table holds a real, routable IP — other nodes pull snapshots from each other over REST using exactly that address, so a same-machine-only default would silently work in dev and then either fail or connect to the wrong process the moment two nodes are ever on separate hosts. `vl` has no way to know a node's real address before that node has actually bound to a socket and discovered it for itself.
 
-## 5. `vl events` removed
+**`vl` doesn't need `host` for anything active in this phase.** The only reason `vl` needed `host` locally at all was to build the CP status query (`GET /nodes?host=&port=`, `stop`/`reset`). The same `(org_id, org_node)` addressing that fixes the CP's duplicate-row bug (`cp-node-identity-spec.md` §2) gives `vl` a strictly better way to ask the CP about a node's status — `org_id` is already sitting in the local `organization` cache (`server_org_id`), and `org_node` is a column `vl` already owns, so there's no functional need to also track `host` just to look a node up. And `vl` structurally *can't* keep it current even if it wanted to: the config handoff to `verilock` is one-directional (`vl` renders files, `verilock` reads them, §5.2) — there's no path back for `verilock` to tell `vl` what address it registered under, short of `vl` polling the CP for it, which is just the status query working backwards.
 
-Out of scope for this version; may return. `commands/events.py` and the
-now-orphaned `lib/config.py` were deleted. The `environment.kafka_bootstrap`
-column and `vl env --kafka` stay (forward-looking, per `vl-env-spec.md` §3).
+**`host` stays on the table anyway, reserved and unused, rather than being removed** — a deliberate call, not an oversight: it's earmarked for the SSH fast-follow (§7), and re-adding a dropped column later is more work than leaving an unused nullable one in place now (SQLite's `ALTER TABLE` didn't support `DROP COLUMN` until 3.35 — removing it today and re-adding it later could mean a full table-rebuild migration rather than two simple `ALTER TABLE`s). `host` still matters *to the CP* (and to other nodes, for snapshot pulls) — it just isn't data `vl` itself reads or writes in this phase.
 
-## 6. `vl team` trimmed to the team resource itself
+**A free-text `--name` was incompatible with a stable server-side identity.** The original design let `vl node create` accept an arbitrary `--name` (`primary`, not just `node<N>`), with auto-numbering skipping anything that didn't fit the pattern when computing the next default. That's no longer workable: the CP-side redesign addresses a node by `(org_id, org_node)` — a numeric index — specifically to fix the bug where the same logical node re-registered as a brand-new CP row every time it started from a different host (see `cp-node-identity-spec.md` for why). A node named `primary` has no number to give the CP. The `org_node` column replaces free-text `name` outright, and `--node <n>` (an integer override, same shape as `--port <n>`) replaces `--name`.
 
-The `members` and `ingest-clients` sub-groups were **removed** from `vl team` —
-it's now just `add` / `show` / `list` / `update` / `delete`. This supersedes
-`vl-team-spec.md` §5.7 entirely and reshapes §5.6. The server endpoints and the
-local `team_member` table are untouched.
+**Port allocation stays environment-agnostic, but for a corrected reason.** `MAX(port)+1` across the *entire store* — not scoped to one environment — because port uniqueness is protecting a physical, single-machine resource (`store.db` describes exactly one host, per its own "local-only" design), and two nodes from *different* environments can absolutely be started concurrently on that one machine. Node *identity*, by contrast, stays scoped per-`(environment_name, org_name)` — `local`'s GLOBO node1 and `dev`'s GLOBO node1 are legitimately two different rows with two different service accounts, since a service account is credentials against one specific IdP instance and there's no version of "shared identity" that doesn't also require sharing credentials across IdPs that don't know about each other. Only the port check is store-wide; everything else about a node's identity stays environment-scoped as originally designed.
 
-**`vl team-member` came back as a top-level command, peer to `vl team`** — a
-trimmed replacement for the old `vl team members` sub-group, with just two verbs:
+One acknowledged, accepted gap, carried over from the same principle the spec already applies to an explicit `--port` override (§5.1 step 2): `store.db` only has visibility into nodes *it* created. If a genuinely different machine runs its own `vl` against its own `store.db` for the same environment, neither store can see the other's port assignments — auto-assignment is a same-machine convenience, not a distributed guarantee, and the real protection against two nodes colliding at the same reachable `host:port` lives entirely in the CP's `(org_id, org_node)` + `409`-if-not-`DOWN` check (`cp-node-identity-spec.md`), not in anything `vl` does locally.
 
-- `vl team-member list <team> [--org <name>]` — the team's members, each `userId`
-  resolved to a `username` from the team org's user list (then `vl`'s local
-  cache, then the raw id). Bulk-refreshes the local `team_member` cache.
-- `vl team-member add <team> <username> [--role TEAM_ADMIN|TEAM_MEMBER] [--org <name>]`
-  — `POST /v1/teams/{id}/members`. The user must already belong to the team's
-  org; `vl` pre-checks that against `GET /v1/users?orgId=` before the call and
-  the server enforces it too (`TeamService.addMember`).
+### 4c. Process liveness, repair on read, and displayed state
 
-Both address the team by **name alone**, resolved across the caller's orgs the
-same way `vl team list` scopes (every org for a PLATFORM_ADMIN); `--org`
-disambiguates when several match. There is no `set-role` / `remove` — `--role` on
-`add` is the only role control for now. `team add` still writes the creator's
-`TEAM_ADMIN` row locally (`vl-team-spec.md` §5.1).
+`node.state` records what `vl` knows about *a process it spawned on this machine*. The control plane independently records what the *network* knows about the logical node (`UP`/`STANDBY`/`DOWN`, and where it last ran). Neither is a superset of the other, and they legitimately disagree — after a reboot, when heartbeats stop, when a node is started elsewhere or under a debugger. This section defines how `vl` reconciles them **without ever importing the CP's view into the columns it owns**: it repairs only what it can verify itself, and *displays* the rest.
 
-**`vl team list` dropped its `<org>` argument** (supersedes `vl-team-spec.md`
-§5.3). Scope now follows the caller's role, read from the `orgs` claim in their
-token (the same claim the IdP's `OrgStandingResolver` reads, so `vl`'s view
-matches the server's authorization view):
+**What `/proc` is.** `/proc` is **not** a control-plane endpoint, and reading it involves no network call. It is a virtual filesystem the Linux kernel exposes: every running process has a directory `/proc/<pid>/`, and the files in it describe that process, read live from the kernel. `vl` reads them with ordinary file reads on the machine it runs on. That is why these checks are Linux-only (§6, item 8), and why they can answer "is this pid really our node?" without asking anyone. The files used here (the exact reads are in `vl.lib.proc`):
 
-- a **PLATFORM_ADMIN** entry (grants admin standing on every org) → list every
-  organization's teams: page through the public `GET /v1/organizations`, then
-  `GET /v1/teams?orgId=` per org.
-- otherwise → one `GET /v1/teams?orgId=` per org in the caller's `orgs` claim
-  (any-role membership, so a `KEY_READER`-only org is included — it still passes
-  the endpoint's `requireOrgMember` guard).
+| File | Contains | Used for |
+|---|---|---|
+| `/proc/<pid>/exe` | a symlink to the executable the process is running | *our process*: does it resolve to this node's own `<node_root>/bin/verilock`? |
+| `/proc/<pid>/comm` | the process's short name, for example `verilock` | *the CP's process*: is it named `verilock`? |
+| `/proc/<pid>/stat` | the process's state and start time | the zombie check (state `Z`), and the process's age for `STARTUP_GRACE_SECONDS` |
 
-Both render an `org` column. `--name <filter>` is still accepted and is passed to
-each per-org call. A token with no `orgs` claim (a service account) lists nothing.
+A missing `/proc/<pid>/` directory means the process doesn't exist. To see what `vl` sees from a shell: `ls -l /proc/<pid>/exe`, `cat /proc/<pid>/comm`, `grep '^State' /proc/<pid>/status`. The control plane enters this section only through its own `NodeDto` (below), never through `/proc`: the computed states come from combining what the CP says about a node with what `/proc` says about a process on this machine.
 
-## 7. `vl org members` split into a top-level `vl org-members`, same shape as §6
+**Liveness.** Two checks, deliberately different:
 
-The nested `members` sub-group under `vl org` was **removed**; its four verbs
-moved unchanged to a new top-level command, peer to `vl org` — the same
-restructure §6 already did for `vl team` / `vl team-member`. This supersedes
-`vl-org-spec.md` §4.5-§4.7a's command names (behaviour, endpoints, and request
-shapes are otherwise unchanged).
+- *Our process* (the `pid` in this row): the process exists, is not a zombie, and its executable is this node's own `<node_root>/bin/verilock` (`/proc/<pid>/exe`). A bare `kill -0` isn't enough: after a reboot pids get reused, and a stale `pid` can belong to an unrelated process — `kill -0` succeeds on it, and `vl node stop` (§5.3) would then signal a stranger. A pid that is alive but *not* ours is treated as stale, exactly like a dead one, and is never signalled.
+- *The CP's process* (the pid in the CP's `metadataJson`, used only to recognise a node started outside `vl`): the process exists, is not a zombie, and its name is `verilock` (`/proc/<pid>/comm`). The executable path isn't required — a node run from a build directory or under a debugger won't be under any `<node_root>`.
 
-- `vl org-members add <org> --user-id <id> --role <role> [--org's --as/--env]`
-- `vl org-members list <org>`
-- `vl org-members set-role <org> <user-id> --role <role>`
-- `vl org-members remove <org> --user-id <id>`
+Where `/proc` is unavailable, both degrade to `kill -0` alone, accepting the pid-reuse weakness (§6). A process's age is then unknown, so the `STARTUP_GRACE_SECONDS` suppression doesn't apply, and `UNREGISTERED` can appear briefly while a node starts.
 
-Unlike the `vl team` split, there was no name-resolution logic to carry over —
-an org is addressed directly by name (`resolve_org`), not searched for across
-the caller's orgs the way a team is — so `vl org-members` is a straight lift of
-the old `members_app` commands into `src/vl/commands/org_members.py`, mounted
-on the root app as `org-members`. `vl org`'s own commands (`add`, `show`,
-`list`, `update`) are unaffected.
+**Repair (persisted, no CP call).** Whenever `vl` reads a row with `state = 'RUNNING'` whose `pid` fails the *our process* check, it sets `state = 'STOPPED'` and clears `pid` — the same correction `vl node stop` already makes at §5.3 step 2, now also applied on the read path (`list`, `show`), so a reboot doesn't leave rows claiming `RUNNING` until someone happens to run `stop`. It is a fact `vl` verified about a process it spawned, not a CP-derived value, so it works when the CP is unreachable.
+
+**Displayed state (computed, never stored).** After the repair, if the CP is reachable and has a row for this node, `vl` may *display* something other than the stored state. Inputs: the stored `state`/`pid`, and from the CP's `NodeDto` (`cp-node-identity-spec.md` §2.5) its `state`, `host`, and pid (parsed from `metadataJson`, below). Two derived facts: **on this machine** — the CP's `host` equals this machine's hostname or any address on any of its interfaces (read with `SIOCGIFADDR` for each interface's primary IPv4 address and `/proc/net/if_inet6` for IPv6: Linux only, like the `/proc` checks, and secondary IPv4 aliases are not seen); and **pids agree** — the CP's `host` is this machine *and* its pid equals the stored `pid` (pid numbers from another machine aren't comparable, so a foreign host always means "differ").
+
+| Stored | CP state | Condition | Displayed |
+|---|---|---|---|
+| `RUNNING` | `DOWN` | pids agree | `NO_HEARTBEAT` |
+| `RUNNING` | `DOWN` | pids differ | `UNREGISTERED` |
+| `RUNNING` | `UP`/`STANDBY` | pids differ | `UNKNOWN` |
+| `NEW`/`STOPPED` | `UP`/`STANDBY` | CP host is not this machine | `REMOTE` |
+| `NEW`/`STOPPED` | `UP`/`STANDBY` | CP host is this machine, and the CP's pid passes the *CP's process* check | `UNMANAGED` |
+| anything else | | | the stored state |
+
+"Anything else" deliberately covers: a healthy node (`RUNNING` against `UP` with agreeing pids); a node the CP has no row for (`NEW` before its first start); stored `STOPPED` against a CP `UP` whose pid is *not* alive here (the CP simply hasn't noticed yet — see Timing); and every row when the CP is unreachable.
+
+- `NO_HEARTBEAT` — this node's process is alive here, but the CP has marked it `DOWN`: it stopped heartbeating (wedged, or cut off from the CP).
+- `UNREGISTERED` — a process `vl` started is alive here, but it isn't the process the CP knows for this logical node, which the CP shows as `DOWN`.
+- `REMOTE` — the CP shows this logical node `UP` on another machine.
+- `UNMANAGED` — the CP shows it `UP` on this machine, from a process `vl` didn't start (e.g. under a debugger).
+- `UNKNOWN` — the two views disagree in a way not classified above. The placeholder for whatever isn't handled yet; expected to shrink as cases are understood and given their own labels.
+
+**Timing.** The CP marks a node `DOWN` 30–35 seconds after its last heartbeat, whether the CP restarted or only the node died (`cp-node-identity-spec.md` §2.3, confirmed live: a killed node's row stayed `UP` for 33.2s past its last heartbeat before flipping) — so after an unclean death the CP still says `UP` for up to ~35 seconds, and the table shows the stored state (typically the just-repaired `STOPPED`) for that window rather than guessing.
+
+Separately, a node's `host` is written at *registration* and its pid only later — at `/standby` if it's behind the network, otherwise at `/up` — measured at 60–200ms apart on a caught-up node, with no dependence on chain length; nothing between registration and whichever of the two fires scales with it. `UNREGISTERED` is the only label this gap can produce: it needs a live local process paired with a CP pid that isn't ours, and for that brief window the CP has no pid at all for this row. `NO_HEARTBEAT` and `UNKNOWN` both need the CP's pid to already equal a *specific* value (ours, or some third one) — whichever endpoint fires writes ours in one step, so there's no window where the CP holds any other live pid for a normal start. So only `UNREGISTERED` is suppressed, for a process younger than `STARTUP_GRACE_SECONDS`, currently `10` — several times the measured gap.
+
+**A node behind the network reports `STANDBY` — with the current pid already written — *before* catching up, not after**, which is what keeps a long catch-up from being mistaken for a problem: an earlier draft of this section treated an unbounded snapshot pull as an accepted, unsolved limitation of the grace period, because the row used to stay `DOWN` with no live pid for the whole pull. That's fixed at the source now, not worked around here — `/standby` (`cp-node-identity-spec.md` §2.6) is called synchronously before catch-up begins, whether that catch-up is a snapshot pull or ordinary replay, and heartbeats start at that point too, so the row never goes stale no matter how long catch-up takes. The table already treats `UP`/`STANDBY` alike and the pids agree throughout, so a node that's still catching up produces no label at all — correctly, since nothing is actually wrong. One measured replay (under the 360-block threshold, so no snapshot pull involved) went `STANDBY` immediately, stayed there while replay ran, and reached `UP` at +2.1s; the `STANDBY` phase itself is unbounded exactly like a snapshot pull, and is equally covered by this fix, not measured separately.
+
+Two failure windows, neither producing a false label, both because every label in the table needs a *live* local process to compare against:
+- **Before `/standby`/`/up` ever succeeds** (a `409`/`404` at registration, or a crash before the first of the two calls) — the row is left indefinitely holding the new `host` with the previous run's pid and `DOWN`.
+- **After `/standby` succeeds but catch-up subsequently fails** — the node shuts itself down rather than heartbeat as `STANDBY` forever (`verilock-node-startup-spec.md` §2.2 step 6). The row is left `STANDBY` (bucketed with `UP`) holding the *current* run's pid, correctly written — but that process no longer exists. The repair (above) marks the local row `STOPPED`; the CP's pid then fails the *CP's process* check (nothing alive to match), so this falls to "anything else" and simply shows `STOPPED`, not a label.
+
+Process start time comes from `/proc`, so no column is needed.
+
+**The CP's pid is a string inside a JSON string** (`{"pid": "<n>"}`). Parse leniently; null, missing, or unparseable means an unknown pid, which never agrees with anything (a node registered but not yet up, for instance).
+
+**Why the labels aren't stored.** They depend on the process table, the CP row, and a 30-second timer, all of which change without `vl` doing anything; nothing would refresh a stored label between invocations, and the next `list` would recompute it regardless. It is the same reason the earlier `cp_state`/`cp_state_synced_at` columns were dropped. So the `state` CHECK stays three-valued, `start`/`stop`/`reset` and the org/network orchestration never see these labels (they act on stored state plus their own live checks), and none of this changes the schema.
+
+---
+
+## 5. Commands: `vl node`
+
+Every verb below also accepts `--help` explicitly (in addition to the existing "missing required argument prints help" behavior, `vl-command-restructure.md` §2) — a user can request it directly rather than only getting it by omitting something.
+
+### 5.1 `vl node create <org> [--node <n>] [--port <n>] [--as <label>] [--env <env>]`
+
+`<org>` positional, not `--org` — matching `start`/`stop`/`reset` (§5.2–§5.4, which already take `<org> <n>` positionally) and `vl team add <org> <name>` (`vl-team-spec.md` §5.1) elsewhere in this project. An earlier draft of this command used `--org <org>` as a required option, inconsistent with both.
+
+No `--host` — per §4b, `vl` doesn't track `host` for any node in this phase; the column stays `NULL` on every row `create` inserts.
+
+1. Resolve the node's number: if `--node` is omitted, one greater than `MAX(org_node)` for this org (including deleted nodes — gaps from deletion are not reused, and avoids confusion if a deleted node's old directory/logs are still on disk). `--node` accepts any positive integer as an override, same shape as `--port`.
+2. Resolve `<port>`: if omitted, one greater than `MAX(port)` across the entire store — every node, in every org and every environment (§4b) — starting from `7001` if none exist yet. Explicit `--port` overrides and is not validated for uniqueness in this phase — an operator-supplied collision is the operator's problem, same principle as everywhere else `vl` doesn't pre-check what the server (or, here, the OS) will reject anyway.
+3. **Check `$HOME/orgs/<org>/nodes/node<n>` doesn't already exist.** If it does, abort immediately — no service account created, no `node` row, nothing touched — with a clear error (`$HOME/orgs/<org>/nodes/node<n> already exists — remove it manually before creating this node. It may hold stale identity/data from a previous incarnation of this node (e.g. after a control-plane reset); deleting it here automatically, silently or otherwise, risks removing something the operator didn't mean to lose, so this is left to a deliberate manual step rather than any kind of automatic cleanup.`). This check runs *before* step 4, specifically so a collision here can never leave an orphaned service account behind with no corresponding node — the same "any failure leaves nothing behind" guarantee step 4 already promises on its own account, just extended to cover this failure mode too.
+4. Create a `NODE`-role service account, calling the same underlying function `vl svc-acct add` uses (not a parallel implementation) — if this step fails, abort with no `node` row and no directory created.
+5. Create `$HOME/orgs/<org>/nodes/node<n>` on disk (hardcoded root for this phase — see §6 Open Items; not read from config or the store). Step 3 already guarantees this can't collide with an existing directory.
+6. Insert the `node` row: `svc_acct_id` from step 4's resulting `svc_acct` row, `org_node` from step 1, `host = NULL`, `pid = NULL`, `state = 'NEW'`.
+
+No caller-kind pre-check beyond what step 3's underlying service-account creation already enforces — same governing principle as `vl team add` (`vl-team-spec.md` §5.1) and `vl svc-acct add`'s own precedent.
+
+### 5.2 `vl node start <org> <n> [--env <env>]`
+
+> **Pending change:** state-changing commands will require an operator identity and a role check (`vl-authorization-spec.md`). This section describes the behavior until that is built.
+
+No `--as` — nothing in this command calls the CP or IdP; it's a local spawn plus local `store.db` writes. (`create`, §5.1, is the only `vl node` verb that still takes `--as`, since it's the only one that calls the IdP as an operator.)
+
+No `--profile` flag, and `verilock` is spawned with no arguments at all — an earlier draft of this document assumed `verilock` needed to be told which environment to read via `--profile`, on the assumption that it would pull its own config from `store.db` given that hint. Since config is instead fully rendered to files *before* `verilock` ever starts (step 2 below), there's nothing left for a `--profile` flag to select — `verilock` just reads whatever `vl` already wrote for the `--env` this `start` invocation targeted. `--env` itself still defaults the normal way (§6 of `vl-env-spec.md` — the store's default environment if omitted).
+
+1. **Pre-check:** if the node's `state = 'RUNNING'` and `pid` is alive and is this node's own process (§4c), print `node1 is already running (pid <pid>)` to stdout and return normally — **not** a raised error, at either the single-node CLI level or the underlying function level. This distinction matters beyond just this one command's own exit code: `vl org start` (`vl-org-phase2-spec.md` §8) calls this same per-node logic directly, in a loop, and relies on it *not* raising here so one already-running node doesn't abort the rest of the batch — see that document's own note on this. `vl network start` (`vl-network-spec.md` §3.1) inherits this in turn, one layer up, by calling `vl org start` per org rather than this command directly. `verilock` also refuses to double-start on its own, but checking first here avoids the wasted setup/spawn/log-parse cycle below and gives a clearer message.
+2. **Setup** (idempotent — re-run unconditionally on every start, matching current script behavior):
+   - Copy `$HOME/.veritaslock/bin/*` → `<node_root>/bin`, `chmod +x`.
+   - Copy `$HOME/.veritaslock/lib/liblog4cplus.so*` → `<node_root>/lib` (in-tree dependency, not a system package — `verilock` aborts on startup without it).
+   - Copy `$HOME/.veritaslock/etc/log4cplus.properties` → `<node_root>/etc`, verbatim.
+   - Copy `$HOME/.veritaslock/etc/verilock-kafka-consumer.conf` → `<node_root>/etc`, verbatim — no per-environment overlay applied in this phase (`env_kafka_property_override`, §3, is schema-only for now).
+   - `study-samples` is **not** copied per node — `verilock` reads it directly from `$HOME/.veritaslock/etc/study-samples` in place, same as `start_test_harness.sh` does today, since its contents don't differ per node.
+   - Write `client_id` (from the node's `svc_acct` row) as a flat file to `<node_root>/identity/client_id` — not part of `veritas-lock.conf`. `client_secret` is **not** written here at all: the node authenticates to the IdP via a private-key-signed JWT assertion (the same mechanism `vl svc-acct get-assertion` uses, `vl-service-account-spec.md` §5.7), not a client secret, so there's no secret for `verilock` to read.
+   - Symlink (not copy) the node's own keypair — already generated at `vl node create` time via the same underlying logic `vl svc-acct add` uses (`vl-service-account-spec.md` §4 step 6), at `svc_acct.private_key_path`/`public_key_path` (`~/.config/vl/keys/<client_id>/{private,public}.key`) — to `<node_root>/identity/private.key` and `<node_root>/identity/public.key`. Symlinked, not copied, specifically to support key rotation transparently: overwriting the contents of the canonical file under `~/.config/vl/keys/<client_id>/` (a future rotate-keys command, not yet specced) is picked up by `verilock` the next time it signs an assertion, with no need to re-run `vl node start` to refresh a stale copy.
+   - `vl` writes/symlinks exactly these three entries (`client_id` as a flat file, `private.key`/`public.key` as symlinks) into `<node_root>/identity/` on every start and touches nothing else there — `node.id` is `verilock`'s own. `metadata.json` (a display-name/description/role file the old provisioning script used to write, purely as human-readable documentation — never read by `verilock` itself) is deliberately **not** written by `vl` in this phase: that same information already lives in `store.db` via the node's `svc_acct` row, so a separate static file would just be a second, driftable copy of it. Revisit only if something's found to actually depend on the file existing.
+   - Render `veritas-lock.conf` (env URLs, `org.node`, `port`) to `<node_root>/etc`, fresh on every start, fully from `store.db` — this is the step that makes `--profile` unnecessary (see above), and the only one of these files `vl` generates rather than copies. `org.node`'s value comes from the node's `org_node` column (§4) — the `.`-separated property name is just this file's own naming convention, matching every other property in it; it isn't a schema or column rename. `org_id` is deliberately not part of this file — `verilock` gets it from the JWT claim when it authenticates to the IdP, not from config (`verilock-node-startup-spec.md` §2.1). Full file format detail in `verilock-node-startup-spec.md` §3, not repeated here.
+3. **Spawn:** `<node_root>/bin/verilock`, detached into its own session (Python equivalent of the script's `setsid`: `subprocess.Popen(..., start_new_session=True)`), with:
+   - `VERITAS_INSTALL_ROOT=<node_root>`
+   - `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2`
+   - `MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0,narenas:2`
+   - stdout/stderr redirected to `$HOME/tmp/<org>-node<n>.out`, matching `start_test_harness.sh`'s existing convention exactly (same file, same location — not under `<node_root>`)
+   - Immediately record `pid = proc.pid`, `state = 'RUNNING'` on the node row.
+4. **Liveness check:** brief pause (`1`s — long enough to cover a real network round trip if `verilock`'s startup fails on the CP side, e.g. a rejected registration; the script's original `0.25`s was sized for catching only an immediate crash like a bad path or missing library, and was too short to catch a CP-side rejection in practice), then `proc.poll()`. If the process is still alive, print `Started <org>/node<n> (pid <pid>)` to stdout — the success confirmation, mirroring `stop`'s own (§5.3 step 4). If it has already exited instead:
+   - Clear `pid`, set `state = 'STOPPED'`.
+   - Print the failure to screen, along with the tail of the log file written in step 3 (last ~50 lines, or lines matching an error marker if `verilock`'s log format supports one).
+
+No separate file-staging step beyond step 2 above (the script's `stage_node_environment` is fully retired) — `verilock`'s own file-reading logic needs no change at all; only what populates those files changes, from hand-maintained `*.local.conf`/`*.server.conf` variants to `vl`-rendered content sourced from `store.db`. Full detail, including `verilock`'s own new startup responsibilities (looking itself up and self-reporting its `host` at the CP by `(org_id, org_node)`, via a single idempotent registration call, rather than the old unconditional `POST`-creates-a-new-row behavior), is in `verilock-node-startup-spec.md` — `cp-node-identity-spec.md` covers the CP-side half of that fix.
+
+### 5.3 `vl node stop <org> <n> [--env <env>]`
+
+> **Pending change:** state-changing commands will require an operator identity and a role check (`vl-authorization-spec.md`). This section describes the behavior until that is built.
+
+No `--as`, and no REST calls at all — this command is entirely local (signal + `store.db` writes). The blocking CP-DOWN-confirmation poll happens at the fleet-orchestration layer, after `stop` returns, not here — see `vl-org-phase2-spec.md` §8.
+
+Single-node mechanics only — ordering/staggering across a fleet is `vl org stop`'s job (`vl-org-phase2-spec.md` §8), layered on top of this; `vl network stop` (`vl-network-spec.md` §3.2) calls that per org rather than implementing its own copy.
+
+1. If the node row has no `pid` recorded, print "not running (or not started by `vl`)" to stdout and return normally — this is what preserves starting a node manually (e.g. under a debugger) and having fleet-level orchestration leave it alone. **Not a raised error** — same reasoning as `start`'s pre-check (§5.2): `vl org stop` (`vl-org-phase2-spec.md` §8) calls this per-node logic directly in a loop, and a node that's already stopped (or never `vl`'s to begin with) shouldn't abort the rest of the batch. `vl network stop` inherits this one layer up, by calling `vl org stop` per org.
+2. If `pid` is recorded but isn't this node's own live process (§4c — dead, a zombie, or reused by an unrelated process after a reboot), clear `pid`, set `state = 'STOPPED'`, and print done to stdout — stale bookkeeping, not an error, same non-raising treatment as step 1. A reused pid is never signalled.
+3. Otherwise: send `SIGTERM`. Poll every `0.25`s (using §4c's liveness check, so a zombie counts as gone) up to a `10`s timeout. Still alive after timeout → `SIGKILL`, brief pause.
+4. Clear `pid`, set `state = 'STOPPED'`, and print `Stopped <org>/node<n> (pid <pid>)` to stdout — the only success message in this command that names the org/node/pid explicitly; steps 1–2's no-op messages above already identify what happened without needing this one repeated.
+5. Return success/failure to the caller (used by the fleet-level orchestration docs to decide whether to proceed to the control-plane wait).
+
+No `pgrep`-by-binary-path fallback (present in the script) — `vl` always records the `pid` it started, so a missing/stale DB `pid` *is* the signal that this node isn't `vl`'s to stop, not a case to search around.
+
+### 5.4 `vl node reset <org> <n> [--include-snapshots] [--yes] [--env <env>]`
+
+> **Pending change:** state-changing commands will require an operator identity and a role check (`vl-authorization-spec.md`). This section describes the behavior until that is built.
+
+No `--as` — this command's one class of REST call (the control-plane check in step 2) authenticates as the node's own service account, resolved via `svc_acct_id` (§4), not as an operator identity — this is "ask the CP about this specific node," which the node's own credentials are the natural authority for.
+
+**Doesn't stop the node itself.** An earlier draft of this section had `reset` auto-stop a running node before deleting its data, reusing `stop`'s `SIGTERM`/poll/`SIGKILL` mechanics inline — but that meant duplicating `stop`'s poll-until-`DOWN`/stagger logic (`vl-org-phase2-spec.md` §8) a second time, inside a different command, for behavior `stop` already owns correctly. The node needs to already be `DOWN` before this command does anything — via `vl node stop` directly, or via `vl org reset` (`vl-org-phase2-spec.md` §8), which explicitly stops-and-verifies each node itself before calling this command, the same way `org stop` already does — rather than this command growing its own copy of that machinery to do it implicitly. `vl network reset` (`vl-network-spec.md` §3.3) is different again: it verifies the *whole environment* is down via one bulk admin-authenticated check before calling `vl org reset` per org at all, rather than relying on each org's own per-node verification as its only guarantee.
+
+1. **Confirm**, unless `--yes` was passed: prompt `Reset <org>/node<n>'s data directory? This permanently deletes all local blockchain state. Are you sure (y/N)?` (with `--include-snapshots`: `Reset <org>/node<n>'s data and snapshots directories? ...`, the rest unchanged) — only `y`/`Y` proceeds; a blank/`Enter` answer, `n`/`N`, or anything else aborts with no changes made. If no TTY is attached and `--yes` wasn't passed, fail immediately with a clear message ("`vl node reset` requires confirmation; pass `--yes` to run non-interactively") rather than hanging on an unanswerable prompt — same pattern already established for the tier-2 password prompt (`vl-identity-user-spec.md` §7).
+2. If `state = 'NEW'`, skip straight to step 3 — there's no CP-side node yet to check (it's never been started). Otherwise, **a single check** via the control plane (`GET /nodes?orgNode=`, authenticated as this node's own service account — `org_id` comes from that JWT, not a query parameter — → `NodeDto.state`, `cp-node-identity-spec.md` §2.4) — **not a poll, no retry, no timeout of its own**: if it isn't `DOWN` right now, print `{org_name}/node{org_node} is still reported UP by the control plane — stop it first or try again.` and **skip** (return normally, not raise — same non-raising treatment as `start`/`stop`'s own pre-checks, §5.2–§5.3, so a batch caller like `org reset` isn't aborted by one node that isn't ready) rather than deleting anything. The two ways this can legitimately happen — a node genuinely running outside `vl`'s tracking (needs a human), or this check simply running a moment before the CP has caught up on a very recent `stop` (needs a retry, or is `org`/`network reset`'s problem to handle correctly in the first place, not this command's) — both point the same direction: this command staying simple and pushing the "make sure it's actually down first" responsibility onto whatever already-correct mechanism stops nodes, rather than this command re-deriving it.
+3. `rm -rf <node_root>/data && mkdir -p <node_root>/data`, then print `Deleted <org>/node<n>'s data directory` to stdout. **With `--include-snapshots`**, also `rm -rf <node_root>/snapshots && mkdir -p <node_root>/snapshots`, and the message reads `Deleted <org>/node<n>'s data and snapshots directories`. The snapshots directory (`orgs/<orgName>/nodes/nodeN/snapshots`) is a peer of `data` and holds the snapshot archives this node created. **It is kept by default:** a node is often reset in order to recreate it from a snapshot it already holds, and the control plane's registry rows may still point at those archives. A network reset always passes the flag (`vl-network-spec.md` §3.3 step 4): it deletes the registry rows and publishes no `SnapshotsDeleted`, so nothing else would remove the now-orphaned archives. The node is expected to recreate the directory if it is missing; `vl` recreates it anyway when it deletes it, so the layout matches a fresh node's. Nothing else is touched — not the log file, not `bin`/`lib` (re-copied fresh on next start regardless), not `state` (a `NEW` node resetting stays `NEW`; a `STOPPED` node stays `STOPPED`).
+
+### 5.5 `vl node list [--org <org>] [--as <label>] [--env <env>]`
+
+Starts from the local `node` rows — so `NEW` nodes, which the CP has never heard of, still appear — and shows each with its *displayed* state (§4c): the stored state, corrected against the actual process, and reconciled with the control plane's view when that's available.
+
+1. **Resolve the caller's identity** per the standard precedence (`--as <label>` / `VL_IDENTITY` / environment default, `vl-org-spec.md` §5). If none resolves, fail with a clear error and print nothing — the same outcome as an authorization failure in step 4, not a fall-back to local data.
+2. **Scope the local rows to that identity's orgs:** the orgs in its cached `org_membership` rows (`vl-identity-user-spec.md` §4); every org if one of those roles is platform-wide (`PLATFORM_ADMIN`); or its own `org_name` for a service-account identity. `--org` narrows further. This mirrors what the CP will return for the same identity in step 4, so both views cover the same nodes. The membership rows are written at login and can be older than the token claims the CP checks; because this scoping is a consistency aid and not a boundary, that is accepted. It is consistency, not a security boundary — anyone who can read `~/.config/vl` already holds every stored credential — and someone with a platform-wide identity stored locally simply passes `--as` it to see everything.
+3. **Repair** `RUNNING` rows whose process is gone (§4c) — persisted, local, no CP call.
+4. **Query the control plane** (`GET /nodes`, list form, *without* `scope=all` — `cp-node-identity-spec.md` §2.5) as the resolved identity, paging to exhaustion (`limit`/`cursor`), and match CP rows to local rows by `(org, org_node)`, resolving each org through `organization.server_org_id`.
+   - **`401`/`403`:** print the CP's error and **nothing else**. A rejection is a definite answer that this caller isn't entitled to the view; falling back to local rows would defeat the scoping.
+   - **Unreachable** (connection failure, timeout, `5xx`; re-authentication that cannot reach the IdP counts too, whereas an expired tier-2 token with no terminal is an error): print `warning: control plane unreachable; showing local state only` and continue with the repaired local rows and their stored states.
+5. **Compute the displayed state** (§4c) and print one row per local node in scope: `org`, `node`, `port`, `state`, `pid`, `created_at`. There is a single `state` column — the stored state in the normal case, a §4c label only when the two views diverge. The reason behind a label is in `show` (§5.6), not repeated here.
+
+Exit code `0` for any successful listing, including one that carried the unreachable warning; non-zero when nothing was listed because of an error (no identity, or a `401`/`403`). Rendered via `vl.lib.output`, same convention as `vl env list` (`vl-env-spec.md` §5.2).
+
+This is deliberately *not* `vl network status` (`vl-network-spec.md` §3.4). `status` prints the control plane's own view of the whole environment, verbatim, and needs platform-wide standing; `list` prints this machine's nodes for whoever's asking, with `pid`/`state` checked against the real processes and divergences from the CP labelled.
+
+### 5.6 `vl node show <org> <n> [--as <label>] [--env <env>]`
+
+Detail view of a single node row. It resolves the identity and gets the control plane's view exactly as `list` does (§5.5 steps 1, 3, 4 — the org-scoped list form filtered to this `(org, org_node)`, not §2.4's `orgNode` form, which derives `org_id` from a single-org token; `GET /v1/nodes` has no org or node filter parameter, so `show` pages through the whole caller-scoped list and filters it locally), so the `state` shown here always agrees with `list`, and the `401`/`403` and unreachable behaviour is the same. A node outside the identity's scope (§5.5 step 2) is reported as not found.
+
+Prints: `org_node`, `port`, `pid`, `state` (displayed, §4c), `created_at`, plus identity info resolved via the `svc_acct_id` FK (§4) — `client_id` and the keypair paths (`private_key_path`/`public_key_path`). **When the displayed state differs from the stored one**, one extra line says why, quoting what produced it — e.g. for `NO_HEARTBEAT`: `stored RUNNING; control plane DOWN on 192.168.8.2, pid 4312 (this node: pid 4312)`. That is the only place the raw CP values surface per node, which keeps `list` to one state column. Nothing to mask: the node doesn't use `client_secret` at all (§5.2's identity-file write step only ever wrote `client_id` and the keypair, never a secret), so there's no secret-bearing field this command needs to hide behind a `--reveal-secret`-style flag the way `vl svc-acct show` does. Anyone who needs the underlying service account's own secret can get it from `vl svc-acct show <label>` directly — this command doesn't surface that label, only `svc_acct_id`, so that's a lookup by `svc_acct_id`/`client_id`, not something `vl node show` hands you directly.
+
+---
+
+## 6. Open Items
+
+1. **`$HOME/orgs` root is hardcoded**, not read from config or `store.db`. Deliberate — Docker-based node execution is expected to replace this filesystem layout in the near term, and making the root configurable now is work likely to be thrown away twice (once to build it, once to remove it). Revisit only if Docker's timeline slips significantly.
+2. **GLOBO-specific shutdown ordering** (org sorted last, descending `nodeN`, in the script's `SHUTDOWN_NODE_DIRS` construction) is carried over as-is by the fleet-level orchestration built on top of §5.3 (`vl-org-phase2-spec.md` §8, called per org by `vl-network-spec.md` §3.2/§3.0) without re-examining whether that's still the right rule now that orchestration lives in `vl` rather than a hand-maintained script. Worth a deliberate decision later rather than silently perpetuating it — tracked here since it originates from this document's `node stop` mechanics, referenced rather than duplicated in those two documents.
+3. ~~No `list`/`show`/`update`/`delete` for `vl node` in this phase~~ — **Partially resolved:** `list`/`show` added (§5.5, §5.6). `update`/`delete` remain deferred — neither was part of the driving use case (rebuilding `start_test_harness.sh`'s behavior), and both are natural, low-risk additions later, following the other nouns' conventions (`vl org update`, `vl svc-acct delete` — though note `vl org` itself has no `delete`, per that document's own deferral), whenever there's an actual need.
+4. **`vl node start`'s config file rendering (§5.2) is a dependency of this document, not something fully specified here** — the mechanics of *which* files get written and their exact format are detailed in `verilock-node-startup-spec.md`, not repeated in this document. Until that lands, `vl node start` is not expected to produce a working node.
+5. **`env_kafka_property_override` has no seed/write path, and no read path either** — the table (§3) exists so the schema is ready, but nothing populates it (manual `INSERT` for now? a future `vl env kafka-property set` command?) and `vl node start`'s copy step (§5.2) doesn't apply it. Deferred because no property currently needs to differ per environment; when one does, §5.2's copy step needs to be extended to overlay matching rows onto the copied file after step 2's verbatim copy.
+6. **`vl node start` has no remote-exec support in this phase** — `start` always spawns on the machine `vl` itself runs on. This is the known, planned gap this document leaves for a fast-follow — see §7, which lays out the direction (SSH) and a real open question about what `host` (§4) actually means once that phase needs it.
+7. **`STARTUP_GRACE_SECONDS` (§4c) is `10`, and only suppresses `UNREGISTERED`.** The registration-to-`/standby`-or-`/up` gap it covers measures at 60–200ms; an earlier draft of this document set it to `35` based on a since-explained-away 15–30 second field observation that turned out to be a now-fixed `bootstrap.servers` config gap on the test binaries, not a real property of startup — corrected here rather than left as a coincidentally-safe number for the wrong reason. It does not need to bound a snapshot pull or a long replay — those are covered separately, by `/standby` reporting before catch-up begins rather than after (§4c), not by this constant.
+8. **Liveness off Linux.** §4c's process checks read `/proc`; elsewhere they degrade to `kill -0`, which can mistake a reused pid for the node's own process. Not a concern while `vl` and `verilock` run on Linux only.
+9. **Platform-wide service accounts, locally.** `vl` has no local record that a service account is platform-wide (`SYSTEM`), so §5.5 step 2 scopes such an identity to its own org while the CP would return every node. Not a problem for anything today; worth revisiting only if `SYSTEM` identities start being used to run `list`.
+10. **Restarting inside the CP's lag window.** After an unclean death or a reboot, the repair (§4c) shows the node `STOPPED` while the CP still says `UP` for up to ~35 seconds, so `vl node start` in that window fails with `409 NOT_DOWN` (`cp-node-identity-spec.md` §2.3). Deliberately left as a known transient; the start failure prints the log tail, which names the cause.
+
+---
+
+## 7. Future phase: remote node execution via SSH
+
+**Not part of this document's implementation** — captured here as the planned direction for a fast-follow phase.
+
+**Goal:** run `vl node create`/`start`/`stop`/`reset` against a node hosted on a different machine than the one `vl` itself runs on, given (a) network connectivity to that machine and (b) an SSH keypair already set up for passwordless access to it — not a new authentication scheme of its own, just standard SSH.
+
+**Open question this fast-follow will need to resolve:** `host` (§4) already exists on the schema, kept deliberately unused rather than removed (§4b), but its semantics for *this* purpose still need deciding, not assumed. The CP-registered runtime address (self-reported by `verilock` at startup, tracked only by the CP in this phase) and "the address `vl` should SSH into to administer this node" aren't guaranteed to be the same value even in principle — an operator might want SSH over a different interface, a jump host, a hostname alias not known to `verilock` at all. Two real options when this phase is scoped: (a) repurpose `host` as an operator-supplied field at `vl node create` time (an `--ssh-host` at creation, rather than anything self-reported), or (b) leave `host` reserved for a future CP-address-mirroring use and add a distinct column for the SSH target. Not resolved here — flagged so it isn't assumed to be a solved problem just because the column already exists.
+
+**How this builds on what's already specced, not instead of it:**
+- `svc_acct_id`/credentials, `port`, `state` all stay meaningful unchanged — a remote node is still one row, still authenticates to the CP the same way, still has the same lifecycle states. Only the *mechanism* `start`/`stop` use to act on the node's process changes; nothing about what they track changes.
+- The CP-facing REST calls (`stop`'s and `reset`'s status checks, §5.3–§5.4) are already keyed by `(org_id, org_node)`, not by any address `vl` supplies — so none of that logic needs to change for remote nodes at all, regardless of how the open question above gets resolved. Only the *local* mechanics — copying `bin`/`lib`, spawning the process, sending signals, tailing the log — are currently local-only and would need an SSH-backed equivalent.
+
+**What a fast-follow phase would need to add (direction, not a committed design):**
+- Resolution of the open question above, plus a decision on where the SSH keypair for the resulting target is located/verified — a new `node` column, a convention based on `~/.ssh/config`, or something env-scoped like the URLs in §2 are all plausible directions, not decided here.
+- An SSH connection mechanism (likely `paramiko` or shelling out to the system `ssh`/`scp`/`rsync`) for a node running on a machine other than the one `vl` itself runs on.
+- Setup (§5.2 step 2) becomes `scp`/`rsync` of `bin`/`lib` to the remote host instead of a local `cp`.
+- Spawn (§5.2 step 3) becomes an SSH-invoked, detached remote process (`ssh ... nohup ...` or equivalent) instead of `subprocess.Popen`. `pid` still gets stored the same way — it's the *remote* PID, meaningful only in combination with the resolved target address for `stop`'s signal-sending.
+- `stop`'s `SIGTERM`/`SIGKILL` (§5.3 steps 3–4) becomes an SSH-invoked `kill` against the remote PID instead of a local one.
+- The liveness/log-tail steps (§5.2 step 4) need a remote file read (`ssh ... tail ...` or `scp` the log back) instead of a local file open.
+
+Whether this is a `vl`-side SSH implementation or a thinner layer that just shells out to `ssh`/`scp` directly is also an open design choice for that future phase, not resolved by this note — the point of this section is scoping the eventual work, not specifying it.

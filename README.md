@@ -61,8 +61,9 @@ vl team add globo ingest --description "Ingest team"
 vl team-member add ingest jdoe
 ```
 
-Every command supports `--help`, and any incomplete or wrong invocation
-prints the relevant help instead of an error. See
+Every command supports `--help`. A wrong or incomplete invocation (an unknown
+option or command, a missing argument) prints a one-line error to stderr and
+the relevant help to stdout, and exits `2`. See
 [`docs/cli-reference.md`](docs/cli-reference.md) for the full command
 reference — configuration variables, identity resolution, and detailed usage
 for every noun group.

@@ -18,9 +18,11 @@ from vl.commands._shared import (
     CliError,
     EnvOption,
     cache_team,
-    caller_orgs_claim,
+    caller_claims,
     fetch_all_orgs,
+    is_platform_admin,
     org_name_resolver,
+    orgs_claim,
     report_errors,
     resolve_org,
 )
@@ -62,8 +64,8 @@ def _resolve_team_by_name(
         org_dto = resolve_org(environment, org)
         candidates = [(str(org_dto["id"]), str(org_dto["name"]))]
     else:
-        orgs_claim = caller_orgs_claim(caller, environment)
-        if any(e.get("role") == "PLATFORM_ADMIN" for e in orgs_claim):
+        claims = caller_claims(caller, environment)
+        if is_platform_admin(claims):
             candidates = [
                 (str(o["id"]), str(o["name"])) for o in fetch_all_orgs(environment)
             ]
@@ -71,7 +73,7 @@ def _resolve_team_by_name(
             resolve_name = org_name_resolver(environment)
             candidates = [
                 (str(e["orgId"]), resolve_name(str(e["orgId"])))
-                for e in orgs_claim
+                for e in orgs_claim(claims)
             ]
 
     matches: list[tuple[dict[str, Any], str, str]] = []

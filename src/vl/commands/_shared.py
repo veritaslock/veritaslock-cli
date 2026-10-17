@@ -149,22 +149,107 @@ def fetch_all_orgs(environment: store.Environment) -> list[dict[str, Any]]:
             page = int(cursor) if str(cursor).isdigit() else page + 1
 
 
-def caller_orgs_claim(
-    caller: store.Identity, environment: store.Environment
-) -> list[dict[str, Any]]:
-    """The caller token's ``orgs`` claim (``[{orgId, role}, ...]``).
+def caller_claims(caller: store.Identity, environment: store.Environment) -> dict[str, Any]:
+    """The decoded payload of the caller's current token (signature not verified)."""
+    token = auth.get_token(caller, environment.idp_base_url)
+    return api.decode_jwt_payload(token)
+
+
+def orgs_claim(claims: dict[str, Any]) -> list[dict[str, Any]]:
+    """A token's ``orgs`` entries that name an org (``[{orgId, role}, ...]``).
 
     This is what the server bakes into the token at login and what its own
     org-standing checks read, so it's the authoritative view of which orgs the
     caller belongs to and with what role. Empty for a token that carries no
     ``orgs`` claim (e.g. a service account).
     """
-    token = auth.get_token(caller, environment.idp_base_url)
-    claims = api.decode_jwt_payload(token)
+    return [e for e in _orgs_entries(claims) if e.get("orgId")]
+
+
+# --------------------------------------------------------------------------- #
+# operator role checks (vl-authorization-spec.md)
+# --------------------------------------------------------------------------- #
+
+_PLATFORM_ADMIN = "PLATFORM_ADMIN"
+_ORG_ADMIN = "ORG_ADMIN"
+
+
+def _orgs_entries(claims: dict[str, Any]) -> list[dict[str, Any]]:
+    """The dict entries of a token's ``orgs`` claim; ``[]`` for a token without one."""
     orgs = claims.get("orgs")
     if not isinstance(orgs, list):
         return []
-    return [e for e in orgs if isinstance(e, dict) and e.get("orgId")]
+    return [e for e in orgs if isinstance(e, dict)]
+
+
+def is_platform_admin(claims: dict[str, Any]) -> bool:
+    """Any ``orgs`` entry whose role is ``PLATFORM_ADMIN``, whatever its ``orgId``.
+
+    The same rule as the control plane's ``NodeAccessGuard``.
+    """
+    return any(e.get("role") == _PLATFORM_ADMIN for e in _orgs_entries(claims))
+
+
+def is_org_admin(claims: dict[str, Any], server_org_id: str) -> bool:
+    """``ORG_ADMIN`` of the org whose IdP id is ``server_org_id``, or a platform admin.
+
+    ``USER`` and ``KEY_READER`` are not enough, and the ``teams`` claim plays no part.
+    """
+    if is_platform_admin(claims):
+        return True
+    return any(
+        e.get("role") == _ORG_ADMIN and str(e.get("orgId")) == server_org_id
+        for e in _orgs_entries(claims)
+    )
+
+
+def require_operator(
+    environment: store.Environment, as_label: str | None, org: str | None = None
+) -> store.Identity:
+    """Resolve the operator identity and check its role, before the command does anything.
+
+    With ``org=None`` the identity must be a ``PLATFORM_ADMIN`` (network commands);
+    with an org, ``ORG_ADMIN`` of that org or ``PLATFORM_ADMIN``. It must be a user,
+    never a service account. A refusal is a ``CliError`` with no side effects.
+    Returns the resolved identity so it can be passed down to the commands this
+    one orchestrates, which check it again.
+
+    This is a guardrail, not a security boundary: the token is decoded without
+    verifying its signature, and the IdP and control plane make the real decisions.
+    The roles are read from the identity's *current* token, never from the local
+    ``org_membership`` rows, which can be stale.
+    """
+    caller = store.resolve_identity(environment.name, as_label)
+    organization = store.get_organization(environment.name, org) if org is not None else None
+
+    service_account = (
+        f"'{caller.label}' is a service account; service accounts can't run this "
+        f"command. Use a user identity (--as <label>)."
+    )
+    if caller.kind != "USER":
+        raise CliError(service_account)
+
+    token = auth.get_token(caller, environment.idp_base_url)
+    try:
+        claims = api.decode_jwt_payload(token)
+    except api.ApiError as exc:
+        raise CliError(f"The token for '{caller.label}' could not be read ({exc}).") from exc
+    if claims.get("typ") != "user":
+        if claims.get("typ") == "service-account":
+            raise CliError(service_account)
+        raise CliError(
+            f"The token for '{caller.label}' is not a user token, so its roles can't be checked."
+        )
+
+    if organization is None:
+        if not is_platform_admin(claims):
+            raise CliError(f"'{caller.label}' needs PLATFORM_ADMIN for network commands.")
+    elif not is_org_admin(claims, organization.server_org_id):
+        raise CliError(
+            f"'{caller.label}' is not an admin of '{organization.name}': this needs "
+            f"ORG_ADMIN for the org, or PLATFORM_ADMIN."
+        )
+    return caller
 
 
 def resolve_membership_org(

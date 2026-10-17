@@ -972,7 +972,8 @@ def resolve_identity(environment: str, explicit_label: str | None) -> Identity:
         if row is None:
             raise NoResolvedIdentityError(
                 f"No identity selected for environment {environment!r}. Pass "
-                f"`--as <label>`, set VL_IDENTITY, or run `vl identity use <label>`."
+                f"`--as <label>`, set VL_IDENTITY, or run `vl usr-acct use <username>` "
+                f"(or `vl svc-acct use <label>`)."
             )
         return _row_to_identity(row)
 
@@ -1485,7 +1486,10 @@ def get_node(environment_name: str, org_name: str, org_node: int) -> Node:
     with _store() as conn:
         row: sqlite3.Row | None = _node_row(conn, environment_name, org_name, org_node)
         if row is None:
-            raise NodeNotFoundError()
+            raise NodeNotFoundError(
+                f"No node {org_name}/node{org_node} in environment {environment_name!r}. "
+                f"Run `vl node list` to see what's stored."
+            )
         return _row_to_node(row)
 
 

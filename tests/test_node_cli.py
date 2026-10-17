@@ -13,11 +13,18 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
+from _helpers import add_service_account, add_user
 from vl.app import app
 from vl.commands import node as node_cmd
 from vl.lib import store
 
 runner = CliRunner()
+
+
+@pytest.fixture
+def operator() -> store.Identity:
+    """The default identity: ORG_ADMIN of globo (org-1), so node commands on globo pass."""
+    return add_user("opadmin", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
 
 
 @pytest.fixture(autouse=True)
@@ -80,7 +87,7 @@ def kills(monkeypatch: pytest.MonkeyPatch) -> Kills:
 # --------------------------------------------------------------------------- #
 
 
-def test_stop_never_signals_a_stale_pid(kills: Kills) -> None:
+def test_stop_never_signals_a_stale_pid(kills: Kills, operator: store.Identity) -> None:
     _org()
     _node(pid=4312)  # 4312 is not in kills.alive: dead, or reused by another process
 
@@ -92,7 +99,7 @@ def test_stop_never_signals_a_stale_pid(kills: Kills) -> None:
     assert row.node_state == "STOPPED" and row.pid is None
 
 
-def test_stop_terminates_its_own_process(kills: Kills) -> None:
+def test_stop_terminates_its_own_process(kills: Kills, operator: store.Identity) -> None:
     _org()
     _node(pid=4312)
     kills.alive.add(4312)
@@ -106,7 +113,9 @@ def test_stop_terminates_its_own_process(kills: Kills) -> None:
     assert row.node_state == "STOPPED" and row.pid is None
 
 
-def test_stop_checks_the_nodes_own_binary(kills: Kills, home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_stop_checks_the_nodes_own_binary(
+    kills: Kills, home: Path, monkeypatch: pytest.MonkeyPatch, operator: store.Identity
+) -> None:
     seen: list[Any] = []
     monkeypatch.setattr(
         node_cmd.proc, "is_our_process", lambda pid, exe, **_: seen.append((pid, exe)) or False
@@ -119,7 +128,7 @@ def test_stop_checks_the_nodes_own_binary(kills: Kills, home: Path, monkeypatch:
     assert seen == [(4312, home / "orgs" / "globo" / "nodes" / "node1" / "bin" / "verilock")]
 
 
-def test_stop_without_a_pid_does_nothing(kills: Kills) -> None:
+def test_stop_without_a_pid_does_nothing(kills: Kills, operator: store.Identity) -> None:
     _org()
     _node()
 
@@ -640,3 +649,211 @@ def test_show_unreachable_cp_warns_and_shows_repaired_local_state(kills: Kills, 
     assert "warning: control plane unreachable; showing local state only" in result.stderr
     row = _json.loads(result.stdout)
     assert row["state"] == "STOPPED" and row["pid"] is None and "reason" not in row
+
+
+# --------------------------------------------------------------------------- #
+# authorization (vl-authorization-spec.md): start, stop and reset need
+# ORG_ADMIN of the node's org or PLATFORM_ADMIN, checked before anything else
+# --------------------------------------------------------------------------- #
+
+from types import SimpleNamespace
+
+
+class Work:
+    """Everything start, stop and reset can do to the machine, recorded."""
+
+    def __init__(self, home: Path) -> None:
+        self.spawned: list[tuple[str, int]] = []
+        self.data = home / "orgs" / "globo" / "nodes" / "node1" / "data"
+        self.data.mkdir(parents=True)
+        (self.data / "chain.db").write_text("blocks")
+
+    def data_intact(self) -> bool:
+        return (self.data / "chain.db").exists()
+
+
+@pytest.fixture
+def work(home: Path, kills: Kills, monkeypatch: pytest.MonkeyPatch) -> Work:
+    w = Work(home)
+    monkeypatch.setattr(node_cmd, "populate_node_dir", lambda env, org, n, node: home)
+    monkeypatch.setattr(
+        node_cmd, "start_verilock", lambda node, root, org, n: w.spawned.append((org, n))
+    )
+    return w
+
+
+@pytest.fixture
+def tty(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        node_cmd, "sys", SimpleNamespace(stdin=SimpleNamespace(isatty=lambda: True))
+    )
+
+
+def _globo_and_acme() -> None:
+    _org("globo", "org-1")
+    _org("acme", "org-2")
+
+
+COMMANDS = {
+    "start": ["node", "start", "globo", "1"],
+    "stop": ["node", "stop", "globo", "1"],
+    "reset": ["node", "reset", "globo", "1", "--yes"],
+}
+
+
+def _did_work(command: str, w: Work, kills: Kills) -> bool:
+    return {
+        "start": bool(w.spawned),
+        "stop": bool(kills.calls),
+        "reset": not w.data_intact(),
+    }[command]
+
+
+def _setup_node(command: str, kills: Kills) -> None:
+    _globo_and_acme()
+    if command == "stop":
+        _node(pid=4312)
+        kills.alive.add(4312)
+    else:
+        _node()  # NEW: start spawns it, reset needs no CP check
+
+
+@pytest.mark.parametrize("command", list(COMMANDS))
+@pytest.mark.parametrize(
+    "orgs",
+    [
+        [{"orgId": "org-1", "role": "ORG_ADMIN"}],
+        [{"orgId": "veritaslock", "role": "PLATFORM_ADMIN"}],
+        [{"orgId": "org-2", "role": "PLATFORM_ADMIN"}],
+    ],
+    ids=["org-admin", "platform-admin", "platform-admin-other-org"],
+)
+def test_node_command_is_allowed_for_an_admin(command: str, orgs: list, work: Work, kills: Kills) -> None:
+    _setup_node(command, kills)
+    add_user("ops", orgs)
+
+    result = runner.invoke(app, COMMANDS[command], env=WIDE)
+
+    assert result.exit_code == 0, result.output
+    assert _did_work(command, work, kills)
+
+
+REFUSALS = {
+    "user": ([{"orgId": "org-1", "role": "USER"}], "is not an admin of 'globo'"),
+    "key-reader": ([{"orgId": "org-1", "role": "KEY_READER"}], "is not an admin of 'globo'"),
+    "admin-of-another-org": ([{"orgId": "org-2", "role": "ORG_ADMIN"}], "is not an admin of 'globo'"),
+}
+
+
+@pytest.mark.parametrize("command", list(COMMANDS))
+@pytest.mark.parametrize("who", list(REFUSALS))
+def test_node_command_is_refused_for_a_non_admin_and_does_nothing(
+    command: str, who: str, work: Work, kills: Kills
+) -> None:
+    _setup_node(command, kills)
+    orgs, message = REFUSALS[who]
+    add_user("ops", orgs)
+
+    result = runner.invoke(app, COMMANDS[command], env=WIDE)
+
+    assert result.exit_code == 1
+    assert message in result.output
+    assert not _did_work(command, work, kills)
+
+
+@pytest.mark.parametrize("command", list(COMMANDS))
+@pytest.mark.parametrize("role", ["NODE", "SYSTEM"])
+def test_node_command_is_refused_for_a_service_account(
+    command: str, role: str, work: Work, kills: Kills
+) -> None:
+    _setup_node(command, kills)
+    # NODE: the node's own service account, which _node() created as 'globo-1'.
+    label = "globo-1" if role == "NODE" else "ops-system"
+    if role == "SYSTEM":
+        add_service_account(label, "globo", role)
+
+    result = runner.invoke(app, [*COMMANDS[command], "--as", label], env=WIDE)
+
+    assert result.exit_code == 1
+    assert "service accounts can't run this command" in result.output
+    assert not _did_work(command, work, kills)
+
+
+@pytest.mark.parametrize("command", list(COMMANDS))
+def test_node_command_without_an_identity_is_refused(command: str, work: Work, kills: Kills) -> None:
+    _setup_node(command, kills)
+
+    result = runner.invoke(app, COMMANDS[command], env=WIDE)
+
+    assert result.exit_code == 1
+    assert "No identity selected" in result.output
+    assert not _did_work(command, work, kills)
+
+
+def test_as_overrides_the_default_identity(work: Work, kills: Kills) -> None:
+    _setup_node("start", kills)
+    add_user("ops", [{"orgId": "org-1", "role": "USER"}])
+    add_user("boss", [{"orgId": "org-1", "role": "ORG_ADMIN"}], default=False)
+
+    assert runner.invoke(app, COMMANDS["start"], env=WIDE).exit_code == 1
+    result = runner.invoke(app, [*COMMANDS["start"], "--as", "boss"], env=WIDE)
+    assert result.exit_code == 0, result.output
+    assert work.spawned == [("globo", 1)]
+
+
+def test_reset_refusal_never_shows_the_prompt(tty: None, work: Work, kills: Kills) -> None:
+    _setup_node("reset", kills)
+    add_user("ops", [{"orgId": "org-1", "role": "USER"}])
+
+    result = runner.invoke(app, ["node", "reset", "globo", "1"], input="y\n", env=WIDE)
+
+    assert result.exit_code == 1
+    assert "Are you sure" not in result.output
+    assert work.data_intact()
+
+
+def test_reset_prompt_still_works_after_the_check(tty: None, work: Work, kills: Kills) -> None:
+    _setup_node("reset", kills)
+    add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
+
+    declined = runner.invoke(app, ["node", "reset", "globo", "1"], input="n\n", env=WIDE)
+    assert declined.exit_code == 0, declined.output
+    assert "Are you sure" in declined.output and work.data_intact()
+
+    confirmed = runner.invoke(app, ["node", "reset", "globo", "1"], input="y\n", env=WIDE)
+    assert confirmed.exit_code == 0, confirmed.output
+    assert "Deleted globo/node1's data directory." in confirmed.output
+    assert not work.data_intact() and work.data.is_dir()
+
+
+def test_start_happy_path_spawns_the_node(work: Work, kills: Kills) -> None:
+    _setup_node("start", kills)
+    add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
+
+    result = runner.invoke(app, COMMANDS["start"], env=WIDE)
+
+    assert result.exit_code == 0, result.output
+    assert work.spawned == [("globo", 1)]
+
+
+def test_reset_happy_path_with_yes_clears_data(work: Work, kills: Kills) -> None:
+    _setup_node("reset", kills)
+    add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
+
+    result = runner.invoke(app, [*COMMANDS["reset"], "--include-snapshots"], env=WIDE)
+
+    assert result.exit_code == 0, result.output
+    assert "Deleted globo/node1's data and snapshots directories." in result.output
+    assert not work.data_intact()
+
+
+@pytest.mark.parametrize("command", list(COMMANDS))
+def test_missing_node_has_a_real_message(command: str, work: Work, kills: Kills) -> None:
+    _globo_and_acme()
+    add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
+
+    args = [a if a != "1" else "7" for a in COMMANDS[command]]
+    result = runner.invoke(app, args, env=WIDE)
+
+    assert result.exit_code == 1
+    assert "No node globo/node7 in environment 'local'" in result.output

@@ -14,7 +14,7 @@ from typing import Annotated, Any
 import typer
 
 from vl.commands import node
-from vl.commands._shared import AsOption, EnvOption, report_errors, CliError
+from vl.commands._shared import AsOption, EnvOption, report_errors, CliError, require_operator
 from vl.lib import api, auth, store
 from vl.lib.cli import HelpOnErrorGroup
 from vl.lib.output import console, note, render
@@ -191,21 +191,30 @@ def start(
     org: Annotated[
         str, typer.Argument(help="Canonical org name (sent to the server as-is).")
     ],
-    env: EnvOption = None) -> None:
-    """Start all nodes in an organization."""
+    *,
+    env: EnvOption = None,
+    as_: AsOption = None) -> None:
+    """Start all nodes in an organization. Needs ORG_ADMIN of the org, or PLATFORM_ADMIN."""
     with report_errors():
         environment = store.get_environment(env)
+        caller = require_operator(environment, as_, org)
         organization = store.get_organization(environment.name, org)
         nodes = store.get_nodes(environment, organization)
         for node_ in nodes:
             try:
-                node.start(organization.name, node_.org_node, environment.name)
+                node.start(organization.name, node_.org_node, env=environment.name, as_=caller.label)
             except Exception as e:
                 note(f"Warning: {e}")
 
 
 def stop_and_optionally_reset_nodes(environment: Environment, nodes: list[Node], organization: Organization,
-                                    include_snapshots: bool = False, reset_: bool | None = None) -> None:
+                                    caller: store.Identity, include_snapshots: bool = False,
+                                    reset_: bool | None = None) -> None:
+    """Stop (and with ``reset_``, reset) each node, as ``caller``, who each node command re-checks.
+
+    The poll for DOWN still authenticates as each node's own service account
+    (``node.node_is_up``): the operator identity only gates the commands.
+    """
     nodes.reverse()
     for idx, node_ in enumerate(nodes):
         try:
@@ -215,7 +224,7 @@ def stop_and_optionally_reset_nodes(environment: Environment, nodes: list[Node],
             elif idx != 0:
                 time.sleep(0.5)
 
-            node.stop(organization.name, node_.org_node, environment.name)
+            node.stop(organization.name, node_.org_node, env=environment.name, as_=caller.label)
             cnt = 0
             node_stopped = False
             while cnt < 20:
@@ -226,7 +235,8 @@ def stop_and_optionally_reset_nodes(environment: Environment, nodes: list[Node],
                 cnt += 1
 
             if reset_ and node_stopped:
-                node.reset(organization.name, node_.org_node, include_snapshots=include_snapshots, yes=True, env=environment.name)
+                node.reset(organization.name, node_.org_node, include_snapshots=include_snapshots, yes=True,
+                           env=environment.name, as_=caller.label)
 
             if not node_stopped:
                 note (f"Warning: {organization.name}-node{node_.org_node} is still reported UP by the control plane.")
@@ -239,13 +249,16 @@ def stop(
     org: Annotated[
         str, typer.Argument(help="Canonical org name (sent to the server as-is).")
     ],
-    env: EnvOption = None) -> None:
-    """Stop all nodes in an organization."""
+    *,
+    env: EnvOption = None,
+    as_: AsOption = None) -> None:
+    """Stop all nodes in an organization. Needs ORG_ADMIN of the org, or PLATFORM_ADMIN."""
     with report_errors():
         environment = store.get_environment(env)
+        caller = require_operator(environment, as_, org)
         organization = store.get_organization(environment.name, org)
         nodes = store.get_nodes(environment, organization)
-        stop_and_optionally_reset_nodes(environment, nodes, organization)
+        stop_and_optionally_reset_nodes(environment, nodes, organization, caller)
 
 
 @app.command("reset")
@@ -262,10 +275,12 @@ def reset(
         bool | None,
         typer.Option("--yes", help="Skip the confirmation prompt."),
     ] = None,
-    env: EnvOption = None) -> None:
-    """Resets all nodes in an organization."""
+    env: EnvOption = None,
+    as_: AsOption = None) -> None:
+    """Resets all nodes in an organization. Needs ORG_ADMIN of the org, or PLATFORM_ADMIN."""
     with report_errors():
         environment = store.get_environment(env)
+        caller = require_operator(environment, as_, org)
         organization = store.get_organization(environment.name, org)
         org_name = organization.name
         if not yes:
@@ -282,4 +297,4 @@ def reset(
 
         if yes:
             nodes = store.get_nodes(environment, organization)
-            stop_and_optionally_reset_nodes(environment, nodes, organization, include_snapshots, True)
+            stop_and_optionally_reset_nodes(environment, nodes, organization, caller, include_snapshots, True)

@@ -22,6 +22,7 @@ from vl.commands._shared import (
     EnvOption,
     cache_org,
     fetch_org_by_id,
+    orgs_claim,
     refuse_duplicate_account,
     report_errors,
     resolve_membership_org,
@@ -79,15 +80,6 @@ def _orgs_summary(identity_id: int) -> str:
     return ", ".join(f"{m.org_name}:{m.role}" for m in memberships) or "-"
 
 
-def _orgs_claim(claims: dict[str, Any]) -> list[dict[str, Any]]:
-    orgs = claims.get("orgs")
-    if not isinstance(orgs, list):
-        return []
-    return [
-        e for e in orgs if isinstance(e, dict) and e.get("orgId") and e.get("role")
-    ]
-
-
 UsernameArg = Annotated[str, typer.Argument(help="Server-side username.")]
 
 
@@ -130,7 +122,7 @@ def cache(
         )
         store.set_user_acct(identity.id, password)
 
-        for entry in _orgs_claim(claims):
+        for entry in (e for e in orgs_claim(claims) if e.get("role")):
             org_dto = fetch_org_by_id(environment.idp_base_url, str(entry["orgId"]))
             if org_dto is None:
                 console.print(f"[dim]note: could not cache org {entry['orgId']}[/dim]")
