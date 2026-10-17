@@ -3,10 +3,13 @@
 Detailed usage reference for every noun group `vl` currently implements. For a
 high-level overview of the project, see the top-level [README](../README.md).
 
-Any incomplete or wrong invocation — a bare group (`vl`, `vl usr-acct`), an
-unknown subcommand (`vl usr-acct blah`), a missing required argument
-(`vl usr-acct login`), an unknown option — just prints the relevant `--help` and
-exits `0`, exactly as `--help` would. No error box.
+A wrong or incomplete invocation — an unknown subcommand (`vl usr-acct blah`), a
+missing required argument or option (`vl usr-acct login`), an unknown option —
+prints Click's one-line error to stderr (for example `Error: No such option:
+--force`), then the relevant `--help` to stdout, and exits `2`. A bare group
+(`vl`, `vl usr-acct`) is not an error: it prints its help and exits `0`, exactly
+as `--help` would. An invalid value (for example a file that doesn't exist)
+gets Click's usual usage line and error box on stderr, also with exit `2`.
 
 ## Configuration
 
