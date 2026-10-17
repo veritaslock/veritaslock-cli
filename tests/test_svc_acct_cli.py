@@ -345,9 +345,10 @@ def test_rotate_keys_command_is_absent() -> None:
     assert "rotate-keys" not in names
 
     result = runner.invoke(app, ["svc-acct", "rotate-keys", "bot"])
-    assert result.exit_code == 0  # unknown subcommand -> prints `svc-acct` help
-    assert "rotate-keys" not in result.output
-    assert "get-assertion" in result.output  # the real command list
+    assert result.exit_code == 2  # unknown subcommand -> error, then `svc-acct` help
+    assert result.stderr == "Error: No such command 'rotate-keys'.\n"
+    assert "rotate-keys" not in result.stdout
+    assert "get-assertion" in result.stdout  # the real command list
 
 
 @respx.mock

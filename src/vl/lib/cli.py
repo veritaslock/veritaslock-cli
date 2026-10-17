@@ -16,12 +16,16 @@ class HelpOnErrorGroup(TyperGroup):
     Exception: a ``BadParameter`` (a value was given but is invalid — e.g. a path that doesn't exist) is re-raised.
     A ``MissingParameter`` still gets help.
 
-    A bare group (``vl``, ``vl usr-acct``), an unknown subcommand
-    (``vl usr-acct blah``), a leaf command missing a required argument
-    (``vl usr-acct login``), an unknown option — Click would answer most of these
-    with a one-line usage hint and a red error box. Instead the failing command's
-    full ``--help`` is printed to stdout and the process exits ``0``, exactly as
-    if ``--help`` had been passed.
+    An unknown subcommand (``vl usr-acct blah``), a leaf command missing a
+    required argument or option (``vl usr-acct login``), an unknown option on a
+    command or a group — Click would answer these with a one-line usage hint and a
+    red error box. Instead Click's one-line message (``Error: No such option:
+    --force``) goes to stderr, the failing command's full ``--help`` is printed to
+    stdout, and the process exits with the error's own exit code (``2``, the usual
+    usage-error status).
+
+    A bare group (``vl``, ``vl usr-acct``) is not an error: it prints its help and
+    exits ``0``, exactly as if ``--help`` had been passed.
 
     Set as ``cls`` on every ``typer.Typer`` in the tree. ``parse_args`` catches a
     group's own ``no_args_is_help`` / option errors; ``invoke`` (on the outermost
@@ -36,19 +40,18 @@ class HelpOnErrorGroup(TyperGroup):
     again would print it a second time. Skip the echo for that case.
     """
 
-    def _help_and_exit(self, ctx: click.Context, *, already_printed: bool) -> NoReturn:
-        if not already_printed:
-            click.echo(ctx.get_help(), color=ctx.color)
-        ctx.exit(0)
+    def _help_and_exit(self, ctx: click.Context, err: click.exceptions.UsageError) -> NoReturn:
+        if isinstance(err, click.exceptions.NoArgsIsHelpError):
+            ctx.exit(0)  # help was already printed while the error was built
+        click.echo(f"Error: {err.format_message()}", err=True)
+        click.echo(ctx.get_help(), color=ctx.color)
+        ctx.exit(err.exit_code)
 
     def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
         try:
             return super().parse_args(ctx, args)
         except click.exceptions.UsageError as err:
-            self._help_and_exit(
-                err.ctx or ctx,
-                already_printed=isinstance(err, click.exceptions.NoArgsIsHelpError),
-            )
+            self._help_and_exit(err.ctx or ctx, err)
 
     def invoke(self, ctx: click.Context) -> Any:
         try:
@@ -56,7 +59,4 @@ class HelpOnErrorGroup(TyperGroup):
         except click.exceptions.UsageError as err:
             if isinstance(err, BadParameter) and not isinstance(err, MissingParameter):
                 raise
-            self._help_and_exit(
-                err.ctx or ctx,
-                already_printed=isinstance(err, click.exceptions.NoArgsIsHelpError),
-            )
+            self._help_and_exit(err.ctx or ctx, err)

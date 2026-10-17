@@ -136,9 +136,10 @@ def test_add_uses_supplied_password_and_stays_quiet() -> None:
 def test_add_requires_email() -> None:
     _caller()
     result = runner.invoke(app, ["usr-acct", "add", "jdoe", "--org", "globo"])
-    # a missing required option -> `add` help, exit 0, no server call attempted
-    assert result.exit_code == 0
-    assert "--email" in result.output and "Error" not in result.output
+    # a missing required option -> `add` help, exit 2, no server call attempted
+    assert result.exit_code == 2
+    assert "--email" in result.stdout and "Error" not in result.stdout
+    assert result.stderr == "Error: Missing option '--email'.\n"
 
 
 @respx.mock
@@ -289,21 +290,25 @@ def test_synonyms_hidden_from_top_level_help() -> None:
 
 
 @pytest.mark.parametrize("argv", [["usr-acct", "nope"], ["user", "nope"], ["nope"]])
-def test_unknown_subcommand_prints_help_like_dash_dash_help(argv: list[str]) -> None:
+def test_unknown_subcommand_prints_the_error_and_the_group_help(argv: list[str]) -> None:
     result = runner.invoke(app, argv)
-    assert result.exit_code == 0  # behaves exactly like --help
-    assert "Usage:" in result.output and "Commands" in result.output
-    assert "Error" not in result.output and "No such command" not in result.output
+    assert result.exit_code == 2  # a usage error
+    assert "Usage:" in result.stdout and "Commands" in result.stdout
+    assert "Error" not in result.stdout
+    # one line; click may add a suggestion ("Did you mean 'node'?")
+    assert result.stderr.startswith("Error: No such command 'nope'.")
+    assert len(result.stderr.splitlines()) == 1
     if argv[:1] != ["nope"]:
-        assert "Manage VeritasLock user accounts." in result.output  # group's own help
+        assert "Manage VeritasLock user accounts." in result.stdout  # group's own help
 
 
 def test_leaf_command_missing_arg_prints_command_help() -> None:
     result = runner.invoke(app, ["usr-acct", "login"])  # `login` needs <username>
-    assert result.exit_code == 0
-    assert "Authenticate as yourself" in result.output  # the command's own help
-    assert "username" in result.output
-    assert "Error" not in result.output and "Missing argument" not in result.output
+    assert result.exit_code == 2
+    assert "Authenticate as yourself" in result.stdout  # the command's own help
+    assert "username" in result.stdout
+    assert "Error" not in result.stdout
+    assert result.stderr == "Error: Missing argument 'username'.\n"
 
 
 def test_list_local_by_default() -> None:

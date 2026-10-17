@@ -321,13 +321,14 @@ def test_delete_of_an_unknown_study_is_not_found(cp: respx.MockRouter, ops: stor
 
 
 def test_delete_has_no_force_option(cp: respx.MockRouter, ops: store.Identity) -> None:
-    # An unknown option is answered with the command's --help and exit 0, by design
-    # (HelpOnErrorGroup, vl/lib/cli.py), not with click's usage error.
+    # An unknown option: the error on stderr, the command's --help on stdout, exit 2
+    # (HelpOnErrorGroup, vl/lib/cli.py).
     result = _invoke("delete", "globo", STUDY_ID, "--yes", "--force")
 
-    assert result.exit_code == 0
-    assert "Usage: vl study delete" in result.output
-    assert "--force" not in result.output
+    assert result.exit_code == 2
+    assert result.stderr == "Error: No such option: --force\n"
+    assert "Usage: vl study delete" in result.stdout
+    assert "--force" not in result.stdout
     assert len(cp.calls) == 0
 
 
@@ -538,12 +539,14 @@ def test_update_refuses_a_study_in_another_org(cp: respx.MockRouter, ops: store.
 
 @pytest.mark.parametrize("option", ["--delete", "--deleted"])
 def test_update_has_no_delete_option(cp: respx.MockRouter, ops: store.Identity, option: str) -> None:
-    # Unknown option: --help and exit 0 (HelpOnErrorGroup), nothing sent.
+    # Unknown option: the error, then --help, exit 2 (HelpOnErrorGroup), nothing sent.
     result = _invoke("update", "globo", STUDY_ID, option)
 
-    assert result.exit_code == 0
-    assert "Usage: vl study update" in result.output
-    assert "--delete" not in result.output
+    assert result.exit_code == 2
+    assert result.stderr.startswith(f"Error: No such option: {option}")  # click may add a suggestion
+    assert len(result.stderr.splitlines()) == 1
+    assert "Usage: vl study update" in result.stdout
+    assert "--delete" not in result.stdout
     assert len(cp.calls) == 0
 
 
