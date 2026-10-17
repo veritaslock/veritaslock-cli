@@ -808,6 +808,24 @@ def test_show_reports_a_403(cp: respx.MockRouter, ops: store.Identity) -> None:
     assert "Error: Access denied. (HTTP 403)" in result.output
 
 
+@pytest.mark.parametrize(
+    "args",
+    [["show", "globo", STUDY_ID], ["update", "globo", STUDY_ID, "--disable"], ["delete", "globo", STUDY_ID, "--yes"]],
+    ids=lambda a: a[0],
+)
+def test_more_than_one_match_is_an_error(cp: respx.MockRouter, ops: store.Identity, args: list[str]) -> None:
+    # studyId is globally unique, so two rows mean something is wrong: act on neither.
+    _lookup(cp, _dto(), _dto(eventId="ev-2"))
+    patch = _patch(cp)
+
+    result = _invoke(*args)
+
+    assert result.exit_code == 1
+    assert "2 studies with studyId 's-1'" in result.output
+    assert not patch.called
+    assert len(cp.calls) == 1
+
+
 # --------------------------------------------------------------------------- #
 # list (§2.3)
 # --------------------------------------------------------------------------- #

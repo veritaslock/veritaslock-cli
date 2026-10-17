@@ -117,6 +117,10 @@ def get_study_dto(environment: store.Environment, caller: store.Identity, org: s
         raise store.StudyNotFoundError(
             f"Study {study_id!r} not found or not visible to {caller.label!r}."
         )
+    if len(items) > 1:
+        raise CliError(
+            f"The control plane returned {len(items)} studies with studyId {study_id!r}; expected one."
+        )
     dto = items[0]
     returned_org = dto["organization"]
     if returned_org != org:
