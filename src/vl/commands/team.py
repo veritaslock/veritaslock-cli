@@ -14,9 +14,11 @@ from vl.commands._shared import (
     AsOption,
     EnvOption,
     cache_team,
-    caller_orgs_claim,
+    caller_claims,
     fetch_all_orgs,
+    is_platform_admin,
     org_name_resolver,
+    orgs_claim,
     report_errors,
     resolve_org,
 )
@@ -148,10 +150,8 @@ def list_(
     with report_errors():
         environment = store.get_environment(env)
         caller = store.resolve_identity(environment.name, as_)
-        orgs_claim = caller_orgs_claim(caller, environment)
-        platform_admin = any(
-            e.get("role") == "PLATFORM_ADMIN" for e in orgs_claim
-        )
+        claims = caller_claims(caller, environment)
+        platform_admin = is_platform_admin(claims)
 
         if platform_admin:
             targets = [
@@ -161,7 +161,7 @@ def list_(
             resolve_name = org_name_resolver(environment)
             targets = [
                 (str(e["orgId"]), resolve_name(str(e["orgId"])))
-                for e in orgs_claim
+                for e in orgs_claim(claims)
             ]
 
         rows: list[dict[str, Any]] = []

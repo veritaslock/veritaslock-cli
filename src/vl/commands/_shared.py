@@ -149,18 +149,20 @@ def fetch_all_orgs(environment: store.Environment) -> list[dict[str, Any]]:
             page = int(cursor) if str(cursor).isdigit() else page + 1
 
 
-def caller_orgs_claim(
-    caller: store.Identity, environment: store.Environment
-) -> list[dict[str, Any]]:
-    """The caller token's ``orgs`` claim (``[{orgId, role}, ...]``).
+def caller_claims(caller: store.Identity, environment: store.Environment) -> dict[str, Any]:
+    """The decoded payload of the caller's current token (signature not verified)."""
+    token = auth.get_token(caller, environment.idp_base_url)
+    return api.decode_jwt_payload(token)
+
+
+def orgs_claim(claims: dict[str, Any]) -> list[dict[str, Any]]:
+    """A token's ``orgs`` entries that name an org (``[{orgId, role}, ...]``).
 
     This is what the server bakes into the token at login and what its own
     org-standing checks read, so it's the authoritative view of which orgs the
     caller belongs to and with what role. Empty for a token that carries no
     ``orgs`` claim (e.g. a service account).
     """
-    token = auth.get_token(caller, environment.idp_base_url)
-    claims = api.decode_jwt_payload(token)
     return [e for e in _orgs_entries(claims) if e.get("orgId")]
 
 
