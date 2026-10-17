@@ -42,7 +42,7 @@ def start(
         orgs = curate_orgs(environment)
         for org_ in orgs:
             try:
-                org.start(org_.name, environment.name)
+                org.start(org_.name, env=environment.name)
             except Exception as e:
                 note(f"Warning: {e}")
 
@@ -59,7 +59,7 @@ def stop(
         orgs.reverse()
         for org_ in orgs:
             try:
-                org.stop(org_.name, environment.name)
+                org.stop(org_.name, env=environment.name)
             except Exception as e:
                 note(f"Warning: {e}")
 
