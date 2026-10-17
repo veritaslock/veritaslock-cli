@@ -299,11 +299,227 @@ def test_delete_as_selects_the_identity(cp: respx.MockRouter, ops: store.Identit
 
 
 # --------------------------------------------------------------------------- #
+# update (§2.4)
+# --------------------------------------------------------------------------- #
+
+
+def test_update_resolves_then_patches_with_the_study_id(cp: respx.MockRouter, ops: store.Identity) -> None:
+    _lookup(cp, _dto())
+    patch = _patch(cp, httpx.Response(200, json=_dto(studyDescription="Updated")))
+
+    result = _invoke("update", "globo", STUDY_ID, "--description", "Updated")
+
+    assert result.exit_code == 0, result.output
+    assert [call.request.method for call in cp.calls] == ["GET", "PATCH"]
+    _assert_lookup(cp.calls[0].request)
+    request = patch.calls.last.request
+    assert request.url.path == f"/v1/studies/{EVENT_ID}"
+    assert _query(request) == {"studyId": STUDY_ID}
+    assert request.headers["Authorization"] == f"Bearer {_token(ops)}"
+    assert "Updated Study s-1" in result.output
+
+
+@pytest.mark.parametrize(
+    ("args", "body"),
+    [
+        (["--study-name", "Flu 2027"], {"studyName": "Flu 2027"}),
+        (["--description", "New text"], {"studyDescription": "New text"}),
+        (["--starting-time", "2026-11-02T00:00:00Z"], {"startingTime": "2026-11-02T00:00:00Z"}),
+        (["--ending-time", "2026-12-31T00:00:00Z"], {"endingTime": "2026-12-31T00:00:00Z"}),
+        (["--allow-multiple-events-per-client"], {"allowMultipleEventsPerClient": True}),
+        (["--no-allow-multiple-events-per-client"], {"allowMultipleEventsPerClient": False}),
+        (["--disable"], {"state": "DISABLED"}),
+        (["--enable"], {"state": "ENABLED"}),
+        (
+            ["--study-name", "Flu 2027", "--ending-time", "2026-12-31T00:00:00Z"],
+            {"studyName": "Flu 2027", "endingTime": "2026-12-31T00:00:00Z"},
+        ),
+        (
+            ["--ending-time", "2027-01-31T00:00:00Z", "--enable"],
+            {"endingTime": "2027-01-31T00:00:00Z", "state": "ENABLED"},
+        ),
+        (
+            ["--description", "On hold", "--disable", "--no-allow-multiple-events-per-client"],
+            {"studyDescription": "On hold", "state": "DISABLED", "allowMultipleEventsPerClient": False},
+        ),
+    ],
+)
+def test_update_sends_only_the_flags_given(
+    cp: respx.MockRouter, ops: store.Identity, args: list[str], body: dict[str, Any]
+) -> None:
+    _lookup(cp, _dto())
+    patch = _patch(cp)
+
+    result = _invoke("update", "globo", STUDY_ID, *args)
+
+    assert result.exit_code == 0, result.output
+    assert _body(patch.calls.last.request) == body
+
+
+def test_update_enable_notes_that_the_state_is_pending(cp: respx.MockRouter, ops: store.Identity) -> None:
+    _lookup(cp, _dto())
+    _patch(cp)
+
+    result = _invoke("update", "globo", STUDY_ID, "--enable")
+
+    assert result.exit_code == 0, result.output
+    assert "Study state update is pending" in result.output
+    assert "vl study show globo s-1" in result.output
+
+
+def test_update_disable_and_enable_together_is_refused_before_any_request(
+    cp: respx.MockRouter, ops: store.Identity
+) -> None:
+    result = _invoke("update", "globo", STUDY_ID, "--disable", "--enable")
+
+    assert result.exit_code == 1
+    assert "--disable and --enable are mutually exclusive" in result.output
+    assert len(cp.calls) == 0
+
+
+def test_update_with_no_flags_is_refused_before_any_request(cp: respx.MockRouter, ops: store.Identity) -> None:
+    result = _invoke("update", "globo", STUDY_ID)
+
+    assert result.exit_code == 1
+    assert "Must specify at least one option to be modified" in result.output
+    assert len(cp.calls) == 0
+
+
+@pytest.mark.parametrize(
+    ("state", "args", "response", "expected"),
+    [
+        (
+            "FINALIZED", ["--description", "x"],
+            _problem(400, "A FINALIZED study can't be updated."),
+            ["Error: A FINALIZED study can't be updated. (HTTP 400)"],
+        ),
+        (
+            "ARCHIVED", ["--description", "x"],
+            _problem(400, "An ARCHIVED study can't be updated."),
+            ["Error: An ARCHIVED study can't be updated. (HTTP 400)"],
+        ),
+        (
+            "DISABLED", ["--description", "x"],
+            _problem(400, "The study is soft-deleted and can no longer be modified."),
+            ["soft-deleted and can no longer be modified. (HTTP 400)"],
+        ),
+        (
+            "ACTIVE", ["--disable"],
+            _problem(400, "The study's endingTime has passed; it can no longer be updated."),
+            ["endingTime has passed; it can no longer be updated. (HTTP 400)"],
+        ),
+        (
+            "DISABLED", ["--ending-time", "2026-01-01T00:00:00Z"],
+            _problem(
+                400, "Validation failed.",
+                invalidFields=[{"field": "endingTime", "message": "must be in the future"}],
+            ),
+            ["Error: Validation failed. (HTTP 400)", "endingTime: must be in the future"],
+        ),
+        (
+            "DISABLED", ["--study-name", "Taken"],
+            _problem(409, "A study named 'Taken' already exists in this organization."),
+            ["already exists in this organization. (HTTP 409)"],
+        ),
+    ],
+)
+def test_update_reports_the_server_refusal(
+    cp: respx.MockRouter,
+    ops: store.Identity,
+    state: str,
+    args: list[str],
+    response: httpx.Response,
+    expected: list[str],
+) -> None:
+    _lookup(cp, _dto(studyState=state))
+    patch = _patch(cp, response)
+
+    result = _invoke("update", "globo", STUDY_ID, *args)
+
+    assert result.exit_code == 1
+    assert patch.call_count == 1
+    for text in expected:
+        assert text in result.output
+    assert "Updated Study" not in result.output
+
+
+def test_update_of_a_soft_deleted_study_still_reaches_the_server(cp: respx.MockRouter, ops: store.Identity) -> None:
+    # The lookup includes deleted studies, so the server's own refusal is what's reported.
+    _lookup(cp, _dto(deleted=True))
+    patch = _patch(cp, _problem(400, "The study is soft-deleted and can no longer be modified."))
+
+    result = _invoke("update", "globo", STUDY_ID, "--description", "x")
+
+    assert result.exit_code == 1
+    assert patch.call_count == 1
+    assert "soft-deleted" in result.output
+    assert "not found" not in result.output
+
+
+def test_update_of_a_rejected_study_is_an_ordinary_patch(cp: respx.MockRouter, ops: store.Identity) -> None:
+    rejected = _dto(studyState="REJECTED", rejectedReason="startingTime is in the past")
+    _lookup(cp, rejected)
+    patch = _patch(cp, httpx.Response(200, json=_dto(studyState="SUBMITTED")))
+
+    result = _invoke("update", "globo", STUDY_ID, "--starting-time", "2026-11-05T00:00:00Z")
+
+    assert result.exit_code == 0, result.output
+    assert _body(patch.calls.last.request) == {"startingTime": "2026-11-05T00:00:00Z"}
+    assert "SUBMITTED" in result.output
+
+
+def test_update_of_an_unknown_study_is_not_found(cp: respx.MockRouter, ops: store.Identity) -> None:
+    _lookup(cp)
+    patch = _patch(cp)
+
+    result = _invoke("update", "globo", STUDY_ID, "--description", "x")
+
+    assert result.exit_code == 1
+    assert "Study 's-1' not found or not visible to 'ops'." in result.output
+    assert not patch.called
+
+
+def test_update_refuses_a_study_in_another_org(cp: respx.MockRouter, ops: store.Identity) -> None:
+    _lookup(cp, _dto(organization="acme"))
+    patch = _patch(cp)
+
+    result = _invoke("update", "globo", STUDY_ID, "--description", "x")
+
+    assert result.exit_code == 1
+    assert "study s-1 belongs to org acme, not globo." in result.output
+    assert not patch.called
+
+
+@pytest.mark.parametrize("option", ["--delete", "--deleted"])
+def test_update_has_no_delete_option(cp: respx.MockRouter, ops: store.Identity, option: str) -> None:
+    # Unknown option: --help and exit 0 (HelpOnErrorGroup), nothing sent.
+    result = _invoke("update", "globo", STUDY_ID, option)
+
+    assert result.exit_code == 0
+    assert "Usage: vl study update" in result.output
+    assert "--delete" not in result.output
+    assert len(cp.calls) == 0
+
+
+def test_update_as_selects_the_identity(cp: respx.MockRouter, ops: store.Identity) -> None:
+    boss = add_user("boss", orgs=[{"orgId": "org-1", "role": "ORG_ADMIN"}], default=False)
+    _lookup(cp, _dto())
+    _patch(cp)
+
+    result = _invoke("update", "globo", STUDY_ID, "--disable", "--as", "boss")
+
+    assert result.exit_code == 0, result.output
+    for call in cp.calls:
+        assert call.request.headers["Authorization"] == f"Bearer {_token(boss)}"
+
+
+# --------------------------------------------------------------------------- #
 # every command needs an identity (§3)
 # --------------------------------------------------------------------------- #
 
 NO_IDENTITY_COMMANDS = [
     ["delete", "globo", STUDY_ID, "--yes"],
+    ["update", "globo", STUDY_ID, "--disable"],
 ]
 
 
