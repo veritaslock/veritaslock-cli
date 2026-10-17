@@ -8,7 +8,9 @@ the router saw.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterator
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -511,6 +513,203 @@ def test_update_as_selects_the_identity(cp: respx.MockRouter, ops: store.Identit
     assert result.exit_code == 0, result.output
     for call in cp.calls:
         assert call.request.headers["Authorization"] == f"Bearer {_token(boss)}"
+
+
+# --------------------------------------------------------------------------- #
+# add (§2.1)
+# --------------------------------------------------------------------------- #
+
+PAYLOAD: dict[str, Any] = {
+    "studyId": STUDY_ID,
+    "studyName": "Flu 2026",
+    "studyDescription": "Seasonal flu",
+    "orgName": "globo",
+    "teamName": "ingest",
+    "startingTime": "2026-11-01T00:00:00Z",
+    "endingTime": "2026-12-01T00:00:00Z",
+    "allowMultipleEventsPerClient": False,
+    "schema": {"fields": [{"name": "temp", "type": "double"}]},
+}
+
+
+def _study_file(tmp_path: Path, payload: Any = None, *, text: str | None = None) -> Path:
+    path = tmp_path / "study.json"
+    path.write_text(text if text is not None else json.dumps(PAYLOAD if payload is None else payload))
+    return path
+
+
+def _post(cp: respx.MockRouter, response: httpx.Response | None = None) -> respx.Route:
+    return cp.post(f"{CP}/v1/studies").mock(
+        return_value=response or httpx.Response(201, json=_dto(studyState="SUBMITTED"))
+    )
+
+
+def test_add_posts_the_file_as_is(cp: respx.MockRouter, ops: store.Identity, tmp_path: Path) -> None:
+    post = _post(cp)
+
+    result = _invoke("add", "globo", str(_study_file(tmp_path)))
+
+    assert result.exit_code == 0, result.output
+    assert len(cp.calls) == 1
+    request = post.calls.last.request
+    assert _body(request) == PAYLOAD
+    assert _query(request) == {}
+    assert request.headers["Authorization"] == f"Bearer {_token(ops)}"
+    assert "Study Created" in result.output
+    assert "SUBMITTED" in result.output
+
+
+def test_add_resubmits_a_rejected_study_with_the_same_command(
+    cp: respx.MockRouter, ops: store.Identity, tmp_path: Path
+) -> None:
+    # The server decides whether it's a new study or a resubmission; vl sends the same request.
+    post = _post(cp, httpx.Response(200, json=_dto(eventId="ev-2", studyState="SUBMITTED")))
+
+    result = _invoke("add", "globo", str(_study_file(tmp_path)))
+
+    assert result.exit_code == 0, result.output
+    assert _body(post.calls.last.request) == PAYLOAD
+    assert len(cp.calls) == 1
+
+
+def test_add_refuses_an_org_that_differs_from_the_files(
+    cp: respx.MockRouter, ops: store.Identity, tmp_path: Path
+) -> None:
+    result = _invoke("add", "acme", str(_study_file(tmp_path)))
+
+    assert result.exit_code == 1
+    assert "orgName in file (globo) does not match acme specified on cmd line." in result.output
+    assert len(cp.calls) == 0
+
+
+def test_add_refuses_a_file_without_an_org_name(
+    cp: respx.MockRouter, ops: store.Identity, tmp_path: Path
+) -> None:
+    payload = {k: v for k, v in PAYLOAD.items() if k != "orgName"}
+
+    result = _invoke("add", "globo", str(_study_file(tmp_path, payload)))
+
+    assert result.exit_code == 1
+    assert "study.json does not contain an orgName." in result.output
+    assert len(cp.calls) == 0
+
+
+def test_add_refuses_invalid_json(cp: respx.MockRouter, ops: store.Identity, tmp_path: Path) -> None:
+    result = _invoke("add", "globo", str(_study_file(tmp_path, text='{"orgName": "globo",')))
+
+    assert result.exit_code == 1
+    assert "Invalid JSON: study.json - 1:" in result.output
+    assert len(cp.calls) == 0
+
+
+def test_add_refuses_a_missing_file(cp: respx.MockRouter, ops: store.Identity, tmp_path: Path) -> None:
+    # Checked by click (exists=True) before the command runs: a usage error, exit 2.
+    result = _invoke("add", "globo", str(tmp_path / "nope.json"))
+
+    assert result.exit_code == 2
+    assert "does not exist" in result.output
+    assert len(cp.calls) == 0
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read a mode-000 file")
+def test_add_refuses_an_unreadable_file(cp: respx.MockRouter, ops: store.Identity, tmp_path: Path) -> None:
+    # Checked by click (readable=True) before the command runs: a usage error, exit 2.
+    path = _study_file(tmp_path)
+    path.chmod(0)
+    try:
+        result = _invoke("add", "globo", str(path))
+    finally:
+        path.chmod(0o600)
+
+    assert result.exit_code == 2
+    assert "is not readable" in result.output
+    assert len(cp.calls) == 0
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (
+            _problem(
+                400, "Validation failed.",
+                invalidFields=[{"field": "endingTime", "message": "must be in the future"}],
+            ),
+            ["Error: Validation failed. (HTTP 400)", "endingTime: must be in the future"],
+        ),
+        (
+            _problem(409, "A study with studyId 's-1' already exists."),
+            ["Error: A study with studyId 's-1' already exists. (HTTP 409)"],
+        ),
+        (
+            _problem(409, "A study named 'Flu 2026' already exists in this organization."),
+            ["already exists in this organization. (HTTP 409)"],
+        ),
+        (
+            _problem(409, "Study 's-1' was rejected and deleted; its studyId stays taken."),
+            ["its studyId stays taken. (HTTP 409)"],
+        ),
+        (
+            _problem(403, "Requires ORG_ADMIN of the study's org or TEAM_ADMIN of its team."),
+            ["Error: Requires ORG_ADMIN of the study's org or TEAM_ADMIN of its team. (HTTP 403)"],
+        ),
+    ],
+)
+def test_add_reports_the_server_refusal(
+    cp: respx.MockRouter,
+    ops: store.Identity,
+    tmp_path: Path,
+    response: httpx.Response,
+    expected: list[str],
+) -> None:
+    post = _post(cp, response)
+
+    result = _invoke("add", "globo", str(_study_file(tmp_path)))
+
+    assert result.exit_code == 1
+    assert post.call_count == 1
+    for text in expected:
+        assert text in result.output
+    assert "Study Created" not in result.output
+
+
+def test_add_retries_a_401_once_with_a_fresh_token_then_reports_it(
+    cp: respx.MockRouter, ops: store.Identity, tmp_path: Path
+) -> None:
+    login = cp.post(f"{IDP}/auth/user/login").mock(
+        return_value=httpx.Response(200, json={"accessToken": "fresh-jwt", "expiresIn": 900})
+    )
+    post = _post(cp, _problem(401, "Token expired."))
+    stale = _token(ops)
+
+    result = _invoke("add", "globo", str(_study_file(tmp_path)))
+
+    assert result.exit_code == 1
+    assert "Error: Token expired. (HTTP 401)" in result.output
+    assert login.call_count == 1
+    assert [c.request.headers["Authorization"] for c in post.calls] == [
+        f"Bearer {stale}",
+        "Bearer fresh-jwt",
+    ]
+
+
+def test_add_as_selects_the_identity(cp: respx.MockRouter, ops: store.Identity, tmp_path: Path) -> None:
+    boss = add_user("boss", orgs=[{"orgId": "org-1", "role": "ORG_ADMIN"}], default=False)
+    post = _post(cp)
+
+    result = _invoke("add", "globo", str(_study_file(tmp_path)), "--as", "boss")
+
+    assert result.exit_code == 0, result.output
+    assert post.calls.last.request.headers["Authorization"] == f"Bearer {_token(boss)}"
+
+
+def test_add_needs_an_identity(cp: respx.MockRouter, tmp_path: Path) -> None:
+    store.ensure_local_environment_seeded()
+
+    result = _invoke("add", "globo", str(_study_file(tmp_path)))
+
+    assert result.exit_code == 1
+    assert "vl usr-acct use" in result.output
+    assert len(cp.calls) == 0
 
 
 # --------------------------------------------------------------------------- #
