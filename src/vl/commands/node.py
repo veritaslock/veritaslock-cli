@@ -23,7 +23,7 @@ from vl.commands._shared import (
     AsOption,
     EnvOption,
     report_errors,
-    resolve_org, assert_label_free, CliError,
+    resolve_org, assert_label_free, CliError, require_operator,
 )
 from vl.lib import store, roles, api, auth, host, node_state, proc
 from vl.lib.cli import HelpOnErrorGroup
@@ -299,11 +299,14 @@ def start_verilock(node: store.Node, node_root: Path, org: str, org_node: int) -
 def start(
     org: Annotated[str, typer.Argument(help="Organization name.")],
     org_node: Annotated[int, typer.Argument(help="Node number to start")],
-    env: EnvOption = None
+    *,
+    env: EnvOption = None,
+    as_: AsOption = None,
 ) -> None:
-    """Start the node """
+    """Start the node. Needs ORG_ADMIN of the node's org, or PLATFORM_ADMIN."""
     with report_errors():
         environment = store.get_environment(env)
+        require_operator(environment, as_, org)
         org_name = store.get_organization(environment.name, org).name
         node = store.get_node(environment.name, org_name, org_node)
 
@@ -355,11 +358,14 @@ def shutdown_node(node: store.Node) -> bool:
 def stop(
     org: Annotated[str, typer.Argument(help="Organization name.")],
     org_node: Annotated[int, typer.Argument(help="Node number to stop")],
-    env: EnvOption = None
+    *,
+    env: EnvOption = None,
+    as_: AsOption = None,
 ) -> None:
-    """Stop the node """
+    """Stop the node. Needs ORG_ADMIN of the node's org, or PLATFORM_ADMIN."""
     with report_errors():
         environment = store.get_environment(env)
+        require_operator(environment, as_, org)
         org_name = store.get_organization(environment.name, org).name
         node = store.get_node(environment.name, org_name, org_node)
         if node.pid is None:
@@ -419,11 +425,13 @@ def reset(
         bool | None,
         typer.Option("--yes", help="Skip the confirmation prompt."),
     ] = None,
-    env: EnvOption = None
-    ) -> None:
-    """Reset the node """
+    env: EnvOption = None,
+    as_: AsOption = None,
+) -> None:
+    """Reset the node. Needs ORG_ADMIN of the node's org, or PLATFORM_ADMIN."""
     with report_errors():
         environment = store.get_environment(env)
+        require_operator(environment, as_, org)
         org_name = store.get_organization(environment.name, org).name
         node = store.get_node(environment.name, org_name, org_node)
         if node.node_state != "NEW" and node_is_up(environment, node):

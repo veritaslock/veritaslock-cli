@@ -199,7 +199,7 @@ def start(
         nodes = store.get_nodes(environment, organization)
         for node_ in nodes:
             try:
-                node.start(organization.name, node_.org_node, environment.name)
+                node.start(organization.name, node_.org_node, env=environment.name)
             except Exception as e:
                 note(f"Warning: {e}")
 
@@ -215,7 +215,7 @@ def stop_and_optionally_reset_nodes(environment: Environment, nodes: list[Node],
             elif idx != 0:
                 time.sleep(0.5)
 
-            node.stop(organization.name, node_.org_node, environment.name)
+            node.stop(organization.name, node_.org_node, env=environment.name)
             cnt = 0
             node_stopped = False
             while cnt < 20:

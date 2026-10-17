@@ -1486,7 +1486,10 @@ def get_node(environment_name: str, org_name: str, org_node: int) -> Node:
     with _store() as conn:
         row: sqlite3.Row | None = _node_row(conn, environment_name, org_name, org_node)
         if row is None:
-            raise NodeNotFoundError()
+            raise NodeNotFoundError(
+                f"No node {org_name}/node{org_node} in environment {environment_name!r}. "
+                f"Run `vl node list` to see what's stored."
+            )
         return _row_to_node(row)
 
 
