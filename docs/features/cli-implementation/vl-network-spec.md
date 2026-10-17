@@ -40,11 +40,11 @@ Every verb below needs to know "which orgs, in what order" — computed once, th
 
 Non-GLOBO orgs' relative order among themselves has no operational dependency — nothing requires them to be sequenced any particular way relative to each other, only relative to GLOBO. Creation order is used for all of them uniformly (not just GLOBO) simply because it's a natural, already-available, deterministic ordering to fall back on, not because the others need it specifically.
 
-### 3.1 `vl network start [--env <env>]`
+### 3.1 `vl network start [--as <label>] [--env <env>]`
 
 No `--as` — every underlying call is either local (`vl org start`, `vl node start`) or authenticated as each node's own service account (`vl-org-phase2-spec.md` §8, `vl-node-spec.md` §4). For each org in §3.0's order (GLOBO first): call `vl org start <org>`. GLOBO's own nodes start in ascending `org_node` order within it (`vl-org-phase2-spec.md` §8's own ordering, not restated here), and no stagger between orgs or between nodes within one — matching the script's startup loop, which has none either.
 
-### 3.2 `vl network stop [--env <env>]`
+### 3.2 `vl network stop [--as <label>] [--env <env>]`
 
 No `--as` — see §4. For each org in §3.0's order, **reversed** (GLOBO last): call `vl org stop <org>` (`vl-org-phase2-spec.md` §8) — its own per-node ordering (descending `org_node`), CP-poll-with-timeout, and GLOBO-conditional pause (triggering correctly here specifically because GLOBO is, by construction, the last org in this sequence) all apply exactly as already specced there, with nothing restated or reimplemented in this document.
 
@@ -75,9 +75,11 @@ Calls the bulk endpoint above. Since one CP instance backs exactly one environme
 
 ## 4. Authentication
 
-Unlike every other post-Phase-3 command group in this project, two of `vl network`'s four verbs take no `--as`. Nothing in `start`/`stop` requires an operator identity: both are purely orchestration over `vl org start`/`stop` (`vl-org-phase2-spec.md` §8), which itself either acts locally or authenticates as each node's own service account — never as whoever is running the network-level command. This mirrors why `vl node stop` and `vl org stop` themselves have no `--as` (`vl-node-spec.md` §5.3, `vl-org-phase2-spec.md` §8): an operator identity is only needed where a command asks the IdP to do something on the operator's behalf (as `vl node create` does, or as `status`/`reset` do below), not for a node checking in on itself.
+> **Authorization:** this command requires an operator identity (`--as`, or the default identity): `PLATFORM_ADMIN`, for `start` and `stop`; `reset` and `status` are decided by the control plane, which adds no local check, checked locally before anything else happens (`vl-authorization-spec.md`). Built on `feat/vl-authorization`, pending merge.
 
-`status` (§3.4) and `reset` (§3.3) are the exception, for different reasons but the same underlying one: each needs an operator identity rather than a node's own self-scoped credentials. `status` needs to see across every org at once to report it, and sends `scope=all` (`cp-node-identity-spec.md` §2.5), so it is the CP itself that refuses anyone lacking platform-wide standing. `reset` no longer lists nodes: it calls `POST /v1/network/reset` (`cp-network-reset-spec.md`) as `--as <label>`, once as a dry run and again for the real call, and that endpoint has its own rule: a `PLATFORM_ADMIN` user only, with no service account accepted, `SYSTEM` included. The same endpoint also checks, atomically, that every node is `DOWN`. In both cases `vl` checks no role itself; the CP's `403` is the answer. `reset`'s per-org, per-node work after the control-plane call still goes through `vl org reset`/`vl node reset`'s own unauthenticated-at-that-layer mechanics, same as `start`/`stop`, so only the two control-plane calls (the dry run and the real reset) need `--as`.
+`start` and `stop` require a `PLATFORM_ADMIN` user (`--as`, or the default identity), checked locally before anything else happens and passed down to each `vl org` and `vl node` call (`vl-authorization-spec.md`). The identity only gates the command: nothing is sent to the control plane as the operator, and the org and node commands below still poll as each node's own service account.
+
+`status` (§3.4) and `reset` (§3.3) differ: they call the control plane as the operator, for different reasons but the same underlying one: each needs an operator identity rather than a node's own self-scoped credentials. `status` needs to see across every org at once to report it, and sends `scope=all` (`cp-node-identity-spec.md` §2.5), so it is the CP itself that refuses anyone lacking platform-wide standing. `reset` no longer lists nodes: it calls `POST /v1/network/reset` (`cp-network-reset-spec.md`) as `--as <label>`, once as a dry run and again for the real call, and that endpoint has its own rule: a `PLATFORM_ADMIN` user only, with no service account accepted, `SYSTEM` included. The same endpoint also checks, atomically, that every node is `DOWN`. In both cases `vl` checks no role itself; the CP's `403` is the answer. `reset`'s per-org, per-node work after the control-plane call goes through `vl org reset`/`vl node reset`, which now also require the operator role; `reset` passes its own identity down, and the local check cannot refuse a caller the control plane accepted, since both rules are "`PLATFORM_ADMIN` user" on the same token.
 
 ---
 
