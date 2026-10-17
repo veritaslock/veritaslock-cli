@@ -17,6 +17,7 @@ import pytest
 import respx
 from typer.testing import CliRunner
 
+from _helpers import add_service_account, add_user, fake_jwt
 from vl.app import app
 from vl.commands import network
 from vl.lib import store
@@ -25,6 +26,11 @@ runner = CliRunner()
 CP = "http://localhost:8082"
 RESET_URL = f"{CP}/v1/network/reset"
 WIDE = {"COLUMNS": "200"}  # keep Rich from wrapping long error lines
+
+# A decodable PLATFORM_ADMIN user token: the org resets network reset calls check it.
+CALLER_JWT = fake_jwt(
+    "u-root", typ="user", orgs=[{"orgId": "veritaslock", "role": "PLATFORM_ADMIN"}]
+)
 
 COUNTS = {"study_event_schema_ref": 0, "study": 3, "block": 40}
 
@@ -36,7 +42,7 @@ def _caller() -> store.Identity:
     store.set_user_acct(ident.id, "pw")
     store.set_default_identity("local", "root")
     now = datetime.now(timezone.utc)
-    store.set_cached_token(ident.id, "caller-jwt", now, now + timedelta(hours=1))
+    store.set_cached_token(ident.id, CALLER_JWT, now, now + timedelta(hours=1))
     return ident
 
 
@@ -92,10 +98,11 @@ def test_yes_skips_dry_run_and_resets_cp_then_every_org(org_resets: list) -> Non
     assert result.exit_code == 0, result.stdout
     assert not dry.called
     assert real.call_count == 1
-    assert real.calls.last.request.headers["authorization"] == "Bearer caller-jwt"
+    assert real.calls.last.request.headers["authorization"] == f"Bearer {CALLER_JWT}"
     # GLOBO last, veritaslock never; snapshots always included, never prompted.
     assert [name for name, _ in org_resets] == ["zeta", "acme", "globo"]
     assert all(kw["include_snapshots"] is True and kw["yes"] is True for _, kw in org_resets)
+    assert all(kw["as_"] == "root" and kw["env"] == "local" for _, kw in org_resets)
 
 
 @respx.mock
@@ -263,3 +270,87 @@ def test_unreachable_cp_is_reported_and_nothing_is_reset(org_resets: list) -> No
     assert result.exit_code == 1
     assert "could not reach" in result.stdout
     assert org_resets == []
+
+
+# --------------------------------------------------------------------------- #
+# start / stop: PLATFORM_ADMIN, checked first, passed down to every org call
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def org_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[str, Any]]]:
+    """Record org start/stop instead of touching real nodes."""
+    calls: list[tuple[str, str, dict[str, Any]]] = []
+    for verb in ("start", "stop"):
+        def record(org_name: str, _verb: str = verb, **kwargs: Any) -> None:
+            calls.append((_verb, org_name, kwargs))
+        monkeypatch.setattr(network.org, verb, record)
+    return calls
+
+
+@pytest.mark.parametrize(
+    ("verb", "order"),
+    [("start", ["globo", "acme", "zeta"]), ("stop", ["zeta", "acme", "globo"])],
+)
+def test_platform_admin_runs_network_start_and_stop_down_every_org(
+    verb: str, order: list[str], org_calls: list
+) -> None:
+    _orgs("globo", "acme", "veritaslock", "zeta")
+    add_user("ops", [{"orgId": "veritaslock", "role": "PLATFORM_ADMIN"}])
+
+    result = runner.invoke(app, ["network", verb], env=WIDE)
+
+    assert result.exit_code == 0, result.output
+    assert [name for _, name, _ in org_calls] == order
+    assert all(v == verb and kw == {"env": "local", "as_": "ops"} for v, _, kw in org_calls)
+
+
+def test_network_start_passes_the_as_identity(org_calls: list) -> None:
+    _orgs("globo")
+    add_user("ops", [{"orgId": "org-0", "role": "ORG_ADMIN"}])
+    add_user("boss", [{"orgId": "veritaslock", "role": "PLATFORM_ADMIN"}], default=False)
+
+    result = runner.invoke(app, ["network", "start", "--as", "boss"], env=WIDE)
+
+    assert result.exit_code == 0, result.output
+    assert [kw["as_"] for _, _, kw in org_calls] == ["boss"]
+
+
+@pytest.mark.parametrize("verb", ["start", "stop"])
+@pytest.mark.parametrize("role", ["ORG_ADMIN", "USER", "KEY_READER"])
+def test_network_start_and_stop_refuse_anyone_but_a_platform_admin(
+    verb: str, role: str, org_calls: list
+) -> None:
+    _orgs("globo")
+    add_user("ops", [{"orgId": "org-0", "role": role}])
+
+    result = runner.invoke(app, ["network", verb], env=WIDE)
+
+    assert result.exit_code == 1
+    assert "'ops' needs PLATFORM_ADMIN for network commands." in result.output
+    assert org_calls == []
+
+
+@pytest.mark.parametrize("verb", ["start", "stop"])
+@pytest.mark.parametrize("role", ["NODE", "SYSTEM"])
+def test_network_start_and_stop_refuse_a_service_account(verb: str, role: str, org_calls: list) -> None:
+    _orgs("globo")
+    add_service_account("ops-sa", "globo", role)
+
+    result = runner.invoke(app, ["network", verb, "--as", "ops-sa"], env=WIDE)
+
+    assert result.exit_code == 1
+    assert "service accounts can't run this command" in result.output
+    assert org_calls == []
+
+
+@pytest.mark.parametrize("verb", ["start", "stop"])
+def test_network_start_and_stop_without_an_identity_are_refused(verb: str, org_calls: list) -> None:
+    _orgs("globo")
+    store.ensure_local_environment_seeded()
+
+    result = runner.invoke(app, ["network", verb], env=WIDE)
+
+    assert result.exit_code == 1
+    assert "No identity selected" in result.output
+    assert org_calls == []

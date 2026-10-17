@@ -12,7 +12,7 @@ from typing import Annotated, Any
 import typer
 
 from vl.commands import org
-from vl.commands._shared import AsOption, EnvOption, report_errors, CliError, org_name_resolver
+from vl.commands._shared import AsOption, EnvOption, report_errors, CliError, org_name_resolver, require_operator
 from vl.lib import auth, store, api
 from vl.lib.cli import HelpOnErrorGroup
 from vl.lib.output import note, render
@@ -34,15 +34,17 @@ def curate_orgs(environment: Environment) -> list[Organization]:
 
 @app.command("start")
 def start(
-    env: EnvOption = None) -> None:
-    """Start all orgs in network."""
+    env: EnvOption = None,
+    as_: AsOption = None) -> None:
+    """Start all orgs in network. Needs PLATFORM_ADMIN."""
     with report_errors():
         environment = store.get_environment(env)
+        caller = require_operator(environment, as_)
 
         orgs = curate_orgs(environment)
         for org_ in orgs:
             try:
-                org.start(org_.name, env=environment.name)
+                org.start(org_.name, env=environment.name, as_=caller.label)
             except Exception as e:
                 note(f"Warning: {e}")
 
@@ -50,16 +52,18 @@ def start(
 
 @app.command("stop")
 def stop(
-    env: EnvOption = None) -> None:
-    """Stops all orgs in network."""
+    env: EnvOption = None,
+    as_: AsOption = None) -> None:
+    """Stops all orgs in network. Needs PLATFORM_ADMIN."""
     with report_errors():
         environment = store.get_environment(env)
+        caller = require_operator(environment, as_)
 
         orgs = curate_orgs(environment)
         orgs.reverse()
         for org_ in orgs:
             try:
-                org.stop(org_.name, env=environment.name)
+                org.stop(org_.name, env=environment.name, as_=caller.label)
             except Exception as e:
                 note(f"Warning: {e}")
 
@@ -151,7 +155,8 @@ def reset(
             orgs.reverse()
             for org_ in orgs:
                 try:
-                    org.reset(org_.name, include_snapshots=True, yes=True, env=environment.name)
+                    org.reset(org_.name, include_snapshots=True, yes=True, env=environment.name,
+                              as_=caller.label)
                 except Exception as e:
                     note(f"Warning: {e}")
 
