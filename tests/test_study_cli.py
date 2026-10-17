@@ -713,12 +713,253 @@ def test_add_needs_an_identity(cp: respx.MockRouter, tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# show (§2.2)
+# --------------------------------------------------------------------------- #
+
+SHOW_KEYS = [
+    "event_id", "name", "description", "study_id", "state", "rejected_reason", "organization",
+    "starting_time", "ending_time", "client_id", "created_at", "created_by", "allows_multiple",
+    "deleted",
+]
+
+
+def test_show_is_one_lookup_including_deleted(cp: respx.MockRouter, ops: store.Identity) -> None:
+    _lookup(cp, _dto())
+
+    result = _invoke("show", "globo", STUDY_ID)
+
+    assert result.exit_code == 0, result.output
+    assert len(cp.calls) == 1
+    _assert_lookup(cp.calls[0].request)
+    assert cp.calls[0].request.headers["Authorization"] == f"Bearer {_token(ops)}"
+    assert "Study s-1" in result.output
+    assert "Flu 2026" in result.output
+
+
+def test_show_of_an_unknown_study_is_not_found(cp: respx.MockRouter, ops: store.Identity) -> None:
+    _lookup(cp)
+
+    result = _invoke("show", "globo", STUDY_ID)
+
+    assert result.exit_code == 1
+    assert "Study 's-1' not found or not visible to 'ops'." in result.output
+
+
+def test_show_refuses_a_study_in_another_org(cp: respx.MockRouter, ops: store.Identity) -> None:
+    _lookup(cp, _dto(organization="acme"))
+
+    result = _invoke("show", "globo", STUDY_ID)
+
+    assert result.exit_code == 1
+    assert "study s-1 belongs to org acme, not globo." in result.output
+    assert "not found" not in result.output
+
+
+def test_show_includes_a_deleted_study_with_its_flag(cp: respx.MockRouter, ops: store.Identity) -> None:
+    _lookup(cp, _dto(deleted=True))
+
+    result = _invoke("show", "globo", STUDY_ID, env={"VL_OUTPUT": "json"})
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["deleted"] is True
+
+
+def test_show_includes_the_rejected_reason(cp: respx.MockRouter, ops: store.Identity) -> None:
+    _lookup(cp, _dto(studyState="REJECTED", rejectedReason="startingTime is in the past"))
+
+    result = _invoke("show", "globo", STUDY_ID, env={"VL_OUTPUT": "json"})
+
+    assert result.exit_code == 0, result.output
+    shown = json.loads(result.output)
+    assert shown["state"] == "REJECTED"
+    assert shown["rejected_reason"] == "startingTime is in the past"
+
+
+def test_show_json_output(cp: respx.MockRouter, ops: store.Identity) -> None:
+    _lookup(cp, _dto())
+
+    result = _invoke("show", "globo", STUDY_ID, env={"VL_OUTPUT": "json"})
+
+    assert result.exit_code == 0, result.output
+    shown = json.loads(result.output)
+    assert list(shown) == SHOW_KEYS
+    assert shown["event_id"] == EVENT_ID
+    assert shown["study_id"] == STUDY_ID
+    assert shown["state"] == "DISABLED"
+    assert shown["deleted"] is False
+
+
+def test_show_table_output(cp: respx.MockRouter, ops: store.Identity) -> None:
+    _lookup(cp, _dto())
+
+    result = _invoke("show", "globo", STUDY_ID)
+
+    assert result.exit_code == 0, result.output
+    for column in SHOW_KEYS:
+        assert column in result.output
+
+
+def test_show_reports_a_403(cp: respx.MockRouter, ops: store.Identity) -> None:
+    cp.get(f"{CP}/v1/studies").mock(return_value=_problem(403, "Access denied."))
+
+    result = _invoke("show", "globo", STUDY_ID)
+
+    assert result.exit_code == 1
+    assert "Error: Access denied. (HTTP 403)" in result.output
+
+
+# --------------------------------------------------------------------------- #
+# list (§2.3)
+# --------------------------------------------------------------------------- #
+
+LIST_KEYS = ["name", "study_id", "state", "organization", "starting_time", "ending_time", "deleted"]
+
+
+def _list_route(cp: respx.MockRouter, *responses: httpx.Response) -> respx.Route:
+    return cp.get(f"{CP}/v1/studies").mock(side_effect=list(responses))
+
+
+def test_list_by_default_only_sends_include_deleted_false(cp: respx.MockRouter, ops: store.Identity) -> None:
+    # The spec's "off by default" is sent explicitly, as includeDeleted=false.
+    route = _list_route(cp, _page())
+
+    result = _invoke("list")
+
+    assert result.exit_code == 0, result.output
+    assert route.call_count == 1
+    assert _query(route.calls.last.request) == {"includeDeleted": "false"}
+    assert route.calls.last.request.headers["Authorization"] == f"Bearer {_token(ops)}"
+
+
+@pytest.mark.parametrize(
+    ("args", "params"),
+    [
+        (["--study-id", "s-1"], {"studyId": "s-1", "includeDeleted": "false"}),
+        (["--study-name", "Flu 2026"], {"studyName": "Flu 2026", "includeDeleted": "false"}),
+        (["--include-deleted"], {"includeDeleted": "true"}),
+        (
+            ["--study-id", "s-1", "--study-name", "Flu 2026", "--include-deleted"],
+            {"studyId": "s-1", "studyName": "Flu 2026", "includeDeleted": "true"},
+        ),
+    ],
+)
+def test_list_maps_its_filters_to_query_params(
+    cp: respx.MockRouter, ops: store.Identity, args: list[str], params: dict[str, str]
+) -> None:
+    route = _list_route(cp, _page())
+
+    result = _invoke("list", *args)
+
+    assert result.exit_code == 0, result.output
+    assert _query(route.calls.last.request) == params
+
+
+def test_list_empty_table(cp: respx.MockRouter, ops: store.Identity) -> None:
+    _list_route(cp, _page())
+
+    result = _invoke("list")
+
+    assert result.exit_code == 0, result.output
+    assert "(no results)" in result.output
+
+
+def test_list_empty_json(cp: respx.MockRouter, ops: store.Identity) -> None:
+    _list_route(cp, _page())
+
+    result = _invoke("list", env={"VL_OUTPUT": "json"})
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == []
+
+
+def test_list_several_rows_table(cp: respx.MockRouter, ops: store.Identity) -> None:
+    _list_route(
+        cp,
+        _page(
+            _dto(),
+            _dto(studyId="s-2", studyName="Covid 2026", studyState="ACTIVE", organization="acme"),
+        ),
+    )
+
+    result = _invoke("list")
+
+    assert result.exit_code == 0, result.output
+    assert "Studies" in result.output
+    for column in LIST_KEYS:
+        assert column in result.output
+    for text in ("s-1", "Flu 2026", "DISABLED", "globo", "s-2", "Covid 2026", "ACTIVE", "acme"):
+        assert text in result.output
+
+
+def test_list_json_pages_through_every_cursor(cp: respx.MockRouter, ops: store.Identity) -> None:
+    route = _list_route(
+        cp,
+        _page(_dto(), next_cursor="c-2"),
+        _page(_dto(studyId="s-2", deleted=True)),
+    )
+
+    result = _invoke("list", "--include-deleted", env={"VL_OUTPUT": "json"})
+
+    assert result.exit_code == 0, result.output
+    rows = json.loads(result.output)
+    assert [row["study_id"] for row in rows] == ["s-1", "s-2"]
+    assert list(rows[0]) == LIST_KEYS
+    assert rows[1]["deleted"] is True
+    assert _query(route.calls[1].request) == {"includeDeleted": "true", "cursor": "c-2"}
+
+
+def test_list_reports_a_403(cp: respx.MockRouter, ops: store.Identity) -> None:
+    _list_route(cp, _problem(403, "Access denied."))
+
+    result = _invoke("list")
+
+    assert result.exit_code == 1
+    assert "Error: Access denied. (HTTP 403)" in result.output
+
+
+def test_list_reports_a_401_after_one_retry(cp: respx.MockRouter, ops: store.Identity) -> None:
+    login = cp.post(f"{IDP}/auth/user/login").mock(
+        return_value=httpx.Response(200, json={"accessToken": "fresh-jwt", "expiresIn": 900})
+    )
+    route = _list_route(cp, _problem(401, "Token expired."), _problem(401, "Token expired."))
+
+    result = _invoke("list")
+
+    assert result.exit_code == 1
+    assert "Error: Token expired. (HTTP 401)" in result.output
+    assert login.call_count == 1
+    assert route.call_count == 2
+
+
+def test_list_as_selects_the_identity(cp: respx.MockRouter, ops: store.Identity) -> None:
+    boss = add_user("boss", orgs=[{"orgId": "org-1", "role": "USER"}], default=False)
+    route = _list_route(cp, _page())
+
+    result = _invoke("list", "--as", "boss")
+
+    assert result.exit_code == 0, result.output
+    assert route.calls.last.request.headers["Authorization"] == f"Bearer {_token(boss)}"
+
+
+def test_show_as_selects_the_identity(cp: respx.MockRouter, ops: store.Identity) -> None:
+    boss = add_user("boss", orgs=[{"orgId": "org-1", "role": "USER"}], default=False)
+    _lookup(cp, _dto())
+
+    result = _invoke("show", "globo", STUDY_ID, "--as", "boss")
+
+    assert result.exit_code == 0, result.output
+    assert cp.calls.last.request.headers["Authorization"] == f"Bearer {_token(boss)}"
+
+
+# --------------------------------------------------------------------------- #
 # every command needs an identity (§3)
 # --------------------------------------------------------------------------- #
 
 NO_IDENTITY_COMMANDS = [
     ["delete", "globo", STUDY_ID, "--yes"],
     ["update", "globo", STUDY_ID, "--disable"],
+    ["show", "globo", STUDY_ID],
+    ["list"],
 ]
 
 
