@@ -13,6 +13,7 @@ from os import mkdir
 from typing import Annotated, Any
 
 import typer
+from rich.markup import escape
 import os
 import time
 import subprocess
@@ -240,27 +241,88 @@ def populate_node_dir(environment: store.Environment, org: str, n: int, node: st
     return node_root
 
 
-def print_tail(path: Path, n: int = 50) -> None:
+# Hints for a node that exits right after `vl node start` (vl-node-spec.md §5.2
+# step 4), keyed by a marker in its log tail or by its exit code. First match wins.
+_START_FAILURE_HINTS: tuple[tuple[str | int, str], ...] = (
+    (
+        "NOT_DOWN",
+        "The control plane still has this node as UP. A kill -9 gives a node no chance "
+        "to say it is going down, and the control plane marks it DOWN after about 30 "
+        "seconds without a heartbeat. Wait about 30 seconds and start it again.",
+    ),
+    (
+        75,  # EX_TEMPFAIL
+        "The node asked to be started again later (for example the control plane still "
+        "has it as UP, or its chain was out of sync and a restart will replay). Check "
+        "the log, wait about 30 seconds and start it again.",
+    ),
+    (
+        74,  # EX_IOERR
+        "The node stopped because of a storage failure. Do not restart it "
+        "automatically: check the disk first.",
+    ),
+)
+
+
+def describe_exit(returncode: int) -> str:
+    """How a process ended: ``killed by SIGABRT`` or ``exited with code 3``."""
+    if returncode < 0:
+        try:
+            name = signal.Signals(-returncode).name
+        except ValueError:
+            name = f"signal {-returncode}"
+        return f"killed by {name}"
+    return f"exited with code {returncode}"
+
+
+def start_failure_hint(returncode: int, log_tail: list[str]) -> str | None:
+    text = "\n".join(log_tail)
+    for key, hint in _START_FAILURE_HINTS:
+        matched = key in text if isinstance(key, str) else key == returncode
+        if matched:
+            return hint
+    return None
+
+
+def read_tail(path: Path, n: int = 50) -> list[str] | None:
+    """The last ``n`` lines of ``path``; ``None`` if it doesn't exist."""
     try:
-        with open(path, "r") as f:
-            lines = f.readlines()
-            tail = lines[-n:]
-            for line in tail:
-                note(line.rstrip())
+        with open(path, "r", errors="replace") as f:
+            return [line.rstrip() for line in f.readlines()[-n:]]
     except FileNotFoundError:
-        note(f"(log file {path} not found)")
+        return None
 
 
-def check_liveness(node: store.Node, proc: subprocess.Popen[bytes], log_path: Path) -> None:
-    # Wait 1 second to ensure that the node starts correctly
+class NodeStartFailed(CliError):
+    """The node's process exited right after `vl node start` spawned it."""
+
+    def __init__(self, label: str, returncode: int, log_path: Path) -> None:
+        tail = read_tail(log_path)
+        self.label = label
+        self.reason = f"exited right after starting ({describe_exit(returncode)})"
+        lines = [f"{label} {self.reason}."]
+        hint = start_failure_hint(returncode, tail or [])
+        if hint:
+            lines.append(hint)
+        lines.append("---- Log tail ----")
+        if tail is None:
+            lines.append(f"(log file {log_path} not found)")
+        else:
+            lines.extend(tail)
+        # Log lines can hold [brackets] that Rich would read as markup.
+        super().__init__("\n".join(escape(line) for line in lines))
+
+
+def check_liveness(
+    node: store.Node, proc: subprocess.Popen[bytes], log_path: Path, label: str
+) -> None:
+    """Raise :class:`NodeStartFailed` if the process has already exited."""
+    # Long enough to catch a rejected registration at the control plane, not just a crash.
     time.sleep(1)
-
-    # If poll() returns something other than None, the process is dead
-    if proc.poll() is not None:
+    returncode = proc.poll()
+    if returncode is not None:
         store.set_node_stopped(node)
-        note(f"Process exited early with code {proc.returncode}")
-        note("---- Log tail ----")
-        print_tail(log_path, n=50)
+        raise NodeStartFailed(label, returncode, log_path)
 
 
 def start_verilock(node: store.Node, node_root: Path, org: str, org_node: int) -> None:
@@ -291,7 +353,7 @@ def start_verilock(node: store.Node, node_root: Path, org: str, org_node: int) -
         )
 
     store.set_pid(node, proc.pid)
-    check_liveness(node, proc, log_path)
+    check_liveness(node, proc, log_path, f"{org}/node{org_node}")
     note(f"Started {org}/node{org_node} (pid: {proc.pid}).")
 
 
