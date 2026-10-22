@@ -347,3 +347,85 @@ def test_org_reset_prompt_still_works_after_the_check(tty: None, node_calls: Nod
     confirmed = runner.invoke(app, ["org", "reset", "globo"], input="y\n", env=WIDE)
     assert confirmed.exit_code == 0, confirmed.output
     assert {verb for verb, _, _ in node_calls.calls} == {"stop", "reset"}
+
+
+# --------------------------------------------------------------------------- #
+# org start: a node that fails to start is reported, the rest still start
+# --------------------------------------------------------------------------- #
+
+import typer
+
+from vl.commands import node as node_cmd
+from pathlib import Path
+
+from vl.commands._shared import CliError, report_errors
+
+
+def _starts(monkeypatch: pytest.MonkeyPatch, module: Any, outcomes: dict[tuple[str, int], str]) -> list[tuple[str, int]]:
+    """Replace node.start: each (org, n) in ``outcomes`` ends as told ("sigabrt",
+    "running" or "error"); every other node starts. Returns the calls made."""
+    calls: list[tuple[str, int]] = []
+
+    def start(org_name: str, n: int, **_: Any) -> None:
+        calls.append((org_name, n))
+        outcome = outcomes.get((org_name, n), "started")
+        with report_errors():  # as the real command does
+            if outcome == "sigabrt":
+                raise node_cmd.NodeStartFailed(f"{org_name}/node{n}", -6, Path("/no/such.out"))
+            if outcome == "error":
+                raise CliError("No such file: verilock")
+            if outcome == "running":
+                print(f"{org_name} node{n} is already running (pid 4312)")
+            else:
+                print(f"Started {org_name}/node{n} (pid: 100{n}).")
+
+    monkeypatch.setattr(module.node, "start", start)
+    return calls
+
+
+def test_org_start_reports_a_failed_node_and_starts_the_rest(monkeypatch: pytest.MonkeyPatch) -> None:
+    _globo_with_nodes(3)
+    add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
+    calls = _starts(monkeypatch, org_cmd, {("globo", 2): "sigabrt"})
+
+    result = runner.invoke(app, ["org", "start", "globo"], env=WIDE)
+
+    assert result.exit_code == 1
+    assert calls == [("globo", 1), ("globo", 2), ("globo", 3)]
+    out = result.output
+    assert "Started globo/node1" in out and "Started globo/node3" in out
+    assert "Started globo/node2" not in out
+    # the node's own error as it happened, then the summary at the end
+    assert "Error: globo/node2 exited right after starting (killed by SIGABRT)." in out
+    assert out.rstrip().endswith(
+        "Error: 1 of 3 nodes in globo failed to start:\n"
+        "  globo/node2: exited right after starting (killed by SIGABRT)"
+    )
+
+
+def test_org_start_summarizes_every_failure_with_its_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    _globo_with_nodes(3)
+    add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
+    _starts(monkeypatch, org_cmd, {("globo", 1): "error", ("globo", 3): "sigabrt"})
+
+    result = runner.invoke(app, ["org", "start", "globo"], env=WIDE)
+
+    assert result.exit_code == 1
+    assert (
+        "Error: 2 of 3 nodes in globo failed to start:\n"
+        "  globo/node1: No such file: verilock\n"
+        "  globo/node3: exited right after starting (killed by SIGABRT)"
+    ) in result.output
+
+
+def test_org_start_an_already_running_node_is_not_a_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    _globo_with_nodes(2)
+    add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
+    _starts(monkeypatch, org_cmd, {("globo", 1): "running"})
+
+    result = runner.invoke(app, ["org", "start", "globo"], env=WIDE)
+
+    assert result.exit_code == 0, result.output
+    assert "globo node1 is already running" in result.output
+    assert "Started globo/node2" in result.output
+    assert "Error" not in result.output and "failed" not in result.output

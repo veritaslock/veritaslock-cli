@@ -857,3 +857,158 @@ def test_missing_node_has_a_real_message(command: str, work: Work, kills: Kills)
 
     assert result.exit_code == 1
     assert "No node globo/node7 in environment 'local'" in result.output
+
+
+# --------------------------------------------------------------------------- #
+# start's liveness check (§5.2 step 4): an early exit is a failure
+# --------------------------------------------------------------------------- #
+
+NOT_DOWN_LOG = (
+    "2026-10-20 10:00:00 [main] INFO registering globo/node1\n"
+    "2026-10-20 10:00:01 [main] ERROR registration failed: "
+    "409 (NOT_DOWN): node org_node=1 is not DOWN on the control plane\n"
+)
+
+
+class FakeProcess:
+    """Stands in for subprocess.Popen: writes ``log`` to the node's log file, then
+    reports ``returncode`` from poll() (``None``: still running)."""
+
+    pid = 367635
+
+    def __init__(self, returncode: int | None, log: str) -> None:
+        self.returncode = returncode
+        self.log = log
+
+    def __call__(self, args: list[str], *, stdout: Any, **_: Any) -> FakeProcess:
+        stdout.write(self.log)
+        return self
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+
+@pytest.fixture
+def spawn(home: Path, kills: Kills, monkeypatch: pytest.MonkeyPatch, operator: store.Identity) -> Any:
+    """Run `vl node start globo 1` against a fake verilock that ends as told."""
+    _org()
+    _node()
+    monkeypatch.setattr(node_cmd, "populate_node_dir", lambda env, org, n, node: home)
+
+    def run(returncode: int | None, log: str = "") -> Any:
+        fake = FakeProcess(returncode, log)
+        monkeypatch.setattr(node_cmd.subprocess, "Popen", fake)
+        return runner.invoke(app, ["node", "start", "globo", "1"], env=WIDE)
+
+    return run
+
+
+def _assert_stopped() -> None:
+    row = store.get_node("local", "globo", 1)
+    assert row.pid is None and row.node_state == "STOPPED"
+
+
+def test_start_killed_by_sigabrt_on_not_down_is_a_failure_with_a_hint(spawn: Any) -> None:
+    result = spawn(-6, NOT_DOWN_LOG)
+
+    assert result.exit_code == 1
+    assert "Started" not in result.output
+    _assert_stopped()
+    out = result.output
+    first = out.index("Error: globo/node1 exited right after starting (killed by SIGABRT).")
+    hint = out.index("The control plane still has this node as UP.")
+    tail = out.index("---- Log tail ----")
+    line = out.index("[main] ERROR registration failed: 409 (NOT_DOWN)")  # brackets kept
+    assert first < hint < tail < line
+    assert "Wait about 30 seconds and start it again." in " ".join(out.split())  # Rich wraps
+
+
+@pytest.mark.parametrize(
+    ("code", "hint"),
+    [
+        (69, "The control plane still has this node as UP. Wait about 30 seconds for its heartbeat timeout"),
+        (75, "The node asked to be started again later"),
+        (74, "The node stopped because of a storage failure. Do not restart it automatically"),
+    ],
+)
+def test_start_exit_codes_with_a_known_meaning_get_a_hint(spawn: Any, code: int, hint: str) -> None:
+    result = spawn(code, "some log line\n")
+
+    assert result.exit_code == 1
+    assert f"globo/node1 exited right after starting (exited with code {code})." in result.output
+    out = " ".join(result.output.split())  # Rich wraps long lines
+    assert hint in out
+    assert out.index(hint) < out.index("---- Log tail ----")
+    assert "some log line" in result.output
+    assert "Started" not in result.output
+    _assert_stopped()
+
+
+def test_start_exit_69_uses_its_own_hint_even_with_not_down_in_the_log(spawn: Any) -> None:
+    result = spawn(69, NOT_DOWN_LOG)
+
+    assert result.exit_code == 1
+    out = " ".join(result.output.split())  # Rich wraps long lines
+    assert "globo/node1 exited right after starting (exited with code 69)." in out
+    assert "Wait about 30 seconds for its heartbeat timeout and start it again." in out
+    assert "A kill -9" not in out
+    assert "409 (NOT_DOWN)" in out  # still in the log tail
+    _assert_stopped()
+
+
+def test_start_other_exit_code_gets_no_hint(spawn: Any) -> None:
+    result = spawn(1, "error: missing liblog4cplus.so.3\n")
+
+    assert result.exit_code == 1
+    lines = result.output.splitlines()
+    assert lines[0] == "Error: globo/node1 exited right after starting (exited with code 1)."
+    assert lines[1] == "---- Log tail ----"
+    assert lines[2] == "error: missing liblog4cplus.so.3"
+    _assert_stopped()
+
+
+def test_start_unknown_signal_falls_back_to_its_number(spawn: Any) -> None:
+    result = spawn(-99)
+
+    assert result.exit_code == 1
+    assert "exited right after starting (killed by signal 99)." in result.output
+    _assert_stopped()
+
+
+def test_start_a_live_process_is_started(spawn: Any) -> None:
+    result = spawn(None, "listening\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Started globo/node1 (pid: 367635)." in result.output
+    assert "Error" not in result.output
+    row = store.get_node("local", "globo", 1)
+    assert row.pid == 367635 and row.node_state == "RUNNING"
+
+
+def test_start_already_running_is_unchanged(spawn: Any, kills: Kills, monkeypatch: pytest.MonkeyPatch) -> None:
+    store.set_pid(store.get_node("local", "globo", 1), 4312)
+    kills.alive.add(4312)
+    spawned: list[Any] = []
+    monkeypatch.setattr(node_cmd.subprocess, "Popen", lambda *a, **k: spawned.append(a))
+
+    result = runner.invoke(app, ["node", "start", "globo", "1"], env=WIDE)
+
+    assert result.exit_code == 0, result.output
+    assert "globo node1 is already running (pid 4312)" in result.output
+    assert spawned == []
+
+
+@pytest.mark.parametrize(
+    ("code", "text"),
+    [(-6, "killed by SIGABRT"), (-9, "killed by SIGKILL"), (-99, "killed by signal 99"),
+     (0, "exited with code 0"), (75, "exited with code 75")],
+)
+def test_describe_exit(code: int, text: str) -> None:
+    assert node_cmd.describe_exit(code) == text
+
+
+def test_start_failure_hint_prefers_the_log_marker() -> None:
+    # A NOT_DOWN abort that also exits 75 gets the more specific NOT_DOWN hint.
+    hint = node_cmd.start_failure_hint(75, ["409 (NOT_DOWN): node org_node=1 is not DOWN"])
+    assert hint is not None and hint.startswith("The control plane still has this node as UP.")
+    assert node_cmd.start_failure_hint(3, ["nothing useful"]) is None

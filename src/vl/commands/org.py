@@ -14,7 +14,7 @@ from typing import Annotated, Any
 import typer
 
 from vl.commands import node
-from vl.commands._shared import AsOption, EnvOption, report_errors, CliError, require_operator
+from vl.commands._shared import AsOption, EnvOption, report_errors, CliError, failure_reason, require_operator
 from vl.lib import api, auth, store
 from vl.lib.cli import HelpOnErrorGroup
 from vl.lib.output import console, note, render
@@ -200,11 +200,24 @@ def start(
         caller = require_operator(environment, as_, org)
         organization = store.get_organization(environment.name, org)
         nodes = store.get_nodes(environment, organization)
+        failures: list[tuple[str, str]] = []
         for node_ in nodes:
             try:
                 node.start(organization.name, node_.org_node, env=environment.name, as_=caller.label)
-            except Exception as e:
-                note(f"Warning: {e}")
+            except Exception as e:  # keep starting the rest; node.start printed its own error
+                failures.append((f"{organization.name}/node{node_.org_node}", failure_reason(e)))
+        if failures:
+            raise OrgStartFailed(organization.name, len(nodes), failures)
+
+
+class OrgStartFailed(CliError):
+    """Some of an org's nodes failed to start; ``failures`` is ``[(org/nodeN, reason)]``."""
+
+    def __init__(self, org_name: str, total: int, failures: list[tuple[str, str]]) -> None:
+        self.failures = failures
+        lines = [f"{len(failures)} of {total} nodes in {org_name} failed to start:"]
+        lines += [f"  {label}: {reason}" for label, reason in failures]
+        super().__init__("\n".join(lines))
 
 
 def stop_and_optionally_reset_nodes(environment: Environment, nodes: list[Node], organization: Organization,
