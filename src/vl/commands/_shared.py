@@ -46,6 +46,22 @@ def report_errors() -> Iterator[None]:
         raise typer.Exit(1) from exc
 
 
+def failure_reason(exc: BaseException) -> str:
+    """A one-line reason for a failed sub-command, for a batch command's summary.
+
+    A command called as a function inside ``report_errors`` has already printed its
+    error and raised ``typer.Exit`` from it; the reason comes from that cause. A
+    :class:`~vl.commands.node.NodeStartFailed` gives its short ``reason``, without
+    the log tail it printed.
+    """
+    cause = exc.__cause__ if isinstance(exc, typer.Exit) and exc.__cause__ else exc
+    reason = getattr(cause, "reason", None)
+    if isinstance(reason, str):
+        return reason
+    lines = str(cause).splitlines()
+    return lines[0] if lines else type(cause).__name__
+
+
 def _fmt_field_error(field_error: Any) -> str:
     if isinstance(field_error, dict):
         name = field_error.get("field") or field_error.get("name") or "?"

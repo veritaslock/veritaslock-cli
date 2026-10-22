@@ -12,7 +12,9 @@ from typing import Annotated, Any
 import typer
 
 from vl.commands import org
-from vl.commands._shared import AsOption, EnvOption, report_errors, CliError, org_name_resolver, require_operator
+from vl.commands._shared import (
+    AsOption, EnvOption, report_errors, CliError, failure_reason, org_name_resolver, require_operator,
+)
 from vl.lib import auth, store, api
 from vl.lib.cli import HelpOnErrorGroup
 from vl.lib.output import note, render
@@ -42,11 +44,20 @@ def start(
         caller = require_operator(environment, as_)
 
         orgs = curate_orgs(environment)
+        failures: list[tuple[str, str]] = []
         for org_ in orgs:
             try:
                 org.start(org_.name, env=environment.name, as_=caller.label)
-            except Exception as e:
-                note(f"Warning: {e}")
+            except Exception as e:  # keep starting the other orgs; org.start printed its own error
+                cause = e.__cause__ if isinstance(e, typer.Exit) else e
+                if isinstance(cause, org.OrgStartFailed):
+                    failures.extend(cause.failures)
+                else:
+                    failures.append((org_.name, failure_reason(e)))
+        if failures:
+            lines = [f"{len(failures)} failed to start across the network:"]
+            lines += [f"  {label}: {reason}" for label, reason in failures]
+            raise CliError("\n".join(lines))
 
 
 

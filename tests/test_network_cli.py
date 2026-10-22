@@ -354,3 +354,98 @@ def test_network_start_and_stop_without_an_identity_are_refused(verb: str, org_c
     assert result.exit_code == 1
     assert "No identity selected" in result.output
     assert org_calls == []
+
+
+# --------------------------------------------------------------------------- #
+# network start: failed nodes in any org are summarized, the rest still start
+# --------------------------------------------------------------------------- #
+
+from pathlib import Path
+
+from vl.commands import node as node_cmd
+from vl.commands._shared import CliError, report_errors
+
+
+def _org_with_nodes(name: str, org_id: str, count: int) -> None:
+    store.ensure_local_environment_seeded()
+    store.upsert_organization("local", name, org_id, name.title(), True, "2026-01-01T00:00:00Z")
+    for n in range(1, count + 1):
+        sa = store.add_identity("local", "SERVICE_ACCOUNT", f"sa-{name}-{n}", f"{name}-{n}", f"{name}-{n}")
+        store.set_svc_acct(sa.id, "local", name, f"client-{name}-{n}", "secret", role="NODE")
+        store.add_node("local", name, n, sa.id, 7000 + n)
+
+
+@pytest.fixture
+def node_starts(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Run network start through the real org start, with node.start replaced."""
+
+    def install(failing: dict[tuple[str, int], str]) -> list[tuple[str, int]]:
+        calls: list[tuple[str, int]] = []
+
+        def start(org_name: str, n: int, **_: Any) -> None:
+            calls.append((org_name, n))
+            with report_errors():  # as the real command does
+                if failing.get((org_name, n)) == "sigabrt":
+                    raise node_cmd.NodeStartFailed(f"{org_name}/node{n}", -6, Path("/no/such.out"))
+                if failing.get((org_name, n)) == "exit75":
+                    raise node_cmd.NodeStartFailed(f"{org_name}/node{n}", 75, Path("/no/such.out"))
+                print(f"Started {org_name}/node{n} (pid: 100{n}).")
+
+        monkeypatch.setattr(network.org.node, "start", start)
+        return calls
+
+    _org_with_nodes("globo", "org-1", 2)
+    _org_with_nodes("acme", "org-2", 2)
+    add_user("ops", [{"orgId": "veritaslock", "role": "PLATFORM_ADMIN"}])
+    return install
+
+
+def test_network_start_summarizes_failed_nodes_and_starts_the_rest(node_starts: Any) -> None:
+    calls = node_starts({("globo", 2): "sigabrt", ("acme", 1): "exit75"})
+
+    result = runner.invoke(app, ["network", "start"], env=WIDE)
+
+    assert result.exit_code == 1
+    assert calls == [("globo", 1), ("globo", 2), ("acme", 1), ("acme", 2)]
+    out = result.output
+    assert "Started globo/node1" in out and "Started acme/node2" in out
+    assert "Error: 1 of 2 nodes in globo failed to start:" in out
+    assert "Error: 1 of 2 nodes in acme failed to start:" in out
+    assert out.rstrip().endswith(
+        "Error: 2 failed to start across the network:\n"
+        "  globo/node2: exited right after starting (killed by SIGABRT)\n"
+        "  acme/node1: exited right after starting (exited with code 75)"
+    )
+
+
+def test_network_start_without_failures_is_unchanged(node_starts: Any) -> None:
+    calls = node_starts({})
+
+    result = runner.invoke(app, ["network", "start"], env=WIDE)
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 4
+    assert "Error" not in result.output and "failed" not in result.output
+
+
+def test_network_start_reports_an_org_that_fails_outright(
+    node_starts: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    node_starts({})
+
+    def broken(org_name: str, **_: Any) -> None:
+        with report_errors():
+            raise CliError(f"cannot read nodes for {org_name}")
+
+    real = network.org.start
+    monkeypatch.setattr(
+        network.org, "start", lambda name, **kw: broken(name) if name == "acme" else real(name, **kw)
+    )
+
+    result = runner.invoke(app, ["network", "start"], env=WIDE)
+
+    assert result.exit_code == 1
+    assert "Started globo/node1" in result.output and "Started globo/node2" in result.output
+    assert result.output.rstrip().endswith(
+        "Error: 1 failed to start across the network:\n  acme: cannot read nodes for acme"
+    )
