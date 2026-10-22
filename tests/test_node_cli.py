@@ -926,6 +926,7 @@ def test_start_killed_by_sigabrt_on_not_down_is_a_failure_with_a_hint(spawn: Any
 @pytest.mark.parametrize(
     ("code", "hint"),
     [
+        (69, "The control plane still has this node as UP. Wait about 30 seconds for its heartbeat timeout"),
         (75, "The node asked to be started again later"),
         (74, "The node stopped because of a storage failure. Do not restart it automatically"),
     ],
@@ -940,6 +941,18 @@ def test_start_exit_codes_with_a_known_meaning_get_a_hint(spawn: Any, code: int,
     assert out.index(hint) < out.index("---- Log tail ----")
     assert "some log line" in result.output
     assert "Started" not in result.output
+    _assert_stopped()
+
+
+def test_start_exit_69_uses_its_own_hint_even_with_not_down_in_the_log(spawn: Any) -> None:
+    result = spawn(69, NOT_DOWN_LOG)
+
+    assert result.exit_code == 1
+    out = " ".join(result.output.split())  # Rich wraps long lines
+    assert "globo/node1 exited right after starting (exited with code 69)." in out
+    assert "Wait about 30 seconds for its heartbeat timeout and start it again." in out
+    assert "A kill -9" not in out
+    assert "409 (NOT_DOWN)" in out  # still in the log tail
     _assert_stopped()
 
 

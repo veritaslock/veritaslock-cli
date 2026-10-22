@@ -242,10 +242,16 @@ def populate_node_dir(environment: store.Environment, org: str, n: int, node: st
 
 
 # Hints for a node that exits right after `vl node start` (vl-node-spec.md §5.2
-# step 4), keyed by a marker in its log tail or by its exit code. First match wins.
+# step 4), keyed by its exit code or a marker in its log tail. First match wins.
+# Exit code 1 (any other startup failure) has no hint: the log tail says why.
 _START_FAILURE_HINTS: tuple[tuple[str | int, str], ...] = (
     (
-        "NOT_DOWN",
+        69,  # EX_UNAVAILABLE: the control plane answered 409 NOT_DOWN
+        "The control plane still has this node as UP. Wait about 30 seconds for its "
+        "heartbeat timeout and start it again.",
+    ),
+    (
+        "NOT_DOWN",  # older binaries abort (SIGABRT) instead, so match the log text
         "The control plane still has this node as UP. A kill -9 gives a node no chance "
         "to say it is going down, and the control plane marks it DOWN after about 30 "
         "seconds without a heartbeat. Wait about 30 seconds and start it again.",
