@@ -1,14 +1,15 @@
 """Tests for `vl network reset` (control plane mocked with respx).
 
-The per-org work (`vl org reset`, which stops and resets real nodes) is replaced
-with a recorder, so these tests cover only what `network reset` itself owns: the
+The per-org work (`vl org reset`, which resets real nodes) is replaced with a
+recorder, so these tests cover only what `network reset` itself owns: the
 control-plane dry run and real call, the prompt, error reporting, and calling
-`org reset` per org in the right order.
+`org reset` per org in the right order. One test runs the real `org reset`.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -103,6 +104,54 @@ def test_yes_skips_dry_run_and_resets_cp_then_every_org(org_resets: list) -> Non
     assert [name for name, _ in org_resets] == ["zeta", "acme", "globo"]
     assert all(kw["include_snapshots"] is True and kw["yes"] is True for _, kw in org_resets)
     assert all(kw["as_"] == "root" and kw["env"] == "local" for _, kw in org_resets)
+
+
+@respx.mock
+def test_yes_runs_the_real_org_reset_for_every_org(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After the control-plane reset every node is DOWN: the real org reset (and
+    node reset under it) checks each node once, stops nothing, and clears it."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _caller()
+    _orgs("globo", "acme")
+    dirs = []
+    for org_name in ("globo", "acme"):
+        for n in (1, 2):
+            sa = add_service_account(f"{org_name}-{n}", org_name, "NODE")
+            row = store.add_node("local", org_name, n, sa.id, 7000 + n)
+            store.set_node_stopped(store.set_pid(row, 4300 + n))  # has run: org reset checks it
+            root = tmp_path / "orgs" / org_name / "nodes" / f"node{n}"
+            for sub in ("data", "snapshots"):
+                (root / sub).mkdir(parents=True)
+                (root / sub / "x").write_text("state")
+            dirs.append(root)
+    checks: list[tuple[str, int]] = []
+
+    def fetch_node_by_id(environment: store.Environment, node_: store.Node) -> dict[str, Any]:
+        checks.append((node_.org_name, node_.org_node))
+        return {"state": "DOWN"}
+
+    signals: list[int] = []
+    monkeypatch.setattr(network.org.node, "fetch_node_by_id", fetch_node_by_id)
+    monkeypatch.setattr(network.org.node.os, "kill", lambda pid, sig: signals.append(pid))
+    monkeypatch.setattr(network.org.node, "stop", lambda *a, **kw: signals.append(-1))
+    real = respx.post(RESET_URL, params={"dryRun": "false"}).mock(return_value=_ok(False))
+
+    result = runner.invoke(app, ["network", "reset", "--yes"], env=WIDE)
+
+    assert result.exit_code == 0, result.output
+    assert "Warning" not in result.output and "not down" not in result.output
+    assert real.call_count == 1
+    # acme first, globo last; per org, org reset's check, then each node reset's own check
+    assert checks == [
+        ("acme", 2), ("acme", 1), ("acme", 2), ("acme", 1),
+        ("globo", 2), ("globo", 1), ("globo", 2), ("globo", 1),
+    ]
+    assert signals == []
+    for root in dirs:
+        assert not (root / "data" / "x").exists() and not (root / "snapshots" / "x").exists()
+    assert "Deleted globo/node1's data and snapshots directories." in result.output
 
 
 @respx.mock
@@ -360,7 +409,6 @@ def test_network_start_and_stop_without_an_identity_are_refused(verb: str, org_c
 # network start: failed nodes in any org are summarized, the rest still start
 # --------------------------------------------------------------------------- #
 
-from pathlib import Path
 
 from vl.commands import node as node_cmd
 from vl.commands._shared import CliError, report_errors

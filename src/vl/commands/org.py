@@ -220,10 +220,9 @@ class OrgStartFailed(CliError):
         super().__init__("\n".join(lines))
 
 
-def stop_and_optionally_reset_nodes(environment: Environment, nodes: list[Node], organization: Organization,
-                                    caller: store.Identity, include_snapshots: bool = False,
-                                    reset_: bool | None = None) -> None:
-    """Stop (and with ``reset_``, reset) each node, as ``caller``, who each node command re-checks.
+def stop_nodes(environment: Environment, nodes: list[Node], organization: Organization,
+               caller: store.Identity) -> None:
+    """Stop each node, as ``caller``, who each node command re-checks.
 
     The poll for DOWN still authenticates as each node's own service account
     (``node.node_is_up``): the operator identity only gates the commands.
@@ -247,10 +246,6 @@ def stop_and_optionally_reset_nodes(environment: Environment, nodes: list[Node],
                     break
                 cnt += 1
 
-            if reset_ and node_stopped:
-                node.reset(organization.name, node_.org_node, include_snapshots=include_snapshots, yes=True,
-                           env=environment.name, as_=caller.label)
-
             if not node_stopped:
                 note (f"Warning: {organization.name}-node{node_.org_node} is still reported UP by the control plane.")
 
@@ -271,7 +266,45 @@ def stop(
         caller = require_operator(environment, as_, org)
         organization = store.get_organization(environment.name, org)
         nodes = store.get_nodes(environment, organization)
-        stop_and_optionally_reset_nodes(environment, nodes, organization, caller)
+        stop_nodes(environment, nodes, organization, caller)
+
+
+def nodes_not_down(environment: Environment, nodes: list[Node]) -> list[tuple[str, str]]:
+    """``[(org/nodeN, state)]`` for each node the control plane doesn't report DOWN.
+
+    One state check per node, as its own service account, the same single call
+    ``vl node reset`` makes. A NEW node has never registered, so it isn't checked.
+    """
+    not_down: list[tuple[str, str]] = []
+    for node_ in nodes:
+        if node_.node_state == "NEW":
+            continue
+        dto = node.fetch_node_by_id(environment, node_)
+        assert dto is not None
+        state: str = dto["state"]
+        if state != "DOWN":
+            not_down.append((f"{node_.org_name}/node{node_.org_node}", state))
+    return not_down
+
+
+class OrgResetRefused(CliError):
+    """Some of an org's nodes aren't DOWN, so nothing was reset."""
+
+    def __init__(self, org_name: str, not_down: list[tuple[str, str]]) -> None:
+        lines = [f"Can't reset org '{org_name}': every node must be down, and these are not:"]
+        lines += [f"  {label} ({state})" for label, state in not_down]
+        lines.append(f"Run `vl org stop {org_name}` first.")
+        super().__init__("\n".join(lines))
+
+
+class OrgResetIncomplete(CliError):
+    """Some of an org's nodes weren't reset; ``failures`` is ``[(org/nodeN, reason)]``."""
+
+    def __init__(self, org_name: str, total: int, failures: list[tuple[str, str]]) -> None:
+        self.failures = failures
+        lines = [f"{len(failures)} of {total} nodes in {org_name} were not reset:"]
+        lines += [f"  {label}: {reason}" for label, reason in failures]
+        super().__init__("\n".join(lines))
 
 
 @app.command("reset")
@@ -290,24 +323,44 @@ def reset(
     ] = None,
     env: EnvOption = None,
     as_: AsOption = None) -> None:
-    """Resets all nodes in an organization. Needs ORG_ADMIN of the org, or PLATFORM_ADMIN."""
+    """Reset all nodes in an organization. Needs ORG_ADMIN of the org, or PLATFORM_ADMIN.
+
+    Every node must already be down (run `vl org stop` first); this stops nothing.
+    If any node is not down, nothing is reset.
+    """
     with report_errors():
         environment = store.get_environment(env)
         caller = require_operator(environment, as_, org)
         organization = store.get_organization(environment.name, org)
         org_name = organization.name
+        nodes = store.get_nodes(environment, organization)
+        nodes.reverse()
+        not_down = nodes_not_down(environment, nodes)
+        if not_down:
+            raise OrgResetRefused(org_name, not_down)
         if not yes:
             if not sys.stdin.isatty():
                 raise CliError("vl org reset requires confirmation; pass --yes to run non-interactively")
-            prompt_prefix = f"Reset all nodes in org '{org_name}'?"
             if include_snapshots:
-                prompt_prefix = f"Reset all nodes in org '{org_name}' including snapshots?"
+                prompt_prefix = f"Reset the data and snapshots directories of ALL nodes in org '{org_name}'?"
+            else:
+                prompt_prefix = f"Reset ALL nodes in org '{org_name}'?"
             yes = typer.confirm(
-                f"{prompt_prefix} Any that are running will be stopped and "
-                f"all local blockchain state will be deleted. Are you sure?",
+                f"{prompt_prefix} This permanently deletes all local blockchain state. Are you sure (y/N)?",
                 default=False,
+                show_default=False,
+                prompt_suffix=" ",
             )
 
         if yes:
-            nodes = store.get_nodes(environment, organization)
-            stop_and_optionally_reset_nodes(environment, nodes, organization, caller, include_snapshots, True)
+            failures: list[tuple[str, str]] = []
+            for node_ in nodes:
+                label = f"{org_name}/node{node_.org_node}"
+                try:
+                    if not node.reset(org_name, node_.org_node, include_snapshots=include_snapshots, yes=True,
+                                      env=environment.name, as_=caller.label):
+                        failures.append((label, "skipped: reported UP by the control plane when its turn came"))
+                except Exception as e:  # keep resetting the rest; node.reset printed its own error
+                    failures.append((label, failure_reason(e)))
+            if failures:
+                raise OrgResetIncomplete(org_name, len(nodes), failures)
