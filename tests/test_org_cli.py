@@ -158,6 +158,7 @@ def test_update_patches_by_name() -> None:
 # then passed down to every node command (vl-authorization-spec.md §3.5)
 # --------------------------------------------------------------------------- #
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -165,20 +166,28 @@ import pytest
 
 from _helpers import add_service_account, add_user
 from vl.commands import org as org_cmd
+from vl.commands._shared import CliError, report_errors
 
 WIDE = {"COLUMNS": "200"}
 
 
 class NodeCalls:
-    """Records the node commands org start/stop/reset make, and the DOWN polls."""
+    """Records the node commands org start/stop/reset make, stop's DOWN polls,
+    reset's state checks (each node reports ``states.get(n, "DOWN")``), the
+    signals sent, and the order checks and prompts happen in (``events``)."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, int, dict[str, Any]]] = []
         self.polled: list[int] = []
+        self.checked: list[int] = []
+        self.states: dict[int, str] = {}
+        self.signals: list[tuple[int, int]] = []
+        self.events: list[str] = []
 
     def recorder(self, verb: str) -> Any:
-        def call(org_name: str, n: int, **kwargs: Any) -> None:
+        def call(org_name: str, n: int, **kwargs: Any) -> bool:
             self.calls.append((verb, n, kwargs))
+            return True  # node.reset: it deleted the node's data
         return call
 
 
@@ -192,19 +201,30 @@ def node_calls(monkeypatch: pytest.MonkeyPatch) -> NodeCalls:
         nc.polled.append(node_.org_node)  # as the node's own service account, not the operator
         return False
 
+    def fetch_node_by_id(environment: store.Environment, node_: store.Node) -> dict[str, Any]:
+        nc.checked.append(node_.org_node)
+        nc.events.append(f"check {node_.org_node}")
+        return {"state": nc.states.get(node_.org_node, "DOWN")}
+
     monkeypatch.setattr(org_cmd.node, "node_is_up", node_is_up)
+    monkeypatch.setattr(org_cmd.node, "fetch_node_by_id", fetch_node_by_id)
+    monkeypatch.setattr(org_cmd.node.os, "kill", lambda pid, sig: nc.signals.append((pid, sig)))
     monkeypatch.setattr(org_cmd.time, "sleep", lambda s: None)
     return nc
 
 
-def _globo_with_nodes(count: int = 2) -> None:
+def _globo_with_nodes(count: int = 2, *, new: set[int] | None = None) -> None:
+    """``count`` globo nodes, all NEW unless ``new`` is given: then every node
+    not in it has run once (STOPPED), so org reset checks its state."""
     store.ensure_local_environment_seeded()
     store.upsert_organization("local", "globo", "org-1", "Globo", True, "2026-01-01T00:00:00Z")
     store.upsert_organization("local", "acme", "org-2", "Acme", True, "2026-01-01T00:00:00Z")
     for n in range(1, count + 1):
         sa = store.add_identity("local", "SERVICE_ACCOUNT", f"sa-{n}", f"globo-{n}", f"globo-{n}")
         store.set_svc_acct(sa.id, "local", "globo", f"client-{n}", "secret", role="NODE")
-        store.add_node("local", "globo", n, sa.id, 7000 + n)
+        row = store.add_node("local", "globo", n, sa.id, 7000 + n)
+        if new is not None and n not in new:
+            store.set_node_stopped(store.set_pid(row, 4300 + n))
 
 
 ORG_COMMANDS = {
@@ -212,7 +232,7 @@ ORG_COMMANDS = {
     "stop": ["org", "stop", "globo"],
     "reset": ["org", "reset", "globo", "--yes"],
 }
-NODE_VERBS = {"start": {"start"}, "stop": {"stop"}, "reset": {"stop", "reset"}}
+NODE_VERBS = {"start": {"start"}, "stop": {"stop"}, "reset": {"reset"}}
 
 
 @pytest.mark.parametrize("command", list(ORG_COMMANDS))
@@ -256,6 +276,17 @@ def test_org_reset_passes_include_snapshots_down(node_calls: NodeCalls) -> None:
     assert resets and all(kw["include_snapshots"] is True and kw["yes"] is True for kw in resets)
 
 
+def test_org_reset_without_include_snapshots_passes_false_down(node_calls: NodeCalls) -> None:
+    _globo_with_nodes()
+    add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
+
+    result = runner.invoke(app, ORG_COMMANDS["reset"], env=WIDE)
+
+    assert result.exit_code == 0, result.output
+    resets = [kw for verb, _, kw in node_calls.calls if verb == "reset"]
+    assert resets and all(kw["include_snapshots"] is False and kw["yes"] is True for kw in resets)
+
+
 def test_org_stop_still_polls_as_each_nodes_own_account(node_calls: NodeCalls) -> None:
     _globo_with_nodes()
     add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
@@ -282,7 +313,7 @@ def test_org_command_refusal_calls_no_node_command(command: str, who: str, node_
 
     assert result.exit_code == 1
     assert "'ops' is not an admin of 'globo'" in result.output
-    assert node_calls.calls == [] and node_calls.polled == []
+    assert node_calls.calls == [] and node_calls.polled == [] and node_calls.checked == []
 
 
 @pytest.mark.parametrize("command", list(ORG_COMMANDS))
@@ -337,7 +368,7 @@ def test_org_reset_refusal_never_shows_the_prompt(tty: None, node_calls: NodeCal
 
 
 def test_org_reset_prompt_still_works_after_the_check(tty: None, node_calls: NodeCalls) -> None:
-    _globo_with_nodes()
+    _globo_with_nodes(new=set())
     add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
 
     declined = runner.invoke(app, ["org", "reset", "globo"], input="n\n", env=WIDE)
@@ -346,7 +377,197 @@ def test_org_reset_prompt_still_works_after_the_check(tty: None, node_calls: Nod
 
     confirmed = runner.invoke(app, ["org", "reset", "globo"], input="y\n", env=WIDE)
     assert confirmed.exit_code == 0, confirmed.output
-    assert {verb for verb, _, _ in node_calls.calls} == {"stop", "reset"}
+    assert {verb for verb, _, _ in node_calls.calls} == {"reset"}
+
+
+# --------------------------------------------------------------------------- #
+# org reset: every node must already be DOWN; it stops nothing
+# --------------------------------------------------------------------------- #
+
+
+def test_org_reset_refuses_naming_every_node_that_is_not_down(node_calls: NodeCalls) -> None:
+    _globo_with_nodes(3, new=set())
+    add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
+    node_calls.states = {1: "UP", 3: "STARTING"}
+
+    result = runner.invoke(app, ORG_COMMANDS["reset"], env=WIDE)
+
+    assert result.exit_code == 1
+    assert "Can't reset org 'globo': every node must be down, and these are not:" in result.output
+    assert "globo/node3 (STARTING)" in result.output and "globo/node1 (UP)" in result.output
+    assert "globo/node2" not in result.output
+    assert "Run `vl org stop globo` first." in result.output
+    assert node_calls.checked == [3, 2, 1]  # one check per node, no poll
+    assert node_calls.calls == [] and node_calls.polled == [] and node_calls.signals == []
+
+
+def test_org_reset_refuses_when_only_one_of_several_nodes_is_up(node_calls: NodeCalls) -> None:
+    _globo_with_nodes(3, new=set())
+    add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
+    node_calls.states = {2: "UP"}
+
+    result = runner.invoke(app, ORG_COMMANDS["reset"], env=WIDE)
+
+    assert result.exit_code == 1
+    assert "globo/node2 (UP)" in result.output
+    assert node_calls.calls == [] and node_calls.signals == []
+
+
+def test_org_reset_resets_every_node_when_all_are_down(node_calls: NodeCalls) -> None:
+    _globo_with_nodes(3, new=set())
+    add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
+
+    result = runner.invoke(app, ORG_COMMANDS["reset"], env=WIDE)
+
+    assert result.exit_code == 0, result.output
+    assert node_calls.checked == [3, 2, 1]
+    assert [(verb, n) for verb, n, _ in node_calls.calls] == [("reset", 3), ("reset", 2), ("reset", 1)]
+    assert node_calls.polled == [] and node_calls.signals == []
+
+
+def test_org_reset_does_not_check_new_nodes(node_calls: NodeCalls) -> None:
+    _globo_with_nodes(3, new={1, 2})
+    add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
+    node_calls.states = {1: "UP", 2: "UP"}  # never asked: a NEW node has never registered
+
+    result = runner.invoke(app, ORG_COMMANDS["reset"], env=WIDE)
+
+    assert result.exit_code == 0, result.output
+    assert node_calls.checked == [3]
+    assert [n for _, n, _ in node_calls.calls] == [3, 2, 1]
+
+
+def test_org_reset_role_check_comes_before_the_state_check(node_calls: NodeCalls) -> None:
+    _globo_with_nodes(2, new=set())
+    add_user("ops", [{"orgId": "org-1", "role": "USER"}])
+    node_calls.states = {1: "UP"}
+
+    result = runner.invoke(app, ORG_COMMANDS["reset"], env=WIDE)
+
+    assert result.exit_code == 1
+    assert "'ops' is not an admin of 'globo'" in result.output
+    assert "not down" not in result.output
+    assert node_calls.checked == [] and node_calls.calls == []
+
+
+def test_org_reset_prompts_once_after_the_check(
+    tty: None, node_calls: NodeCalls, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _globo_with_nodes(2, new=set())
+    add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
+
+    def confirm(text: str, **_: Any) -> bool:
+        node_calls.events.append("prompt")
+        return True
+
+    monkeypatch.setattr(org_cmd.typer, "confirm", confirm)
+    result = runner.invoke(app, ["org", "reset", "globo"], env=WIDE)
+
+    assert result.exit_code == 0, result.output
+    assert node_calls.events == ["check 2", "check 1", "prompt"]
+    assert [n for _, n, _ in node_calls.calls] == [2, 1]
+
+
+def test_org_reset_prompt_is_never_shown_when_the_check_refuses(tty: None, node_calls: NodeCalls) -> None:
+    _globo_with_nodes(2, new=set())
+    add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
+    node_calls.states = {1: "UP"}
+
+    result = runner.invoke(app, ["org", "reset", "globo"], input="y\n", env=WIDE)
+
+    assert result.exit_code == 1
+    assert "Are you sure" not in result.output
+    assert node_calls.calls == []
+
+
+@pytest.mark.parametrize(
+    ("flags", "prompt"),
+    [
+        ([], "Reset ALL nodes in org 'globo'? This permanently deletes all local blockchain state. "
+             "Are you sure (y/N)? "),
+        (["--include-snapshots"],
+         "Reset the data and snapshots directories of ALL nodes in org 'globo'? "
+         "This permanently deletes all local blockchain state. Are you sure (y/N)? "),
+    ],
+    ids=["data", "data-and-snapshots"],
+)
+def test_org_reset_prompt_wording(flags: list[str], prompt: str, tty: None, node_calls: NodeCalls) -> None:
+    _globo_with_nodes()
+    add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
+
+    result = runner.invoke(app, ["org", "reset", "globo", *flags], input="n\n", env=WIDE)
+
+    assert result.exit_code == 0, result.output
+    assert result.output.startswith(prompt)
+    assert result.output.count("Are you sure") == 1
+    assert node_calls.calls == []
+
+
+def test_org_reset_without_a_tty_or_yes_refuses_after_the_check(node_calls: NodeCalls) -> None:
+    _globo_with_nodes(2, new=set())
+    add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
+
+    result = runner.invoke(app, ["org", "reset", "globo"], env=WIDE)
+
+    assert result.exit_code == 1
+    assert "vl org reset requires confirmation; pass --yes to run non-interactively" in result.output
+    assert node_calls.checked == [2, 1] and node_calls.calls == []
+
+
+def _node_data(home: Path, n: int) -> Path:
+    data = home / "orgs" / "globo" / "nodes" / f"node{n}" / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    (data / "chain.db").write_text("blocks")
+    return data
+
+
+def test_org_reset_reports_a_node_that_came_up_after_the_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real node.reset: its own check skips node2, which came up between
+    org reset's check and its turn; that is reported, and the exit is non-zero."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _globo_with_nodes(3, new=set())
+    add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
+    data = {n: _node_data(tmp_path, n) for n in (1, 2, 3)}
+    checks: list[int] = []
+
+    def fetch_node_by_id(environment: store.Environment, node_: store.Node) -> dict[str, Any]:
+        checks.append(node_.org_node)
+        came_up = node_.org_node == 2 and checks.count(2) > 1
+        return {"state": "UP" if came_up else "DOWN"}
+
+    monkeypatch.setattr(org_cmd.node, "fetch_node_by_id", fetch_node_by_id)
+    result = runner.invoke(app, ORG_COMMANDS["reset"], env=WIDE)
+
+    assert result.exit_code == 1
+    assert "1 of 3 nodes in globo were not reset:" in result.output
+    assert "globo/node2: skipped: reported UP by the control plane when its turn came" in result.output
+    assert (data[2] / "chain.db").exists()
+    assert not (data[1] / "chain.db").exists() and not (data[3] / "chain.db").exists()
+
+
+def test_org_reset_reports_a_node_whose_reset_failed_and_resets_the_rest(
+    node_calls: NodeCalls, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _globo_with_nodes(3, new=set())
+    add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
+    resets: list[int] = []
+
+    def reset(org_name: str, n: int, **_: Any) -> bool:
+        resets.append(n)
+        with report_errors():  # as the real command does
+            if n == 2:
+                raise CliError("disk on fire")
+        return True
+
+    monkeypatch.setattr(org_cmd.node, "reset", reset)
+    result = runner.invoke(app, ORG_COMMANDS["reset"], env=WIDE)
+
+    assert result.exit_code == 1
+    assert resets == [3, 2, 1]
+    assert "1 of 3 nodes in globo were not reset:" in result.output
+    assert "globo/node2: disk on fire" in result.output
 
 
 # --------------------------------------------------------------------------- #
@@ -356,9 +577,6 @@ def test_org_reset_prompt_still_works_after_the_check(tty: None, node_calls: Nod
 import typer
 
 from vl.commands import node as node_cmd
-from pathlib import Path
-
-from vl.commands._shared import CliError, report_errors
 
 
 def _starts(monkeypatch: pytest.MonkeyPatch, module: Any, outcomes: dict[tuple[str, int], str]) -> list[tuple[str, int]]:

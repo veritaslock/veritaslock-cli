@@ -495,7 +495,7 @@ def reset(
     ] = None,
     env: EnvOption = None,
     as_: AsOption = None,
-) -> None:
+) -> bool:
     """Reset the node. Needs ORG_ADMIN of the node's org, or PLATFORM_ADMIN."""
     with report_errors():
         environment = store.get_environment(env)
@@ -504,7 +504,7 @@ def reset(
         node = store.get_node(environment.name, org_name, org_node)
         if node.node_state != "NEW" and node_is_up(environment, node):
             note(f"{org_name}/node{org_node} is still reported UP by the control plane — stop it first or try again.")
-            return
+            return False
         if yes is None:
             if not sys.stdin.isatty():
                 raise CliError("vl node reset requires confirmation; pass --yes to run non-interactively")
@@ -525,6 +525,8 @@ def reset(
             else:
                 msg_suffix = "data directory."
             note(f"Deleted {org_name}/node{org_node}'s {msg_suffix}")
+            return True
+        return False
 
 
 # --------------------------------------------------------------------------- #
