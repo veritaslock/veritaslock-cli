@@ -847,6 +847,24 @@ def test_reset_happy_path_with_yes_clears_data(work: Work, kills: Kills) -> None
     assert not work.data_intact()
 
 
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [("deleted", True), ("declined", False), ("up", False)],
+)
+def test_reset_returns_whether_it_deleted(
+    outcome: str, expected: bool, tty: None, work: Work, kills: Kills, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batch caller (`vl org reset`) tells a skipped node from a reset one by this."""
+    _globo_and_acme()
+    store.set_node_stopped(store.set_pid(_node(), 4312))  # not NEW, so reset checks the CP
+    add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
+    monkeypatch.setattr(node_cmd, "node_is_up", lambda environment, node: outcome == "up")
+    monkeypatch.setattr(node_cmd.typer, "confirm", lambda *a, **kw: outcome != "declined")
+
+    assert node_cmd.reset("globo", 1, env="local", as_="ops") is expected
+    assert work.data_intact() is not expected
+
+
 @pytest.mark.parametrize("command", list(COMMANDS))
 def test_missing_node_has_a_real_message(command: str, work: Work, kills: Kills) -> None:
     _globo_and_acme()
