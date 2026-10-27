@@ -36,7 +36,7 @@ Starting, stopping and resetting a network, an org or a node should be done by s
 | `vl org list`, `show`; `vl node list`, `show` | no | unchanged |
 | `vl org add`, `update`; `vl node create` | yes (operator at the IdP) | unchanged |
 
-Today `org stop`, `org reset` and `node reset` also call the control plane **as the node's own service account** (to poll `node_is_up`, and for the single `GET /v1/nodes?orgNode=` check, which is skipped for a `NEW` node). That doesn't change: the operator identity gates the command, and the node's service account keeps making those calls.
+Today `org stop` (to poll `node_is_up`), and `org reset` and `node reset` (for the single `GET /v1/nodes?orgNode=` check, which is skipped for a `NEW` node), also call the control plane **as the node's own service account**. That doesn't change: the operator identity gates the command, and the node's service account keeps making those calls.
 
 ---
 
