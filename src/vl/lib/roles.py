@@ -28,6 +28,10 @@ class ServiceAccountRole(str, Enum):
     NODE = "NODE"
     SYSTEM = "SYSTEM"
     INGEST_CLIENT = "INGEST_CLIENT"
+    # A host's node agent (vl-agent-cli-spec.md §10). Like every role it belongs
+    # to one org; the identity provider lets an ORG_ADMIN of that org, or a
+    # SYSTEM account, create it.
+    NODE_AGENT = "NODE_AGENT"
 
 
 class TeamRole(str, Enum):
