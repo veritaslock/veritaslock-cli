@@ -167,6 +167,8 @@ import pytest
 from _helpers import add_service_account, add_user
 from vl.commands import org as org_cmd
 from vl.commands._shared import CliError, report_errors
+from vl.lib import nodeops
+from vl.lib.output import note
 
 WIDE = {"COLUMNS": "200"}
 
@@ -184,18 +186,19 @@ class NodeCalls:
         self.signals: list[tuple[int, int]] = []
         self.events: list[str] = []
 
-    def recorder(self, verb: str) -> Any:
-        def call(org_name: str, n: int, **kwargs: Any) -> bool:
-            self.calls.append((verb, n, kwargs))
-            return True  # node.reset: it deleted the node's data
+    def recorder(self, verb: str, outcome: nodeops.Outcome) -> Any:
+        def call(environment: store.Environment, org_name: str, n: int, emit: Any, **kwargs: Any) -> nodeops.NodeResult:
+            self.calls.append((verb, n, {**kwargs, "env": environment.name, "emit": emit}))
+            return nodeops.NodeResult(outcome, "done")
         return call
 
 
 @pytest.fixture
 def node_calls(monkeypatch: pytest.MonkeyPatch) -> NodeCalls:
     nc = NodeCalls()
-    for verb in ("start", "stop", "reset"):
-        monkeypatch.setattr(org_cmd.node, verb, nc.recorder(verb))
+    for verb, outcome in (("start", nodeops.Outcome.STARTED), ("stop", nodeops.Outcome.STOPPED),
+                          ("reset", nodeops.Outcome.RESET)):
+        monkeypatch.setattr(nodeops, f"{verb}_node", nc.recorder(verb, outcome))
 
     def node_is_up(environment: store.Environment, node_: store.Node) -> bool:
         nc.polled.append(node_.org_node)  # as the node's own service account, not the operator
@@ -206,10 +209,10 @@ def node_calls(monkeypatch: pytest.MonkeyPatch) -> NodeCalls:
         nc.events.append(f"check {node_.org_node}")
         return {"state": nc.states.get(node_.org_node, "DOWN")}
 
-    monkeypatch.setattr(org_cmd.node, "node_is_up", node_is_up)
-    monkeypatch.setattr(org_cmd.node, "fetch_node_by_id", fetch_node_by_id)
-    monkeypatch.setattr(org_cmd.node.os, "kill", lambda pid, sig: nc.signals.append((pid, sig)))
-    monkeypatch.setattr(org_cmd.time, "sleep", lambda s: None)
+    monkeypatch.setattr(nodeops, "node_is_up", node_is_up)
+    monkeypatch.setattr(nodeops, "fetch_node_by_id", fetch_node_by_id)
+    monkeypatch.setattr(nodeops.os, "kill", lambda pid, sig: nc.signals.append((pid, sig)))
+    monkeypatch.setattr(nodeops.time, "sleep", lambda s: None)
     return nc
 
 
@@ -241,9 +244,11 @@ NODE_VERBS = {"start": {"start"}, "stop": {"stop"}, "reset": {"reset"}}
     [[{"orgId": "org-1", "role": "ORG_ADMIN"}], [{"orgId": "org-2", "role": "PLATFORM_ADMIN"}]],
     ids=["org-admin", "platform-admin"],
 )
-def test_org_command_is_allowed_and_passes_the_identity_to_every_node_call(
+def test_org_command_is_allowed_and_runs_the_shared_operation_on_every_node(
     command: str, orgs: list, node_calls: NodeCalls
 ) -> None:
+    """The role is checked once, here; the shared operations check none, and
+    their progress goes to the CLI's note."""
     _globo_with_nodes()
     add_user("ops", orgs)
 
@@ -252,18 +257,20 @@ def test_org_command_is_allowed_and_passes_the_identity_to_every_node_call(
     assert result.exit_code == 0, result.output
     assert {verb for verb, _, _ in node_calls.calls} == NODE_VERBS[command]
     assert {n for _, n, _ in node_calls.calls} == {1, 2}
-    assert all(kw["as_"] == "ops" and kw["env"] == "local" for _, _, kw in node_calls.calls)
+    assert all(kw["env"] == "local" and kw["emit"] is note for _, _, kw in node_calls.calls)
 
 
-def test_org_command_passes_the_as_identity_not_the_default(node_calls: NodeCalls) -> None:
+def test_org_command_checks_the_as_identity_not_the_default(node_calls: NodeCalls) -> None:
     _globo_with_nodes()
     add_user("ops", [{"orgId": "org-1", "role": "USER"}])
     add_user("boss", [{"orgId": "org-1", "role": "ORG_ADMIN"}], default=False)
 
+    assert runner.invoke(app, ORG_COMMANDS["stop"], env=WIDE).exit_code == 1
+    assert node_calls.calls == []
     result = runner.invoke(app, [*ORG_COMMANDS["stop"], "--as", "boss"], env=WIDE)
 
     assert result.exit_code == 0, result.output
-    assert [kw["as_"] for _, _, kw in node_calls.calls] == ["boss", "boss"]
+    assert [n for _, n, _ in node_calls.calls] == [2, 1]
 
 
 def test_org_reset_passes_include_snapshots_down(node_calls: NodeCalls) -> None:
@@ -273,7 +280,7 @@ def test_org_reset_passes_include_snapshots_down(node_calls: NodeCalls) -> None:
     runner.invoke(app, [*ORG_COMMANDS["reset"], "--include-snapshots"], env=WIDE)
 
     resets = [kw for verb, _, kw in node_calls.calls if verb == "reset"]
-    assert resets and all(kw["include_snapshots"] is True and kw["yes"] is True for kw in resets)
+    assert resets and all(kw["include_snapshots"] is True for kw in resets)
 
 
 def test_org_reset_without_include_snapshots_passes_false_down(node_calls: NodeCalls) -> None:
@@ -284,7 +291,7 @@ def test_org_reset_without_include_snapshots_passes_false_down(node_calls: NodeC
 
     assert result.exit_code == 0, result.output
     resets = [kw for verb, _, kw in node_calls.calls if verb == "reset"]
-    assert resets and all(kw["include_snapshots"] is False and kw["yes"] is True for kw in resets)
+    assert resets and all(kw["include_snapshots"] is False for kw in resets)
 
 
 def test_org_stop_still_polls_as_each_nodes_own_account(node_calls: NodeCalls) -> None:
@@ -524,7 +531,7 @@ def _node_data(home: Path, n: int) -> Path:
 def test_org_reset_reports_a_node_that_came_up_after_the_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The real node.reset: its own check skips node2, which came up between
+    """The real reset_node: its own check skips node2, which came up between
     org reset's check and its turn; that is reported, and the exit is non-zero."""
     monkeypatch.setenv("HOME", str(tmp_path))
     _globo_with_nodes(3, new=set())
@@ -537,7 +544,7 @@ def test_org_reset_reports_a_node_that_came_up_after_the_check(
         came_up = node_.org_node == 2 and checks.count(2) > 1
         return {"state": "UP" if came_up else "DOWN"}
 
-    monkeypatch.setattr(org_cmd.node, "fetch_node_by_id", fetch_node_by_id)
+    monkeypatch.setattr(nodeops, "fetch_node_by_id", fetch_node_by_id)
     result = runner.invoke(app, ORG_COMMANDS["reset"], env=WIDE)
 
     assert result.exit_code == 1
@@ -554,18 +561,18 @@ def test_org_reset_reports_a_node_whose_reset_failed_and_resets_the_rest(
     add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
     resets: list[int] = []
 
-    def reset(org_name: str, n: int, **_: Any) -> bool:
+    def reset(environment: store.Environment, org_name: str, n: int, emit: Any, **_: Any) -> nodeops.NodeResult:
         resets.append(n)
-        with report_errors():  # as the real command does
-            if n == 2:
-                raise CliError("disk on fire")
-        return True
+        if n == 2:
+            raise CliError("disk on fire")
+        return nodeops.NodeResult(nodeops.Outcome.RESET, "done")
 
-    monkeypatch.setattr(org_cmd.node, "reset", reset)
+    monkeypatch.setattr(nodeops, "reset_node", reset)
     result = runner.invoke(app, ORG_COMMANDS["reset"], env=WIDE)
 
     assert result.exit_code == 1
     assert resets == [3, 2, 1]
+    assert "Error: disk on fire" in result.output  # the failure as it happened
     assert "1 of 3 nodes in globo were not reset:" in result.output
     assert "globo/node2: disk on fire" in result.output
 
@@ -579,32 +586,32 @@ import typer
 from vl.commands import node as node_cmd
 
 
-def _starts(monkeypatch: pytest.MonkeyPatch, module: Any, outcomes: dict[tuple[str, int], str]) -> list[tuple[str, int]]:
-    """Replace node.start: each (org, n) in ``outcomes`` ends as told ("sigabrt",
-    "running" or "error"); every other node starts. Returns the calls made."""
+def _starts(monkeypatch: pytest.MonkeyPatch, outcomes: dict[tuple[str, int], str]) -> list[tuple[str, int]]:
+    """Replace nodeops.start_node: each (org, n) in ``outcomes`` ends as told
+    ("sigabrt", "running" or "error"); every other node starts. Returns the calls made."""
     calls: list[tuple[str, int]] = []
 
-    def start(org_name: str, n: int, **_: Any) -> None:
+    def start(environment: store.Environment, org_name: str, n: int, emit: Any, **_: Any) -> nodeops.NodeResult:
         calls.append((org_name, n))
         outcome = outcomes.get((org_name, n), "started")
-        with report_errors():  # as the real command does
-            if outcome == "sigabrt":
-                raise node_cmd.NodeStartFailed(f"{org_name}/node{n}", -6, Path("/no/such.out"))
-            if outcome == "error":
-                raise CliError("No such file: verilock")
-            if outcome == "running":
-                print(f"{org_name} node{n} is already running (pid 4312)")
-            else:
-                print(f"Started {org_name}/node{n} (pid: 100{n}).")
+        if outcome == "sigabrt":
+            return nodeops.NodeResult(nodeops.Outcome.FAILED, nodeops.start_failure_reason(-6), exit_code=-6)
+        if outcome == "error":
+            raise CliError("No such file: verilock")
+        if outcome == "running":
+            emit(f"{org_name} node{n} is already running (pid 4312)")
+            return nodeops.NodeResult(nodeops.Outcome.ALREADY_RUNNING, "already running (pid 4312)", pid=4312)
+        emit(f"Started {org_name}/node{n} (pid: 100{n}).")
+        return nodeops.NodeResult(nodeops.Outcome.STARTED, f"pid 100{n}", pid=1000 + n)
 
-    monkeypatch.setattr(module.node, "start", start)
+    monkeypatch.setattr(nodeops, "start_node", start)
     return calls
 
 
 def test_org_start_reports_a_failed_node_and_starts_the_rest(monkeypatch: pytest.MonkeyPatch) -> None:
     _globo_with_nodes(3)
     add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
-    calls = _starts(monkeypatch, org_cmd, {("globo", 2): "sigabrt"})
+    calls = _starts(monkeypatch, {("globo", 2): "sigabrt"})
 
     result = runner.invoke(app, ["org", "start", "globo"], env=WIDE)
 
@@ -624,7 +631,7 @@ def test_org_start_reports_a_failed_node_and_starts_the_rest(monkeypatch: pytest
 def test_org_start_summarizes_every_failure_with_its_reason(monkeypatch: pytest.MonkeyPatch) -> None:
     _globo_with_nodes(3)
     add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
-    _starts(monkeypatch, org_cmd, {("globo", 1): "error", ("globo", 3): "sigabrt"})
+    _starts(monkeypatch, {("globo", 1): "error", ("globo", 3): "sigabrt"})
 
     result = runner.invoke(app, ["org", "start", "globo"], env=WIDE)
 
@@ -639,7 +646,7 @@ def test_org_start_summarizes_every_failure_with_its_reason(monkeypatch: pytest.
 def test_org_start_an_already_running_node_is_not_a_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     _globo_with_nodes(2)
     add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
-    _starts(monkeypatch, org_cmd, {("globo", 1): "running"})
+    _starts(monkeypatch, {("globo", 1): "running"})
 
     result = runner.invoke(app, ["org", "start", "globo"], env=WIDE)
 

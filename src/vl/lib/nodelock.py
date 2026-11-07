@@ -65,10 +65,16 @@ def _release(fd: int) -> None:
 def node_lock(node_root: Path, *, wait: float = DEFAULT_WAIT_SECONDS) -> Iterator[None]:
     """Hold the node's lock for the block, waiting up to ``wait`` seconds for it.
 
-    Raises :class:`NodeBusyError` when the wait runs out, and ``FileNotFoundError``
-    when ``node_root`` doesn't exist (the directory is never created here).
+    Raises :class:`NodeBusyError` when the wait runs out. A node whose directory
+    doesn't exist has no lock anyone could hold, so the block runs without one
+    (the directory is never created here): stopping such a node's process still
+    works, as it always has.
     """
-    fd = _open(node_root)
+    try:
+        fd = _open(node_root)
+    except FileNotFoundError:
+        yield
+        return
     deadline = time.monotonic() + wait
     try:
         while not _try_flock(fd):

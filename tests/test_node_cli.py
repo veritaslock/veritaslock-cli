@@ -16,7 +16,7 @@ from typer.testing import CliRunner
 from _helpers import add_service_account, add_user
 from vl.app import app
 from vl.commands import node as node_cmd
-from vl.lib import store
+from vl.lib import nodeops, store
 
 runner = CliRunner()
 
@@ -74,11 +74,11 @@ class Kills:
 @pytest.fixture
 def kills(monkeypatch: pytest.MonkeyPatch) -> Kills:
     k = Kills()
-    monkeypatch.setattr(node_cmd.os, "kill", k.kill)
+    monkeypatch.setattr(nodeops.os, "kill", k.kill)
     monkeypatch.setattr(
-        node_cmd.proc, "is_our_process", lambda pid, exe, **_: pid in k.alive
+        nodeops.proc, "is_our_process", lambda pid, exe, **_: pid in k.alive
     )
-    monkeypatch.setattr(node_cmd.time, "sleep", lambda s: None)
+    monkeypatch.setattr(nodeops.time, "sleep", lambda s: None)
     return k
 
 
@@ -118,7 +118,7 @@ def test_stop_checks_the_nodes_own_binary(
 ) -> None:
     seen: list[Any] = []
     monkeypatch.setattr(
-        node_cmd.proc, "is_our_process", lambda pid, exe, **_: seen.append((pid, exe)) or False
+        nodeops.proc, "is_our_process", lambda pid, exe, **_: seen.append((pid, exe)) or False
     )
     _org()
     _node(pid=4312)
@@ -145,17 +145,39 @@ def test_stop_without_a_pid_does_nothing(kills: Kills, operator: store.Identity)
 # --------------------------------------------------------------------------- #
 
 
-def test_start_precheck_treats_a_stale_pid_as_down(kills: Kills) -> None:
-    _org()
-    row = _node(pid=4312)
-    assert node_cmd.is_node_down(row)
+def _start_with_fake_spawn(home: Path, monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Run nodeops.start_node on globo/node1 with the copy and the spawn faked."""
+    (home / "orgs" / "globo" / "nodes" / "node1").mkdir(parents=True, exist_ok=True)
+    spawned: list[int] = []
+    monkeypatch.setattr(nodeops, "populate_node_dir", lambda env, org, n, node: home)
+
+    def spawn(node: store.Node, root: Path, emit: Any) -> nodeops.NodeResult:
+        spawned.append(node.org_node)
+        return nodeops.NodeResult(nodeops.Outcome.STARTED, "pid 1", pid=1)
+
+    monkeypatch.setattr(nodeops, "spawn_node", spawn)
+    return spawned
 
 
-def test_start_precheck_refuses_when_its_own_process_runs(kills: Kills) -> None:
+def test_start_precheck_treats_a_stale_pid_as_down(
+    kills: Kills, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     _org()
-    row = _node(pid=4312)
+    _node(pid=4312)
+    spawned = _start_with_fake_spawn(home, monkeypatch)
+    result = nodeops.start_node(store.get_environment("local"), "globo", 1, lambda text: None)
+    assert result.outcome is nodeops.Outcome.STARTED and spawned == [1]
+
+
+def test_start_precheck_refuses_when_its_own_process_runs(
+    kills: Kills, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _org()
+    _node(pid=4312)
     kills.alive.add(4312)
-    assert not node_cmd.is_node_down(row)
+    spawned = _start_with_fake_spawn(home, monkeypatch)
+    result = nodeops.start_node(store.get_environment("local"), "globo", 1, lambda text: None)
+    assert result.outcome is nodeops.Outcome.ALREADY_RUNNING and spawned == []
 
 
 # --------------------------------------------------------------------------- #
@@ -167,7 +189,7 @@ def test_repair_stops_a_running_row_whose_process_is_gone(kills: Kills) -> None:
     _org()
     row = _node(pid=4312)
 
-    repaired = node_cmd.repair(row)
+    repaired = nodeops.repair(row)
 
     assert repaired.node_state == "STOPPED" and repaired.pid is None
     stored = store.get_node("local", "globo", 1)
@@ -180,7 +202,7 @@ def test_repair_leaves_a_live_running_row_alone(kills: Kills) -> None:
     row = _node(pid=4312)
     kills.alive.add(4312)
 
-    assert node_cmd.repair(row) == row
+    assert nodeops.repair(row) == row
     assert store.get_node("local", "globo", 1).node_state == "RUNNING"
 
 
@@ -189,8 +211,8 @@ def test_repair_leaves_new_and_stopped_rows_alone(kills: Kills) -> None:
     new = _node(n=1)
     stopped = store.set_node_stopped(_node(n=2, port=7002))
 
-    assert node_cmd.repair(new) == new
-    assert node_cmd.repair(stopped) == stopped
+    assert nodeops.repair(new) == new
+    assert nodeops.repair(stopped) == stopped
 
 
 # --------------------------------------------------------------------------- #
@@ -239,9 +261,9 @@ def machine(monkeypatch: pytest.MonkeyPatch, kills: Kills) -> dict[str, Any]:
     """Injected process and host facts: which pids are live verilocks, process ages."""
     facts: dict[str, Any] = {"cp_alive": set(), "age": {}}
     monkeypatch.setattr(node_cmd.host, "local_identities", lambda: {HERE, "127.0.0.1"})
-    monkeypatch.setattr(node_cmd.proc, "is_cp_process", lambda pid, **_: pid in facts["cp_alive"])
+    monkeypatch.setattr(nodeops.proc, "is_cp_process", lambda pid, **_: pid in facts["cp_alive"])
     monkeypatch.setattr(
-        node_cmd.proc, "process_age_seconds", lambda pid, **_: facts["age"].get(pid, 3600.0)
+        nodeops.proc, "process_age_seconds", lambda pid, **_: facts["age"].get(pid, 3600.0)
     )
     return facts
 
@@ -675,10 +697,13 @@ class Work:
 @pytest.fixture
 def work(home: Path, kills: Kills, monkeypatch: pytest.MonkeyPatch) -> Work:
     w = Work(home)
-    monkeypatch.setattr(node_cmd, "populate_node_dir", lambda env, org, n, node: home)
-    monkeypatch.setattr(
-        node_cmd, "start_verilock", lambda node, root, org, n: w.spawned.append((org, n))
-    )
+    monkeypatch.setattr(nodeops, "populate_node_dir", lambda env, org, n, node: home)
+
+    def spawn(node: store.Node, root: Path, emit: Any) -> nodeops.NodeResult:
+        w.spawned.append((node.org_name, node.org_node))
+        return nodeops.NodeResult(nodeops.Outcome.STARTED, "pid 1", pid=1)
+
+    monkeypatch.setattr(nodeops, "spawn_node", spawn)
     return w
 
 
@@ -858,7 +883,7 @@ def test_reset_returns_whether_it_deleted(
     _globo_and_acme()
     store.set_node_stopped(store.set_pid(_node(), 4312))  # not NEW, so reset checks the CP
     add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
-    monkeypatch.setattr(node_cmd, "node_is_up", lambda environment, node: outcome == "up")
+    monkeypatch.setattr(nodeops, "node_is_up", lambda environment, node: outcome == "up")
     monkeypatch.setattr(node_cmd.typer, "confirm", lambda *a, **kw: outcome != "declined")
 
     assert node_cmd.reset("globo", 1, env="local", as_="ops") is expected
@@ -911,11 +936,12 @@ def spawn(home: Path, kills: Kills, monkeypatch: pytest.MonkeyPatch, operator: s
     """Run `vl node start globo 1` against a fake verilock that ends as told."""
     _org()
     _node()
-    monkeypatch.setattr(node_cmd, "populate_node_dir", lambda env, org, n, node: home)
+    (home / "orgs" / "globo" / "nodes" / "node1").mkdir(parents=True)
+    monkeypatch.setattr(nodeops, "populate_node_dir", lambda env, org, n, node: home)
 
     def run(returncode: int | None, log: str = "") -> Any:
         fake = FakeProcess(returncode, log)
-        monkeypatch.setattr(node_cmd.subprocess, "Popen", fake)
+        monkeypatch.setattr(nodeops.subprocess, "Popen", fake)
         return runner.invoke(app, ["node", "start", "globo", "1"], env=WIDE)
 
     return run
@@ -1007,7 +1033,7 @@ def test_start_already_running_is_unchanged(spawn: Any, kills: Kills, monkeypatc
     store.set_pid(store.get_node("local", "globo", 1), 4312)
     kills.alive.add(4312)
     spawned: list[Any] = []
-    monkeypatch.setattr(node_cmd.subprocess, "Popen", lambda *a, **k: spawned.append(a))
+    monkeypatch.setattr(nodeops.subprocess, "Popen", lambda *a, **k: spawned.append(a))
 
     result = runner.invoke(app, ["node", "start", "globo", "1"], env=WIDE)
 
@@ -1022,11 +1048,11 @@ def test_start_already_running_is_unchanged(spawn: Any, kills: Kills, monkeypatc
      (0, "exited with code 0"), (75, "exited with code 75")],
 )
 def test_describe_exit(code: int, text: str) -> None:
-    assert node_cmd.describe_exit(code) == text
+    assert nodeops.describe_exit(code) == text
 
 
 def test_start_failure_hint_prefers_the_log_marker() -> None:
     # A NOT_DOWN abort that also exits 75 gets the more specific NOT_DOWN hint.
-    hint = node_cmd.start_failure_hint(75, ["409 (NOT_DOWN): node org_node=1 is not DOWN"])
+    hint = nodeops.start_failure_hint(75, ["409 (NOT_DOWN): node org_node=1 is not DOWN"])
     assert hint is not None and hint.startswith("The control plane still has this node as UP.")
-    assert node_cmd.start_failure_hint(3, ["nothing useful"]) is None
+    assert nodeops.start_failure_hint(3, ["nothing useful"]) is None

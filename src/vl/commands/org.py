@@ -8,17 +8,18 @@ resource command.
 from __future__ import annotations
 
 import sys
-import time
 from typing import Annotated, Any
 
 import typer
 
 from vl.commands import node
-from vl.commands._shared import AsOption, EnvOption, report_errors, CliError, failure_reason, require_operator
-from vl.lib import api, auth, store
+from vl.commands._shared import (
+    AsOption, EnvOption, report_errors, CliError, failure_reason, print_error, require_operator,
+)
+from vl.lib import api, auth, nodeops, store
 from vl.lib.cli import HelpOnErrorGroup
 from vl.lib.output import console, note, render
-from vl.lib.store import Environment, Node, Organization
+from vl.lib.store import Environment, Node
 
 app = typer.Typer(
     help="Manage VeritasLock organizations.",
@@ -197,15 +198,21 @@ def start(
     """Start all nodes in an organization. Needs ORG_ADMIN of the org, or PLATFORM_ADMIN."""
     with report_errors():
         environment = store.get_environment(env)
-        caller = require_operator(environment, as_, org)
+        require_operator(environment, as_, org)
         organization = store.get_organization(environment.name, org)
         nodes = store.get_nodes(environment, organization)
         failures: list[tuple[str, str]] = []
         for node_ in nodes:
+            label = f"{organization.name}/node{node_.org_node}"
             try:
-                node.start(organization.name, node_.org_node, env=environment.name, as_=caller.label)
-            except Exception as e:  # keep starting the rest; node.start printed its own error
-                failures.append((f"{organization.name}/node{node_.org_node}", failure_reason(e)))
+                result = nodeops.start_node(environment, organization.name, node_.org_node, note)
+                if result.outcome is nodeops.Outcome.FAILED:
+                    error = node.start_failure_error(organization.name, node_.org_node, result)
+                    print_error(error)
+                    failures.append((label, failure_reason(error)))
+            except Exception as e:  # keep starting the rest
+                print_error(e)
+                failures.append((label, failure_reason(e)))
         if failures:
             raise OrgStartFailed(organization.name, len(nodes), failures)
 
@@ -220,38 +227,6 @@ class OrgStartFailed(CliError):
         super().__init__("\n".join(lines))
 
 
-def stop_nodes(environment: Environment, nodes: list[Node], organization: Organization,
-               caller: store.Identity) -> None:
-    """Stop each node, as ``caller``, who each node command re-checks.
-
-    The poll for DOWN still authenticates as each node's own service account
-    (``node.node_is_up``): the operator identity only gates the commands.
-    """
-    nodes.reverse()
-    for idx, node_ in enumerate(nodes):
-        try:
-            is_last = idx == len(nodes) - 1
-            if is_last and organization.name == "globo":
-                time.sleep(2)
-            elif idx != 0:
-                time.sleep(0.5)
-
-            node.stop(organization.name, node_.org_node, env=environment.name, as_=caller.label)
-            cnt = 0
-            node_stopped = False
-            while cnt < 20:
-                time.sleep(.25)
-                if not node.node_is_up(environment, node_):
-                    node_stopped = True
-                    break
-                cnt += 1
-
-            if not node_stopped:
-                note (f"Warning: {organization.name}-node{node_.org_node} is still reported UP by the control plane.")
-
-        except Exception as e:
-            note(f"Warning: {e}")
-
 @app.command("stop")
 def stop(
     org: Annotated[
@@ -263,10 +238,10 @@ def stop(
     """Stop all nodes in an organization. Needs ORG_ADMIN of the org, or PLATFORM_ADMIN."""
     with report_errors():
         environment = store.get_environment(env)
-        caller = require_operator(environment, as_, org)
+        require_operator(environment, as_, org)
         organization = store.get_organization(environment.name, org)
         nodes = store.get_nodes(environment, organization)
-        stop_nodes(environment, nodes, organization, caller)
+        nodeops.stop_nodes_to_down(environment, nodes, note)
 
 
 def nodes_not_down(environment: Environment, nodes: list[Node]) -> list[tuple[str, str]]:
@@ -279,7 +254,7 @@ def nodes_not_down(environment: Environment, nodes: list[Node]) -> list[tuple[st
     for node_ in nodes:
         if node_.node_state == "NEW":
             continue
-        dto = node.fetch_node_by_id(environment, node_)
+        dto = nodeops.fetch_node_by_id(environment, node_)
         assert dto is not None
         state: str = dto["state"]
         if state != "DOWN":
@@ -330,7 +305,7 @@ def reset(
     """
     with report_errors():
         environment = store.get_environment(env)
-        caller = require_operator(environment, as_, org)
+        require_operator(environment, as_, org)
         organization = store.get_organization(environment.name, org)
         org_name = organization.name
         nodes = store.get_nodes(environment, organization)
@@ -357,10 +332,15 @@ def reset(
             for node_ in nodes:
                 label = f"{org_name}/node{node_.org_node}"
                 try:
-                    if not node.reset(org_name, node_.org_node, include_snapshots=include_snapshots, yes=True,
-                                      env=environment.name, as_=caller.label):
+                    result = nodeops.reset_node(
+                        environment, org_name, node_.org_node, note, include_snapshots=include_snapshots
+                    )
+                    if result.outcome is nodeops.Outcome.SKIPPED_UP:
                         failures.append((label, "skipped: reported UP by the control plane when its turn came"))
-                except Exception as e:  # keep resetting the rest; node.reset printed its own error
+                    elif result.outcome is nodeops.Outcome.FAILED:
+                        failures.append((label, result.detail))
+                except Exception as e:  # keep resetting the rest
+                    print_error(e)
                     failures.append((label, failure_reason(e)))
             if failures:
                 raise OrgResetIncomplete(org_name, len(nodes), failures)

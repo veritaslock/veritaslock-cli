@@ -19,8 +19,8 @@ from pathlib import Path
 
 import pytest
 
-from vl.commands import node as node_cmd
-from vl.lib import nodelock, store
+from _helpers import kill_stand_in
+from vl.lib import nodelock, nodeops, store
 
 # Holds the node's lock for argv[2] seconds, saying "locked" once it has it.
 _HOLDER = textwrap.dedent(
@@ -94,7 +94,7 @@ def test_the_lock_file_is_beside_data_not_inside_it(node_root: Path) -> None:
         lock = nodelock.lock_path(node_root)
         assert lock == node_root / ".lifecycle.lock" and lock.exists()
         assert (node_root / "data") not in lock.parents
-        node_cmd.reset_node(node_root, include_snapshots=True)  # what reset deletes
+        nodeops.clear_node_data(node_root, include_snapshots=True)  # what reset deletes
         assert lock.exists()
         assert _try_from_another_process(node_root) == "busy"  # still the same lock
 
@@ -135,11 +135,12 @@ def test_the_try_lock_skips_at_once_when_busy_and_holds_when_free(node_root: Pat
     assert _try_from_another_process(node_root) == "held"
 
 
-def test_without_a_node_directory_the_lock_fails_and_the_try_lock_proceeds(isolated_home: Path) -> None:
+def test_without_a_node_directory_both_locks_proceed_and_create_nothing(isolated_home: Path) -> None:
     missing = isolated_home / "orgs" / "globo" / "nodes" / "node9"
-    with pytest.raises(FileNotFoundError):
-        with nodelock.node_lock(missing):
-            pass
+    ran = False
+    with nodelock.node_lock(missing, wait=0):
+        ran = True
+    assert ran
     with nodelock.try_node_lock(missing) as held:
         assert held is True
     assert not missing.exists()
@@ -147,7 +148,7 @@ def test_without_a_node_directory_the_lock_fails_and_the_try_lock_proceeds(isola
 
 def test_a_node_spawned_under_the_lock_does_not_keep_it(node_root: Path) -> None:
     """The node outlives the operation, the lock does not: the spawn (the real
-    start_verilock) does not hand the lock's descriptor to the node."""
+    spawn_node) does not hand the lock's descriptor to the node."""
     (node_root / "bin").mkdir()
     binary = node_root / "bin" / "verilock"
     binary.write_text("#!/bin/sh\nsleep 60\n")  # a stand-in node: never a real verilock
@@ -159,32 +160,28 @@ def test_a_node_spawned_under_the_lock_does_not_keep_it(node_root: Path) -> None
     row = store.add_node("local", "globo", 1, ident.id)
 
     with nodelock.node_lock(node_root):
-        node_cmd.start_verilock(row, node_root, "globo", 1)
+        nodeops.spawn_node(row, node_root, lambda text: None)
     pid = store.get_node("local", "globo", 1).pid
     assert pid is not None
     try:
         assert Path(f"/proc/{pid}/cmdline").read_bytes().decode().count(str(binary)) == 1
         assert _try_from_another_process(node_root) == "held"
     finally:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        kill_stand_in(pid)
 
 
-# Takes the lock, spawns the node with the real start_verilock, then dies
+# Takes the lock, spawns the node with the real spawn_node, then dies
 # without releasing the lock (a vl or an agent killed mid-operation).
 _CRASHER = textwrap.dedent(
     """
     import os, sys
     from pathlib import Path
-    from vl.commands import node as node_cmd
-    from vl.lib import nodelock, store
+    from vl.lib import nodelock, nodeops, store
 
     root = Path(sys.argv[1])
     row = store.get_node("local", "globo", 1)
     with nodelock.node_lock(root):
-        node_cmd.start_verilock(row, root, "globo", 1)
+        nodeops.spawn_node(row, root, print)
         print(store.get_node("local", "globo", 1).pid, flush=True)
         os._exit(0)
     """
@@ -216,7 +213,45 @@ def test_a_node_does_not_keep_the_lock_when_its_starter_dies_holding_it(
         assert Path(f"/proc/{pid}/cmdline").read_bytes().decode().count(str(binary)) == 1
         assert _try_from_another_process(node_root) == "held"
     finally:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        kill_stand_in(pid)
+
+
+def test_after_start_node_returns_another_process_can_take_the_lock_at_once(
+    isolated_home: Path,
+) -> None:
+    """The real start_node, from the shared install to the spawn: once it returns
+    STARTED with the node still alive, the node's lock is free (the node did
+    not inherit its descriptor)."""
+    install = isolated_home / ".veritaslock"
+    for sub, name, text in (
+        ("bin", "verilock", "#!/bin/sh\nsleep 60\n"),  # a stand-in node: never a real verilock
+        ("lib", "liblog4cplus.so.3", "lib"),
+        ("etc", "log4cplus.properties", "x"),
+        ("etc", "verilock-kafka-consumer.conf", "x"),
+    ):
+        (install / sub).mkdir(parents=True, exist_ok=True)
+        (install / sub / name).write_text(text)
+    root = isolated_home / "orgs" / "globo" / "nodes" / "node1"
+    for sub in ("bin", "etc", "data", "identity", "lib", "snapshots"):
+        (root / sub).mkdir(parents=True)
+    store.ensure_local_environment_seeded()
+    store.upsert_organization("local", "globo", "org-1", "Globo", True, "t0")
+    ident = store.add_identity("local", "SERVICE_ACCOUNT", "client-1", "client-1", "globo-1")
+    store.set_svc_acct(ident.id, "local", "globo", "client-1", "secret", role="NODE",
+                       public_key_path=str(isolated_home / "public.key"),
+                       private_key_path=str(isolated_home / "private.key"))
+    store.add_node("local", "globo", 1, ident.id)
+    lines: list[str] = []
+
+    result = nodeops.start_node(store.get_environment("local"), "globo", 1, lines.append)
+
+    assert result.outcome is nodeops.Outcome.STARTED, result
+    assert result.pid is not None
+    try:
+        assert lines == [f"Started globo/node1 (pid: {result.pid})."]
+        assert Path(f"/proc/{result.pid}/cmdline").read_bytes().decode().count(str(root / "bin" / "verilock")) == 1
+        began = time.monotonic()
+        assert _try_from_another_process(root) == "held"
+        assert time.monotonic() - began < 5
+    finally:
+        kill_stand_in(result.pid)

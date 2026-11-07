@@ -57,3 +57,29 @@ def add_service_account(label: str, org: str, role: str = "NODE") -> store.Ident
         now, now + timedelta(hours=1),
     )
     return ident
+
+
+def kill_stand_in(pid: int) -> None:
+    """SIGKILL a stand-in node (a ``#!/bin/sh`` script) and its children.
+
+    A node is spawned as the leader of its own session and process group, so the
+    group goes with it; without that, the script's ``sleep`` would outlive it.
+    """
+    import os
+    import signal
+    from pathlib import Path
+
+    children = []  # also when it does not lead a group (a spawn without its own session)
+    for stat in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            fields = stat.read_text().rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        if fields and int(fields[1]) == pid:
+            children.append(int(stat.parent.name))
+    targets = [(os.killpg, pid), (os.kill, pid)] + [(os.kill, child) for child in children]
+    for kill, target in targets:
+        try:
+            kill(target, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass

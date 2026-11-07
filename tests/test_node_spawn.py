@@ -19,8 +19,8 @@ from typing import Any
 
 import pytest
 
-from vl.commands import node as node_cmd
-from vl.lib import proc, store
+from _helpers import kill_stand_in
+from vl.lib import nodeops, proc, store
 
 
 @pytest.fixture(autouse=True)
@@ -57,11 +57,11 @@ def test_start_spawns_the_node_in_its_own_session_with_nothing_tied_to_the_calle
         calls.append((args, kwargs))
         return _Running()
 
-    monkeypatch.setattr(node_cmd.subprocess, "Popen", popen)
-    monkeypatch.setattr(node_cmd.time, "sleep", lambda s: None)
+    monkeypatch.setattr(nodeops.subprocess, "Popen", popen)
+    monkeypatch.setattr(nodeops.time, "sleep", lambda s: None)
     node_root = home / "orgs" / "globo" / "nodes" / "node1"
 
-    node_cmd.start_verilock(_node_row(), node_root, "globo", 1)
+    nodeops.spawn_node(_node_row(), node_root, lambda text: None)
 
     [(args, kwargs)] = calls
     assert args == ([str(node_root / "bin" / "verilock")],)
@@ -82,15 +82,14 @@ _STARTER = textwrap.dedent(
     """
     import sys
     from pathlib import Path
-    from vl.commands import node as node_cmd
-    from vl.lib import store
+    from vl.lib import nodeops, store
 
     store.ensure_local_environment_seeded()
     store.upsert_organization("local", "globo", "org-1", "Globo", True, "2026-01-01T00:00:00Z")
     ident = store.add_identity("local", "SERVICE_ACCOUNT", "sa-globo-1", "globo-1", "globo-1")
     store.set_svc_acct(ident.id, "local", "globo", "client-globo-1", "secret", role="NODE")
     row = store.add_node("local", "globo", 1, ident.id, 7001)
-    node_cmd.start_verilock(row, Path(sys.argv[1]), "globo", 1)
+    nodeops.spawn_node(row, Path(sys.argv[1]), print)
     print(store.get_node("local", "globo", 1).pid)
     """
 )
@@ -121,7 +120,4 @@ def test_a_node_survives_the_process_that_started_it(home: Path, isolated_store:
         assert os.getsid(pid) != os.getsid(0)
         assert os.getpgid(pid) == pid
     finally:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        kill_stand_in(pid)
