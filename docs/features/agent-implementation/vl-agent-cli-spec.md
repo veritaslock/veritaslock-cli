@@ -67,7 +67,7 @@ One migration; bump `PRAGMA user_version` by one (the build reads the current va
 |---|---|
 | `node`: a unique constraint on `port` | Port allocation (`MAX(port)+1` across the store) stays, but runs inside `BEGIN IMMEDIATE` (§5) and the constraint backs it up. |
 | New table **`agent`** | One row per agent created on this host, like `node`: `id`, `environment_name`, `org_name`, `svc_acct_id` (the `NODE_AGENT` account, `REFERENCES svc_acct(identity_id) ON DELETE RESTRICT`), `pid`, `state` (`NEW`, `RUNNING`, `STOPPED`), `created_at`. Unique on `(environment_name, org_name)`: one agent per org and environment on a host, matching the control plane's rule. |
-| New table **`command_history`** | The commands issued from this machine, so `--last` works: `id`, `environment_name`, `correlation_id`, `command_type`, `scope`, `org_name`, `org_node`, `issued_at`, `expires_at`. Trimmed to the newest 50 per environment on insert. |
+| New table **`issued_command`** | The commands issued from this machine through the control plane, so `--last` works (the existing `command_history` table, the argv log behind `vl history`, is left alone): `id`, `environment_name`, `correlation_id`, `command_type`, `scope`, `org_name`, `org_node`, `issued_at`, `expires_at`. Trimmed to the newest 50 per environment on insert. |
 
 `svc_acct.role` accepts `NODE_AGENT` (§10).
 
@@ -88,7 +88,7 @@ outcome ∈ STARTED | ALREADY_RUNNING | STOPPED | ALREADY_STOPPED | RESET | SKIP
 The outcomes are those of `cp-agent-commands-spec.md` §3.4, plus `SKIPPED_UP` (reset found the node up), which the agent reports as `FAILED` with that detail. The functions take:
 
 - **`emit(text)`**, a callback for the progress text they print today (`Started …`, `still reported UP …`). The CLI passes `print`; the agent passes its logger.
-- **`confirm=False`**, so no function ever prompts. Prompting stays in the thin commands.
+- **No `confirm` parameter**: no function ever prompts. Prompting stays in the thin commands, which make the checks they make today before they prompt (an up node is reported without a prompt); the function checks again under the lock, so a prompting `vl node reset` makes one extra control plane check.
 
 No function checks the operator's role (`require_operator` stays in the thin commands: the CLI checks locally, and for the agent the control plane already did).
 
@@ -119,7 +119,7 @@ All local (no REST call except the control plane columns of `list`), like `vl no
 
 **Nothing is copied, at `create` or at `start`.** Unlike `vl node start`, which copies `$HOME/.veritaslock/bin/*`, the libraries and the configuration into each node's directory (`vl-node-spec.md` §5.2 step 2) so that every node runs its own binary, the agent is Python code in the installed `vl` package and runs from it (`python -m vl.agent`, with the same interpreter): a copy would only be a second version of the same code, stale after the next `vl` upgrade, and an upgrade takes effect when the agent is restarted. The one binary it needs is `verilock --print-host` (`vl-agent-spec.md` §8 item 2), which it reads from the shared install, `$HOME/.veritaslock/bin/verilock` by default, or from `--verilock <path>`. The agent's directory is therefore small: `agent.properties` (optional) and `data/`, with no `bin/`, `lib/` or `etc/`.
 
-- **`vl agent create <org> [--name <n>] [--as <label>] [--env <env>]`**: creates the `NODE_AGENT` service account (the `vl service-account add` logic, display name `<org>-agent`, role `NODE_AGENT`, that org) and the `agent` row (`NEW`), and makes `$HOME/orgs/<org>/agent/` with its `data/`. Allowed for an `ORG_ADMIN` of the org, checked locally. The identity provider enforces the rule that applies to every service-account role (a user with an `ORG_ADMIN` row in the account's org, or a `SYSTEM` service account); a `PLATFORM_ADMIN` with no `ORG_ADMIN` row in that org is refused, so `vl` does not offer it. `vl service-account add --role NODE_AGENT` is a separate change in this repo (§10).
+- **`vl agent create <org> [--name <n>] [--as <label>] [--env <env>]`**: creates the `NODE_AGENT` service account (the `vl svc-acct add` logic, display name `<org>-agent`, role `NODE_AGENT`, that org) and the `agent` row (`NEW`), and makes `$HOME/orgs/<org>/agent/` with its `data/`. Allowed for an `ORG_ADMIN` of the org, checked locally. The identity provider enforces the rule that applies to every service-account role (a user with an `ORG_ADMIN` row in the account's org, or a `SYSTEM` service account); a `PLATFORM_ADMIN` with no `ORG_ADMIN` row in that org is refused, so `vl` does not offer it. `vl svc-acct add --role NODE_AGENT` is a separate change in this repo (§10).
 - **`vl agent start <org> [--env <env>]`**: operator role check, then it spawns `[sys.executable, "-m", "vl.agent", "--as", <label>, "--env", <env>]` detached (`start_new_session=True`), **stdout and stderr to `$HOME/tmp/<org>-agent.out`** (the general log, as for nodes; the results go to the agent's own `data/results.log`, `vl-agent-spec.md` §2.2), records `pid` and `RUNNING`, waits one second and checks it is alive. An early exit is a `CliError` with the log tail and a hint for the agent's exit codes (`vl-agent-spec.md` §2.4: 69 control plane or Kafka unreachable, 77 authentication refused, 78 bad configuration or identity).
 - **`vl agent stop <org>`**: `SIGTERM`, wait up to 30 seconds (the agent finishes the node operation in hand), then `SIGKILL`. Nodes are not touched. Clears `pid`, sets `STOPPED`.
 - **`vl agent list [<org>] [--remote] [--as <label>] [--env <env>]`**: named and shaped like `vl node list` (local rows with the control plane's view joined in) and `vl svc-acct list` (which has the same `--remote`). By default it lists the agents created on **this host**, from the local rows, in a bordered table: org, local state (`NEW`, `RUNNING`, `STOPPED`, with the pid checked against `/proc` like `vl node list`), the control plane's state for the agent (`ALIVE`, `STALE`, `NEVER_SEEN`), `host`, `nodeCount` and when it was last seen (from `GET /v1/agents`). A local `RUNNING` agent that the control plane calls `STALE`, or a `nodeCount` of zero, is highlighted: those are the two symptoms of a `host` mismatch (`cp-agent-commands-spec.md` §3.3). **`--remote`** lists every agent the control plane knows for the orgs you may see, on any host, with no local columns: it answers "which hosts have an agent?". The control plane columns need an operator identity (`--as` or the default identity); without one, or if the control plane cannot be reached, the local columns are shown, the others are `-`, and one line says why. The optional `<org>` narrows the list. There is no `vl agent show` for now: the list carries what it would.
@@ -152,7 +152,7 @@ An `--all-orgs` option for `results`, interleaving rows by time, is a possible l
 
 1. The operator role check, locally, as today (`vl-authorization-spec.md`). A network command needs a `PLATFORM_ADMIN` **user** identity; a service-account identity is refused here with a clear message, as the control plane would.
 2. The REST call to the control plane with the operator's token (`--as` or the default identity). The org is resolved to its id from the local organization cache. The request carries **`command`**, the command as typed, without its arguments (`vl network stop`), which the results later show; the `RESET` that `vl network reset` issues carries `vl network reset` (`cp-agent-commands-spec.md` §5.1).
-3. On `202`, record the command in `command_history`, print what was published, and **wait for the results** (§7.5) unless `--no-wait` was given:
+3. On `202`, record the command in `issued_command`, print what was published, and **wait for the results** (§7.5) unless `--no-wait` was given:
 
 ```
 $ vl network stop --as admin
@@ -219,25 +219,26 @@ When several apply, the order is 4, then 1, then 3, then 0: not knowing outranks
 - **`vl command watch [<id> | --last] [--timeout <seconds>] [--interval <seconds>]`**: waits for a command that has already been issued, with exactly the logic of §7.5 (the local agent's results file for the orgs this host has a running agent for, the control plane for the rest), so the remote verbs and `watch` are the same code. Use it after `--no-wait`, or for a command issued from another machine. `--interval` is the polling interval for control plane targets (default 2 seconds); `--timeout` caps the wait (default: until `waitUntil`). The exit status is that of §7.6; an explicit `--timeout` that runs out before every target has answered is **3**.
 - **`vl command list [--org <org>] [--limit <n>]`**: `GET /v1/commands`, newest first: id, type, scope, issuer, issued, status.
 
-`--last` is the newest row of `command_history` for the environment. Because the verbs wait by default and exit non-zero on failure, a script chains them directly: `vl network stop --as admin && vl network reset --as admin --yes`. With `--no-wait`, `vl command watch --last` is the explicit wait.
+`--last` is the newest row of `issued_command` for the environment. Because the verbs wait by default and exit non-zero on failure, a script chains them directly: `vl network stop --as admin && vl network reset --as admin --yes`. With `--no-wait`, `vl command watch --last` is the explicit wait.
 
 ---
 
 ## 9. Failures are no longer swallowed
 
-`vl network start|stop|reset` and `vl org start|stop` wrap each org or node in a handler that turns any exception, including a refusal, into `Warning: …`, so the command exits 0 even when something failed (`vl-network-spec.md` open item 5). Changed, for the local loops (every node in scope is local, or `--local`):
+Checked against the code at the step 1 review: `vl org start`, `vl network start` and `vl org reset` already collect their failures and exit 1, each with its own summary (`N of M nodes in <org> failed to start:`, `N failed to start across the network:`, and the incomplete-reset error). **Three loops still turn every exception into `Warning: …` and exit 0:** `vl org stop` (the `stop_nodes` routine), `vl network stop` and `vl network reset`. Changed, for those three, in their local form (every node in scope is local, or `--local`):
 
 - the per-node and per-org warnings stay, as they are the detail;
-- every failure is also collected, and at the end the command prints **`N of M nodes failed:`** with one line each;
-- the exit status is **1** if anything failed.
+- every failure is also collected, and at the end the command prints a summary with one line each: **`N of M nodes in <org> failed to stop:`** for `vl org stop`, and **`N of M orgs failed:`** for `vl network stop` and `vl network reset` (naming the org and the cause);
+- the exit status is **1** if anything failed;
+- a failure that arrives as a `typer.Exit` (`vl org reset` prints its own error and raises it) is recorded as `<org>: failed, see above`, and not printed as `Warning: 1`, as `vl network reset` does today.
 
-A node that was already running or stopped is not a failure.
+A node that was already running or stopped is not a failure. The wording of the three loops that already collect is left alone.
 
 ---
 
 ## 10. Dependencies, role, entry points
 
-- **`vl service-account add --role`** accepts `NODE_AGENT` (the choices list, and the `svc_acct.role` column if it has a constraint, which the build checks). `vl svc-acct list --role` filters on it. The identity provider side is a separate task (`node-agent-role`).
+- **`vl svc-acct add --role`** accepts `NODE_AGENT` (the command group is `vl svc-acct`; the choices are the `ServiceAccountRole` enum in `vl.lib.roles`, today `ACCOUNT, NODE, SYSTEM, INGEST_CLIENT`; the `svc_acct.role` column has no constraint, so no table rebuild; `vl svc-acct list --role` filters only on the server, with `--remote` or `--all`, and the local listing ignores it) . `vl svc-acct list --role` filters on it. The identity provider side is a separate task (`node-agent-role`).
 - **Dependencies:** an optional group `vl[agent]`: `confluent-kafka` with its Avro and Schema Registry support (`fastavro` and the HTTP client). Ordinary `vl` hosts do not install it. `vl agent start` fails with a clear message ("install vl[agent]") if it is missing.
 - **Entry points:** `vl` as today, and `vl-agent` (foreground, the agent program of spec 2). `vl agent start` runs `python -m vl.agent` with the same interpreter, so it needs no `PATH` lookup.
 
@@ -248,7 +249,7 @@ A node that was already running or stopped is not a failure.
 1. **Independent and small, first:** the `NODE_AGENT` role in the identity provider; `verilock --print-host` in the node.
 2. **`vl`, no dependency on anything new:** §4 (shared functions and results), §5 (locking and store settings), §9 (failures not swallowed), and the first step of the build: confirm that `vl node start` really spawns with `start_new_session=True` (`vl-agent-spec.md` §8 item 6).
 3. **The control plane** (spec 1): tables, topics, schemas, endpoints, consumer, cleanup.
-4. **The agent program** (spec 2) with `vl agent` (§6) and `vl service-account --role NODE_AGENT`.
+4. **The agent program** (spec 2) with `vl agent` (§6) and `vl svc-acct --role NODE_AGENT`.
 5. **Remote verbs and `vl command`** (§7, §8), with the scope resolution of §2.
 6. **Acceptance on two real hosts**, the desktop and the laptop: register an agent on each, start a network that spans both, stop it, reset it, and look at each result with `vl command show`.
 
@@ -284,3 +285,7 @@ Steps 1 and 2 can run while spec 1 is still being reviewed; they change nothing 
 8. **The agent's label. Decided.** `vl agent create` names the service account `<org>-agent` by default.
 9. **Waiting by default. Decided.** When a verb goes through the control plane it waits for the results and exits with their status, as the local loops always have, and `--no-wait` is the opt-out. The results come from the local agent's file where this host has a running agent for the org, and from the control plane only for the rest. This replaces the earlier design, in which the verbs returned at once and a separate `vl command watch` polled the control plane.
 10. **`vl node list --remote` and `--all`.** Remote nodes have no local rows, so without these an org admin cannot see their remote nodes at all, and nobody can preview what a fleet verb will act on. **Decided, as written in §2.1.** The alternative, leaving `vl node list` local and relying on `vl network status`, which needs platform-wide standing, was not taken.
+11. **The table for remote commands is `issued_command`. Decided at the step 1 review.** The store already has a `command_history` table (migration v7: the argv log behind `vl history`, 200 rows, written by `app.main` on every invocation). It is left alone, and the new table of §3 is named `issued_command`. The alternative, renaming the old table, was not taken: it would change code and tests that work.
+12. **No `confirm` parameter. Decided at the step 1 review.** See §4.
+13. **The command group is `vl svc-acct`. A slip corrected at the step 1 review.** The specs said `vl service-account`.
+14. **Where the real state is.** The store is `~/.config/vl/store.db` (or `VL_STORE_PATH`); `~/.veritaslock` holds the shared install that `populate_node_dir` copies from; the nodes live under `~/orgs`. The store has `SCHEMA_VERSION` 9, so the migration of §3 is 9 to 10.
