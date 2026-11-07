@@ -119,7 +119,7 @@ def test_yes_runs_the_real_org_reset_for_every_org(
     for org_name in ("globo", "acme"):
         for n in (1, 2):
             sa = add_service_account(f"{org_name}-{n}", org_name, "NODE")
-            row = store.add_node("local", org_name, n, sa.id, 7000 + n)
+            row = store.add_node("local", org_name, n, sa.id)  # the store allocates a free port
             store.set_node_stopped(store.set_pid(row, 4300 + n))  # has run: org reset checks it
             root = tmp_path / "orgs" / org_name / "nodes" / f"node{n}"
             for sub in ("data", "snapshots"):
@@ -420,7 +420,7 @@ def _org_with_nodes(name: str, org_id: str, count: int) -> None:
     for n in range(1, count + 1):
         sa = store.add_identity("local", "SERVICE_ACCOUNT", f"sa-{name}-{n}", f"{name}-{n}", f"{name}-{n}")
         store.set_svc_acct(sa.id, "local", name, f"client-{name}-{n}", "secret", role="NODE")
-        store.add_node("local", name, n, sa.id, 7000 + n)
+        store.add_node("local", name, n, sa.id)  # the store allocates a free port
 
 
 @pytest.fixture

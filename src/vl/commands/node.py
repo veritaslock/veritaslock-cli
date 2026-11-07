@@ -55,12 +55,6 @@ def _resolve_org_node(env: str, org_name: str, org_node: int | None = None) -> i
     return org_node
 
 
-def _resolve_port(port: int | None = None) -> int:
-    if port is None:
-        port = store.next_port()
-    return port
-
-
 def create_node_dir(org: str, n: int) -> None:
     node_root = Path.home() / "orgs" / org / "nodes" / f"node{n}"
     node_bin_dir = node_root / "bin"
@@ -98,7 +92,11 @@ def create(
     with report_errors():
         environment = store.get_environment(env)
 
-        resolved_port = _resolve_port(port)
+        if port is not None and (owner := store.get_node_by_port(port)) is not None:
+            raise store.PortInUseError(
+                f"Port {port} is already used by {owner.org_name}/node{owner.org_node} "
+                f"(environment {owner.environment_name!r}). Pick another --port, or leave it out."
+            )
         caller = store.resolve_identity(environment.name, as_)
         org_dto = resolve_org(environment, org)
         org_name = str(org_dto["name"])
@@ -116,7 +114,8 @@ def create(
         _, identity_id = svc_acct.create_svc_acct(display_name, f"svc-acct for {display_name}", client_secret,
                             environment, identity_label, org_name, caller, role)
         create_node_dir(org_name, org_node)
-        _node = store.add_node(environment.name, org_name, org_node, identity_id, resolved_port)
+        # With no --port, add_node allocates it with the insert (BEGIN IMMEDIATE).
+        _node = store.add_node(environment.name, org_name, org_node, identity_id, port)
     render(_node_row(_node), title="Node created")
 
 
@@ -138,7 +137,7 @@ def repair(node: store.Node) -> store.Node:
     process becomes ``STOPPED`` with no pid. Persisted, local, no control-plane call.
     """
     if node.node_state == "RUNNING" and not is_our_process(node):
-        return store.set_node_stopped(node)
+        return store.set_node_stopped_if_unchanged(node)
     return node
 
 
