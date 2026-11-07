@@ -241,7 +241,25 @@ def stop(
         require_operator(environment, as_, org)
         organization = store.get_organization(environment.name, org)
         nodes = store.get_nodes(environment, organization)
-        nodeops.stop_nodes_to_down(environment, nodes, note)
+        results = nodeops.stop_nodes_to_down(environment, nodes, note)
+        # A node that was already stopped is not a failure (§9).
+        failures = [
+            (f"{n.org_name}/node{n.org_node}", r.detail)
+            for n, r in results
+            if r.outcome is nodeops.Outcome.FAILED
+        ]
+        if failures:
+            raise OrgStopFailed(organization.name, len(nodes), failures)
+
+
+class OrgStopFailed(CliError):
+    """Some of an org's nodes failed to stop; ``failures`` is ``[(org/nodeN, reason)]``."""
+
+    def __init__(self, org_name: str, total: int, failures: list[tuple[str, str]]) -> None:
+        self.failures = failures
+        lines = [f"{len(failures)} of {total} nodes in {org_name} failed to stop:"]
+        lines += [f"  {label}: {reason}" for label, reason in failures]
+        super().__init__("\n".join(lines))
 
 
 def nodes_not_down(environment: Environment, nodes: list[Node]) -> list[tuple[str, str]]:

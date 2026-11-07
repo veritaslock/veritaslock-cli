@@ -7,6 +7,7 @@ resource command.
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from typing import Annotated, Any
 
 import typer
@@ -72,11 +73,30 @@ def stop(
 
         orgs = curate_orgs(environment)
         orgs.reverse()
-        for org_ in orgs:
-            try:
-                org.stop(org_.name, env=environment.name, as_=caller.label)
-            except Exception as e:
-                note(f"Warning: {e}")
+        for_each_org(orgs, lambda org_: org.stop(org_.name, env=environment.name, as_=caller.label))
+
+
+def for_each_org(orgs: list[Organization], run: Callable[[Organization], object]) -> None:
+    """Run an org verb on each org, then fail with one summary if any failed (§9).
+
+    An org verb that failed has printed its own error and raised ``typer.Exit``:
+    that is recorded as ``<org>: failed, see above``. Any other exception keeps
+    its ``Warning: …`` line, as before, and is recorded with its cause.
+    """
+    failures: list[tuple[str, str]] = []
+    for org_ in orgs:
+        try:
+            run(org_)
+        except typer.Exit as e:
+            if e.exit_code != 0:
+                failures.append((org_.name, "failed, see above"))
+        except Exception as e:
+            note(f"Warning: {e}")
+            failures.append((org_.name, failure_reason(e)))
+    if failures:
+        lines = [f"{len(failures)} of {len(orgs)} orgs failed:"]
+        lines += [f"  {name}: {reason}" for name, reason in failures]
+        raise CliError("\n".join(lines))
 
 
 def get_network_status(as_: str | None, env: str | None) -> list[dict[str, Any]]:
@@ -164,12 +184,8 @@ def reset(
             reset_cp_state(caller, environment, dry_run=False)
             orgs = curate_orgs(environment)
             orgs.reverse()
-            for org_ in orgs:
-                try:
-                    org.reset(org_.name, include_snapshots=True, yes=True, env=environment.name,
-                              as_=caller.label)
-                except Exception as e:
-                    note(f"Warning: {e}")
+            for_each_org(orgs, lambda org_: org.reset(org_.name, include_snapshots=True, yes=True,
+                                                      env=environment.name, as_=caller.label))
 
 
 @app.command("status")
