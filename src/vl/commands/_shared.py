@@ -34,16 +34,28 @@ def report_errors() -> Iterator[None]:
     """Render a store / API / auth / CLI error as one clean line + non-zero exit."""
     try:
         yield
-    except (store.StoreError, auth.AuthError, CliError) as exc:
-        console.print(f"[red]Error:[/red] {exc}")
+    except (store.StoreError, auth.AuthError, CliError, api.ApiError) as exc:
+        print_error(exc)
         raise typer.Exit(1) from exc
-    except api.ApiError as exc:
+
+
+def print_error(exc: BaseException) -> bool:
+    """Print ``exc`` as :func:`report_errors` does, if it is one it reports.
+
+    For a batch command that reports a sub-step's failure itself and goes on.
+    Returns whether anything was printed.
+    """
+    if isinstance(exc, api.ApiError):
         console.print(f"[red]Error:[/red] {exc}")
         for field_error in exc.invalid_fields:
             console.print(f"  - {_fmt_field_error(field_error)}")
         if exc.correlation_id and exc.status_code >= 500:
             console.print(f"  [dim]correlation-id: {exc.correlation_id}[/dim]")
-        raise typer.Exit(1) from exc
+        return True
+    if isinstance(exc, (store.StoreError, auth.AuthError, CliError)):
+        console.print(f"[red]Error:[/red] {exc}")
+        return True
+    return False
 
 
 def failure_reason(exc: BaseException) -> str:

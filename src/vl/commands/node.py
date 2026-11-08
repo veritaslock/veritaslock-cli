@@ -7,17 +7,11 @@ token flow throughout. See vl-node-spec.md.
 from __future__ import annotations
 
 import secrets
-import signal
 import sys
-from os import mkdir
 from typing import Annotated, Any
 
 import typer
 from rich.markup import escape
-import os
-import time
-import subprocess
-import shutil
 
 from vl.commands import svc_acct
 from vl.commands._shared import (
@@ -26,7 +20,7 @@ from vl.commands._shared import (
     report_errors,
     resolve_org, assert_label_free, CliError, require_operator,
 )
-from vl.lib import store, roles, api, auth, host, node_state, proc
+from vl.lib import store, roles, api, auth, host, node_state, nodelock, nodeops, proc
 from vl.lib.cli import HelpOnErrorGroup
 from vl.lib.output import is_json, render, note, warn
 from pathlib import Path
@@ -55,14 +49,8 @@ def _resolve_org_node(env: str, org_name: str, org_node: int | None = None) -> i
     return org_node
 
 
-def _resolve_port(port: int | None = None) -> int:
-    if port is None:
-        port = store.next_port()
-    return port
-
-
 def create_node_dir(org: str, n: int) -> None:
-    node_root = Path.home() / "orgs" / org / "nodes" / f"node{n}"
+    node_root = nodeops.node_root(org, n)
     node_bin_dir = node_root / "bin"
     node_etc_dir = node_root / "etc"
     node_data_dir = node_root / "data"
@@ -98,7 +86,11 @@ def create(
     with report_errors():
         environment = store.get_environment(env)
 
-        resolved_port = _resolve_port(port)
+        if port is not None and (owner := store.get_node_by_port(port)) is not None:
+            raise store.PortInUseError(
+                f"Port {port} is already used by {owner.org_name}/node{owner.org_node} "
+                f"(environment {owner.environment_name!r}). Pick another --port, or leave it out."
+            )
         caller = store.resolve_identity(environment.name, as_)
         org_dto = resolve_org(environment, org)
         org_name = str(org_dto["name"])
@@ -109,205 +101,31 @@ def create(
         client_secret = secrets.token_hex(16)
         assert_label_free(environment.name, identity_label)
 
-        node_root = Path.home() / "orgs" / org_name / "nodes" / f"node{org_node}"
+        node_root = nodeops.node_root(org_name, org_node)
         if node_root.exists():
             raise CliError(f"{node_root} already exists — remove it manually before creating this node.")
 
         _, identity_id = svc_acct.create_svc_acct(display_name, f"svc-acct for {display_name}", client_secret,
                             environment, identity_label, org_name, caller, role)
         create_node_dir(org_name, org_node)
-        _node = store.add_node(environment.name, org_name, org_node, identity_id, resolved_port)
+        # With no --port, add_node allocates it with the insert (BEGIN IMMEDIATE).
+        _node = store.add_node(environment.name, org_name, org_node, identity_id, port)
     render(_node_row(_node), title="Node created")
 
 
 def node_root_dir(org: str, n: int) -> Path:
-    return Path.home() / "orgs" / org / "nodes" / f"node{n}"
-
-
-def node_executable(node: store.Node) -> Path:
-    """The binary a process must be running to count as this node's own (§4c)."""
-    return node_root_dir(node.org_name, node.org_node) / "bin" / "verilock"
-
-
-def is_our_process(node: store.Node) -> bool:
-    return proc.is_our_process(node.pid, node_executable(node))
-
-
-def repair(node: store.Node) -> store.Node:
-    """§4c repair on read: a ``RUNNING`` row whose pid isn't this node's own live
-    process becomes ``STOPPED`` with no pid. Persisted, local, no control-plane call.
-    """
-    if node.node_state == "RUNNING" and not is_our_process(node):
-        return store.set_node_stopped(node)
-    return node
-
-
-def is_node_down(node: store.Node) -> bool:
-    if node.node_state == "RUNNING" and is_our_process(node):
-        note(f"{node.org_name} node{node.org_node} is already running (pid {node.pid})")
-        return False
-    return True
-
-
-def create_sym_link(private_key_link: Path, private_key_path: str) -> None:
-    # Remove old link if it exists
-    if private_key_link.exists() or private_key_link.is_symlink():
-        private_key_link.unlink()
-    private_key_link.symlink_to(private_key_path)
-
-
-def create_lib_symlink(node_lib_dir: Path) -> None:
-    target = node_lib_dir / "liblog4cplus.so.3"
-    link = node_lib_dir / "liblog4cplus.so"
-    create_sym_link(link, target.name)
-
-
-def generate_veritaslock_config (environment: store.Environment, dest_config_dir: Path, node: store.Node) -> None:
-    veritaslock_config_file = dest_config_dir / "veritas-lock.conf"
-    assert all(v is not None for v in [environment.cp_base_url,
-                                       environment.idp_base_url,
-                                       environment.token_url,
-                                       environment.schema_reg_url,
-                                       environment.kafka_bootstrap])
-
-    with open(veritaslock_config_file, "w") as veritaslock_config:
-        veritaslock_config.write(f"kafka.broker={environment.kafka_bootstrap}\n")
-        veritaslock_config.write(f"schema.registry.url={environment.schema_reg_url}\n")
-        veritaslock_config.write("veritas.data.dir=data\n")
-        veritaslock_config.write(f"token.url={environment.token_url}\n")
-        veritaslock_config.write(f"control.plane.base.url={environment.cp_base_url}\n")
-        veritaslock_config.write(f"identity.provider.base.url={environment.idp_base_url}\n")
-        veritaslock_config.write(f"http.port={node.port}\n")
-        veritaslock_config.write(f"org.node={node.org_node}")
-
-
-def populate_bin_dir(node_root: Path, src_dir: Path) -> None:
-    src_bin = src_dir / "bin"
-    dst_bin = node_root / "bin"
-    for src_file in src_bin.iterdir():
-        if src_file.is_file():
-            dst_file = dst_bin / src_file.name
-            shutil.copy2(src_file, dst_file)
-            # chmod +x (preserve existing bits, add execute)
-            st = dst_file.stat()
-            os.chmod(dst_file, st.st_mode | 0o111)
-
-
-def populate_lib_dir(node_root: Path, src_dir: Path) -> None:
-    src_lib_dir = src_dir / "lib"
-    dest_lib_dir = node_root / "lib"
-    shutil.copy2(src_lib_dir / "liblog4cplus.so.3", dest_lib_dir)
-    create_lib_symlink(dest_lib_dir)
-
-
-def populate_config_dir(environment: store.Environment, node_root: Path, src_dir: Path, node: store.Node) -> None:
-    src_config_dir = src_dir / "etc"
-    dest_config_dir = node_root / "etc"
-    shutil.copy2(src_config_dir / "log4cplus.properties", dest_config_dir)
-    shutil.copy2(src_config_dir / "verilock-kafka-consumer.conf", dest_config_dir)
-    generate_veritaslock_config(environment, dest_config_dir, node)
-
-
-def populate_identity_dir(node: store.Node, node_root: Path) -> None:
-    svc_acct_id = node.svc_acct_id
-    svc_acct_ = store.get_svc_acct(svc_acct_id)
-    if svc_acct_ is not None:
-        private_key_path = svc_acct_.private_key_path
-        public_key_path = svc_acct_.public_key_path
-        assert private_key_path is not None
-        assert public_key_path is not None
-
-        identity_dir = node_root / "identity"
-        client_id = svc_acct_.client_id
-        client_id_file = identity_dir / "client_id"
-        with client_id_file.open("w") as f:
-            f.write(client_id)
-
-
-        private_key_link = identity_dir / "private.key"
-        public_key_link = identity_dir / "public.key"
-
-        create_sym_link(private_key_link, private_key_path)
-        create_sym_link(public_key_link, public_key_path)
-
-
-def populate_node_dir(environment: store.Environment, org: str, n: int, node: store.Node) -> Path:
-    node_root = Path.home() / "orgs" / org / "nodes" / f"node{n}"
-    src_dir = Path.home() / ".veritaslock"
-    populate_bin_dir(node_root, src_dir)
-    populate_config_dir(environment, node_root, src_dir, node)
-    populate_lib_dir(node_root, src_dir)
-    populate_identity_dir(node, node_root)
-    return node_root
-
-
-# Hints for a node that exits right after `vl node start` (vl-node-spec.md §5.2
-# step 4), keyed by its exit code or a marker in its log tail. First match wins.
-# Exit code 1 (any other startup failure) has no hint: the log tail says why.
-_START_FAILURE_HINTS: tuple[tuple[str | int, str], ...] = (
-    (
-        69,  # EX_UNAVAILABLE: the control plane answered 409 NOT_DOWN
-        "The control plane still has this node as UP. Wait about 30 seconds for its "
-        "heartbeat timeout and start it again.",
-    ),
-    (
-        "NOT_DOWN",  # older binaries abort (SIGABRT) instead, so match the log text
-        "The control plane still has this node as UP. A kill -9 gives a node no chance "
-        "to say it is going down, and the control plane marks it DOWN after about 30 "
-        "seconds without a heartbeat. Wait about 30 seconds and start it again.",
-    ),
-    (
-        75,  # EX_TEMPFAIL
-        "The node asked to be started again later (for example the control plane still "
-        "has it as UP, or its chain was out of sync and a restart will replay). Check "
-        "the log, wait about 30 seconds and start it again.",
-    ),
-    (
-        74,  # EX_IOERR
-        "The node stopped because of a storage failure. Do not restart it "
-        "automatically: check the disk first.",
-    ),
-)
-
-
-def describe_exit(returncode: int) -> str:
-    """How a process ended: ``killed by SIGABRT`` or ``exited with code 3``."""
-    if returncode < 0:
-        try:
-            name = signal.Signals(-returncode).name
-        except ValueError:
-            name = f"signal {-returncode}"
-        return f"killed by {name}"
-    return f"exited with code {returncode}"
-
-
-def start_failure_hint(returncode: int, log_tail: list[str]) -> str | None:
-    text = "\n".join(log_tail)
-    for key, hint in _START_FAILURE_HINTS:
-        matched = key in text if isinstance(key, str) else key == returncode
-        if matched:
-            return hint
-    return None
-
-
-def read_tail(path: Path, n: int = 50) -> list[str] | None:
-    """The last ``n`` lines of ``path``; ``None`` if it doesn't exist."""
-    try:
-        with open(path, "r", errors="replace") as f:
-            return [line.rstrip() for line in f.readlines()[-n:]]
-    except FileNotFoundError:
-        return None
+    return nodeops.node_root(org, n)
 
 
 class NodeStartFailed(CliError):
     """The node's process exited right after `vl node start` spawned it."""
 
     def __init__(self, label: str, returncode: int, log_path: Path) -> None:
-        tail = read_tail(log_path)
+        tail = nodeops.read_tail(log_path)
         self.label = label
-        self.reason = f"exited right after starting ({describe_exit(returncode)})"
+        self.reason = nodeops.start_failure_reason(returncode)
         lines = [f"{label} {self.reason}."]
-        hint = start_failure_hint(returncode, tail or [])
+        hint = nodeops.start_failure_hint(returncode, tail or [])
         if hint:
             lines.append(hint)
         lines.append("---- Log tail ----")
@@ -319,48 +137,13 @@ class NodeStartFailed(CliError):
         super().__init__("\n".join(escape(line) for line in lines))
 
 
-def check_liveness(
-    node: store.Node, proc: subprocess.Popen[bytes], log_path: Path, label: str
-) -> None:
-    """Raise :class:`NodeStartFailed` if the process has already exited."""
-    # Long enough to catch a rejected registration at the control plane, not just a crash.
-    time.sleep(1)
-    returncode = proc.poll()
-    if returncode is not None:
-        store.set_node_stopped(node)
-        raise NodeStartFailed(label, returncode, log_path)
-
-
-def start_verilock(node: store.Node, node_root: Path, org: str, org_node: int) -> None:
-    bin_path = node_root / "bin" / "verilock"
-    log_dir = Path.home() / "tmp"
-    Path.mkdir(log_dir, exist_ok=True)
-    log_path = log_dir / f"{org}-node{org_node}.out"
-    # Build environment
-    env = os.environ.copy()
-    env["VERITAS_INSTALL_ROOT"] = str(node_root)
-    env["LD_PRELOAD"] = "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2"
-    env["MALLOC_CONF"] = (
-        "background_thread:true,"
-        "dirty_decay_ms:1000,"
-        "muzzy_decay_ms:0,"
-        "narenas:2"
-    )
-    # Open log file for stdout+stderr redirection
-    # Spawn detached process
-    with open(log_path, "w") as log_file:
-        proc = subprocess.Popen(
-            [str(bin_path)],
-            stdout=log_file,
-            stderr=log_file,
-            stdin=subprocess.DEVNULL,
-            env=env,
-            start_new_session=True,
-        )
-
-    store.set_pid(node, proc.pid)
-    check_liveness(node, proc, log_path, f"{org}/node{org_node}")
-    note(f"Started {org}/node{org_node} (pid: {proc.pid}).")
+def start_failure_error(org: str, org_node: int, result: nodeops.NodeResult) -> CliError:
+    """The error `vl node start` reports for a ``FAILED`` start: an early exit
+    with its hint and log tail, or the result's detail (a busy node)."""
+    label = f"{org}/node{org_node}"
+    if result.exit_code is not None:
+        return NodeStartFailed(label, result.exit_code, nodeops.log_path(org, org_node))
+    return CliError(f"{label}: {result.detail}")
 
 
 @app.command("start")
@@ -376,50 +159,10 @@ def start(
         environment = store.get_environment(env)
         require_operator(environment, as_, org)
         org_name = store.get_organization(environment.name, org).name
-        node = store.get_node(environment.name, org_name, org_node)
-
-        if is_node_down(node):
-            node_root = populate_node_dir(environment, org_name, org_node, node)
-            start_verilock(node, node_root, org_name, org_node)
-
-
-def shutdown_node(node: store.Node) -> bool:
-    """SIGTERM, poll, then SIGKILL. Only call this for a pid that passed :func:`is_our_process`.
-
-    Polls with the same §4c check, so a zombie or a pid that's been reused counts
-    as gone and is never signalled again.
-    """
-    assert node.pid is not None
-    pid = node.pid
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        note(f"{pid} was not running or was already terminated")
-        return True
-
-    deadline = time.time() + 10.0
-    while time.time() < deadline:
-        if not is_our_process(node):
-            note(f"Stopped {node.org_name}/node{node.org_node} (pid: {pid}).")
-            return True
-        time.sleep(0.25)
-
-    # Still alive after the timeout: SIGKILL, then a brief pause for the kernel to reap.
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        note(f"Terminated {node.org_name}/node{node.org_node} (pid: {pid}).")
-        return True
-    except PermissionError:
-        pass
-    time.sleep(0.1)
-
-    if not is_our_process(node):
-        note(f"Terminated {node.org_name}/node{node.org_node} (pid: {pid}).")
-        return True
-
-    note(f"Failure to shutdown {node.org_name}/node{node.org_node} (pid: {pid}).")
-    return False
+        store.get_node(environment.name, org_name, org_node)  # no such node: the store's error
+        result = nodeops.start_node(environment, org_name, org_node, note)
+        if result.outcome is nodeops.Outcome.FAILED:
+            raise start_failure_error(org_name, org_node, result)
 
 
 @app.command("stop")
@@ -435,49 +178,12 @@ def stop(
         environment = store.get_environment(env)
         require_operator(environment, as_, org)
         org_name = store.get_organization(environment.name, org).name
-        node = store.get_node(environment.name, org_name, org_node)
-        if node.pid is None:
-            note(f"{org_name}/node{node.org_node} is not running.")
-        elif is_our_process(node):
-            if shutdown_node(node):
-                store.set_node_stopped(node)
-        else:
-            store.set_node_stopped(node)
-            note("done")
-
-def fetch_node_by_id(environment: store.Environment, node: store.Node) -> dict[str, Any] | None:
-    """`GET /v1/nodes/{id}` """
-    acct = store.get_svc_acct(node.svc_acct_id)
-    assert acct is not None
-    assert acct.client_id is not None
-    identity = store.get_identity_by_server_id(environment.name, acct.client_id,"SERVICE_ACCOUNT")
-    assert identity is not None
-    result: dict[str, Any] = auth.authed_call(
-        identity,
-        environment.idp_base_url,
-        lambda c: c.get(
-            "/v1/nodes", params={"orgNode": node.org_node}
-        ),
-        environment.cp_base_url
-    )
-    return result
-
-
-def node_is_up(environment: store.Environment, node: store.Node) -> bool:
-    node_dto = fetch_node_by_id(environment, node)
-    assert node_dto is not None
-    state: str = node_dto["state"]
-    return state != "DOWN"
-
-
-def reset_node(node_root: Path, include_snapshots: bool) -> None:
-    data_dir = node_root / "data"
-    shutil.rmtree(data_dir, ignore_errors=True)
-    data_dir.mkdir(parents=True, exist_ok=True)
-    if include_snapshots:
-        snapshots_dir = node_root / "snapshots"
-        shutil.rmtree(snapshots_dir, ignore_errors=True)
-        snapshots_dir.mkdir(parents=True, exist_ok=True)
+        store.get_node(environment.name, org_name, org_node)
+        result = nodeops.stop_node(environment, org_name, org_node, note)
+        # A node that would not die has had its own line ("Failure to shutdown …"),
+        # and exits 0 as it always has; a busy node is an error.
+        if result.detail == nodelock.BUSY_DETAIL:
+            raise CliError(f"{org_name}/node{org_node}: {result.detail}")
 
 
 @app.command("reset")
@@ -502,10 +208,12 @@ def reset(
         require_operator(environment, as_, org)
         org_name = store.get_organization(environment.name, org).name
         node = store.get_node(environment.name, org_name, org_node)
-        if node.node_state != "NEW" and node_is_up(environment, node):
-            note(f"{org_name}/node{org_node} is still reported UP by the control plane — stop it first or try again.")
-            return False
         if yes is None:
+            # The check comes before the prompt, so an up node is reported without
+            # one; reset_node checks again under the node's lock.
+            if node.node_state != "NEW" and nodeops.node_is_up(environment, node):
+                note(f"{org_name}/node{org_node} is still reported UP by the control plane — stop it first or try again.")
+                return False
             if not sys.stdin.isatty():
                 raise CliError("vl node reset requires confirmation; pass --yes to run non-interactively")
             if include_snapshots:
@@ -517,16 +225,14 @@ def reset(
                 default=False,
             )
 
-        if yes:
-            node_root = Path.home() / "orgs" / org_name / "nodes" / f"node{org_node}"
-            reset_node(node_root, include_snapshots)
-            if include_snapshots:
-                msg_suffix = "data and snapshots directories."
-            else:
-                msg_suffix = "data directory."
-            note(f"Deleted {org_name}/node{org_node}'s {msg_suffix}")
-            return True
-        return False
+        if not yes:
+            return False
+        result = nodeops.reset_node(
+            environment, org_name, org_node, note, include_snapshots=include_snapshots
+        )
+        if result.detail == nodelock.BUSY_DETAIL:
+            raise CliError(f"{org_name}/node{org_node}: {result.detail}")
+        return result.outcome is nodeops.Outcome.RESET
 
 
 # --------------------------------------------------------------------------- #
@@ -657,7 +363,7 @@ def list_(
         else:
             local = store.get_nodes(environment)
             title = f"nodes in {environment.name}"
-        nodes = [repair(n) for n in local if _in_scope(n, scope)]
+        nodes = [nodeops.repair(n) for n in local if _in_scope(n, scope)]
 
         overlay = _Overlay(_cp_by_node(environment, _fetch_cp_nodes(environment, caller)))
         rows = [
@@ -696,7 +402,7 @@ def show(
             raise not_found from None
         if not _in_scope(local, _scope_org_names(environment, caller)):
             raise not_found
-        node = repair(local)
+        node = nodeops.repair(local)
 
         # The org-scoped list form, filtered here to this (org, org_node): the
         # orgNode form derives org_id from a single-org token, which a user's isn't.

@@ -14,6 +14,13 @@ and bumping ``SCHEMA_VERSION`` (§8 of the ``vl env`` spec):
 * v7 — ``command_history`` ring buffer + ``vl history``.
 * v8 — ``svc_acct.role`` column (shown by ``vl svc-acct list`` / ``show``).
 * v9 — ``env_kafka_property_override`` + ``node`` tables, ``vl node`` (Phase 7).
+* v10 — a unique ``node.port``, and the ``agent`` and ``issued_command`` tables
+  (node agent support, vl-agent-cli-spec.md §3). Refused, changing nothing, if
+  two existing nodes share a port.
+
+Every connection runs in WAL mode with a 10-second busy timeout (§5.2 of the
+same spec), so ``vl`` and the node agents can share the file; a transaction
+that reads and then writes takes the write lock first (``BEGIN IMMEDIATE``).
 
 On open, every migration between the store's ``PRAGMA user_version`` and
 ``SCHEMA_VERSION`` is applied in order; a store from a *newer* `vl` is rejected
@@ -37,14 +44,17 @@ from __future__ import annotations
 import os
 import shlex
 import sqlite3
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
+
+# How long a connection waits for another's write lock before failing (§5.2).
+BUSY_TIMEOUT_MS = 10_000
 
 # Treat a cached token as expired this many seconds before its real expiry, to
 # avoid handing a command a token that dies mid-request.
@@ -236,6 +246,47 @@ _MIGRATIONS: tuple[str, ...] = (
             ON UPDATE CASCADE ON DELETE RESTRICT
     );
     """,
+    # 9 -> 10: node agent support (vl-agent-cli-spec.md §3). Ports are allocated
+    # across the whole store (MAX(port)+1), so the index is on port alone; the
+    # migration is refused beforehand if existing rows share one
+    # (_check_unique_ports). agent: one per org and environment on this host,
+    # like node. issued_command: the commands issued from this machine through
+    # the control plane, for `--last`; the argv log behind `vl history` is
+    # command_history, a different table.
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS node_port_unique ON node (port);
+    CREATE TABLE IF NOT EXISTS agent (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        environment_name  TEXT NOT NULL
+                          REFERENCES environment(name)
+                          ON UPDATE CASCADE ON DELETE RESTRICT,
+        org_name          TEXT NOT NULL,
+        svc_acct_id       INTEGER NOT NULL
+                          REFERENCES svc_acct(identity_id)
+                          ON DELETE RESTRICT,
+        pid               INTEGER,
+        state             TEXT NOT NULL DEFAULT 'NEW'
+                          CHECK (state IN ('NEW', 'RUNNING', 'STOPPED')),
+        created_at        TEXT NOT NULL,
+        UNIQUE (environment_name, org_name),
+        FOREIGN KEY (environment_name, org_name)
+            REFERENCES organization(environment_name, name)
+            ON UPDATE CASCADE ON DELETE RESTRICT
+    );
+    CREATE TABLE IF NOT EXISTS issued_command (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        environment_name  TEXT NOT NULL
+                          REFERENCES environment(name)
+                          ON UPDATE CASCADE ON DELETE CASCADE,
+        correlation_id    TEXT NOT NULL,
+        command_type      TEXT NOT NULL,
+        scope             TEXT NOT NULL,
+        org_name          TEXT,
+        org_node          INTEGER,
+        issued_at         TEXT NOT NULL,
+        expires_at        TEXT NOT NULL
+    );
+    """,
 )
 
 # Auto-seeded on first store-open so a fresh install works with zero setup (§4).
@@ -302,6 +353,14 @@ class NodeNotFoundError(StoreError):
 
 class NodeExistsError(StoreError):
     """Node with name in org org_name already exists in environment."""
+
+
+class PortInUseError(StoreError):
+    """Another node already has that port."""
+
+
+class DuplicatePortsError(StoreError):
+    """The store can't be migrated to a unique ``node.port``: existing nodes share ports."""
 
 
 @dataclass(frozen=True)
@@ -451,24 +510,74 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _connect(path: Path) -> sqlite3.Connection:
+    """The one place a store connection is opened (vl-agent-cli-spec.md §5.2).
+
+    A 10-second busy timeout (a writer waits for another's lock instead of
+    failing at once), foreign keys, the schema brought up to date, then WAL
+    (persistent; readers never block the writer). WAL comes after the schema
+    step so that a migration that is refused, or a store from a newer `vl`,
+    leaves the file exactly as it was.
+    """
+    conn = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA foreign_keys = ON")
+        _init_schema(conn)
+        conn.execute("PRAGMA journal_mode = WAL")
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
 @contextmanager
-def _store() -> Iterator[sqlite3.Connection]:
-    """Open the store, applying schema + seed, and always close the handle."""
+def _immediate(conn: sqlite3.Connection) -> Iterator[None]:
+    """One ``BEGIN IMMEDIATE`` transaction: the write lock is taken before the
+    first read, so a read-then-write can't interleave with another process's.
+
+    Commits on success (a ``conn.commit()`` inside just ends it early) and rolls
+    back on any exception.
+    """
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    if conn.in_transaction:
+        conn.commit()
+
+
+@contextmanager
+def _store(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+    """Open the store, applying schema + seed, and always close the handle.
+
+    ``immediate=True`` runs the caller's block as one ``BEGIN IMMEDIATE``
+    transaction: for every function that reads and then writes.
+    """
     path = _store_path()
 
     if not path.parent.exists():
         path.parent.mkdir(parents=True)
         os.chmod(path.parent, 0o700)
 
-    newly_created = not path.exists()
-    conn = sqlite3.connect(path)
+    if not path.exists():
+        # Owner-only before SQLite opens it: the -wal and -shm files that WAL adds
+        # beside it take the database file's mode, and they hold the same secrets.
+        path.touch(mode=0o600)
+        os.chmod(path, 0o600)
+    conn = _connect(path)
     try:
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        if newly_created:
-            os.chmod(path, 0o600)
-        _init_schema(conn)
-        yield conn
+        if immediate:
+            with _immediate(conn):
+                yield conn
+        else:
+            yield conn
     finally:
         conn.close()
 
@@ -484,6 +593,9 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         )
 
     for current in range(version, SCHEMA_VERSION):
+        check = _MIGRATION_CHECKS.get(current)
+        if check is not None:
+            check(conn)
         conn.executescript(_MIGRATIONS[current])
         conn.execute(f"PRAGMA user_version = {current + 1}")
         conn.commit()
@@ -491,10 +603,54 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     _seed_local(conn)
 
 
+def _check_unique_ports(conn: sqlite3.Connection) -> None:
+    """Before 9 -> 10: refuse, changing nothing, if existing nodes share a port.
+
+    The unique index would fail on them anyway; this names them instead, and
+    leaves renumbering to the owner: a node's port is in its rendered config.
+    """
+    rows = conn.execute(
+        "SELECT port, group_concat(org_name || '/node' || org_node, ', ') AS nodes "
+        "FROM node GROUP BY port HAVING COUNT(*) > 1 ORDER BY port"
+    ).fetchall()
+    if rows:
+        lines = [
+            f"store.db can't be upgraded to schema version {SCHEMA_VERSION}: each node "
+            f"needs its own port, and these share one:"
+        ]
+        lines += [f"  port {row['port']}: {row['nodes']}" for row in rows]
+        lines.append(
+            f"Nothing was changed. Give each of them a different port in the node "
+            f"table of {_store_path()}, then run vl again."
+        )
+        raise DuplicatePortsError("\n".join(lines))
+
+
+# Checks run before a migration (keyed like _MIGRATIONS: i is the step i -> i + 1).
+_MIGRATION_CHECKS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    9: _check_unique_ports,
+}
+
+
 def _seed_local(conn: sqlite3.Connection) -> None:
-    """Create the ``local`` row if the table is empty (idempotent)."""
-    if conn.execute("SELECT COUNT(*) FROM environment").fetchone()[0]:
+    """Create the ``local`` row if the table is empty (idempotent).
+
+    Checked first without the write lock, so an ordinary open never takes it;
+    checked again under it, so two processes opening a new store seed once.
+    """
+    if _has_environments(conn):
         return
+    with _immediate(conn):
+        if _has_environments(conn):
+            return
+        _insert_local_seed(conn)
+
+
+def _has_environments(conn: sqlite3.Connection) -> bool:
+    return bool(conn.execute("SELECT COUNT(*) FROM environment").fetchone()[0])
+
+
+def _insert_local_seed(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         INSERT INTO environment (name, idp_base_url, cp_base_url, di_base_url, token_url, schema_reg_url,
@@ -549,7 +705,7 @@ def add_environment(
     kafka_bootstrap: str,
 ) -> Environment:
     """Insert a new environment. Does not make it the default."""
-    with _store() as conn:
+    with _store(immediate=True) as conn:
         if _find(conn, name) is not None:
             raise EnvironmentExistsError(
                 f"Environment {name!r} already exists. Use "
@@ -617,7 +773,7 @@ def get_environment(name: str | None = None) -> Environment:
 
 def set_default_environment(name: str) -> None:
     """Make ``name`` the sole default environment."""
-    with _store() as conn:
+    with _store(immediate=True) as conn:
         if _find(conn, name) is None:
             raise EnvironmentNotFoundError(
                 f"No environment named {name!r}. Run `vl env list` to see what "
@@ -655,7 +811,7 @@ def update_environment(
         if value is not None
     }
 
-    with _store() as conn:
+    with _store(immediate=True) as conn:
         if _find(conn, name) is None:
             raise EnvironmentNotFoundError(
                 f"No environment named {name!r}. Run `vl env list` to see what "
@@ -675,7 +831,7 @@ def update_environment(
 
 def delete_environment(name: str) -> None:
     """Delete an environment. Refuses to delete the default or a referenced one."""
-    with _store() as conn:
+    with _store(immediate=True) as conn:
         env = _find(conn, name)
         if env is None:
             raise EnvironmentNotFoundError(
@@ -843,7 +999,7 @@ def add_identity(
     label: str,
 ) -> Identity:
     """Create an identity row. Does not make it the environment's default."""
-    with _store() as conn:
+    with _store(immediate=True) as conn:
         if _identity_row(conn, environment, label) is not None:
             raise IdentityExistsError(
                 f"Identity {label!r} already exists in environment "
@@ -926,7 +1082,7 @@ def list_identities(
 
 def delete_identity(environment: str, label: str) -> None:
     """Delete an identity (cascades to credential, memberships, cached token)."""
-    with _store() as conn:
+    with _store(immediate=True) as conn:
         row = _identity_row(conn, environment, label)
         if row is None:
             raise IdentityNotFoundError(
@@ -938,7 +1094,7 @@ def delete_identity(environment: str, label: str) -> None:
 
 def set_default_identity(environment: str, label: str) -> None:
     """Make ``label`` the sole default identity for its environment."""
-    with _store() as conn:
+    with _store(immediate=True) as conn:
         if _identity_row(conn, environment, label) is None:
             raise IdentityNotFoundError(
                 f"No identity {label!r} in environment {environment!r}."
@@ -1445,13 +1601,21 @@ def _node_row(
     return row
 
 
-def add_node(environment_name: str, org_name: str, org_node: int, svc_acct_id: int, port: int) -> Node:
-    """Create a Node row."""
-    with _store() as conn:
+def add_node(
+    environment_name: str, org_name: str, org_node: int, svc_acct_id: int, port: int | None = None
+) -> Node:
+    """Create a Node row. With no ``port``, allocates the next one (``MAX(port)+1``
+    across the store, or 7001) in the same ``BEGIN IMMEDIATE`` transaction as the
+    insert, so two concurrent creates never get the same port."""
+    with _store(immediate=True) as conn:
         if _node_row(conn, environment_name, org_name, org_node) is not None:
             raise NodeExistsError(
                 f"Node with {org_node!r} in {org_name!r} already exists in environment {environment_name!r}"
             )
+        if port is None:
+            port = _allocate_port(conn)
+        elif (owner := _node_with_port(conn, port)) is not None:
+            raise _port_in_use(port, owner)
         cursor = conn.execute(
             """
             INSERT INTO node (environment_name, org_name, org_node, svc_acct_id, port, state, created_at)
@@ -1467,6 +1631,31 @@ def add_node(environment_name: str, org_name: str, org_node: int, svc_acct_id: i
         return _row_to_node(row)
 
 
+def _allocate_port(conn: sqlite3.Connection) -> int:
+    """The next port across the store. Call only inside ``BEGIN IMMEDIATE``."""
+    row: sqlite3.Row = conn.execute("SELECT MAX(port) FROM node").fetchone()
+    return int(row[0]) + 1 if row[0] is not None else 7001
+
+
+def _node_with_port(conn: sqlite3.Connection, port: int) -> sqlite3.Row | None:
+    row: sqlite3.Row | None = conn.execute("SELECT * FROM node WHERE port = ?", (port,)).fetchone()
+    return row
+
+
+def _port_in_use(port: int, owner: sqlite3.Row) -> PortInUseError:
+    return PortInUseError(
+        f"Port {port} is already used by {owner['org_name']}/node{owner['org_node']} "
+        f"(environment {owner['environment_name']!r}). Pick another --port, or leave it out."
+    )
+
+
+def get_node_by_port(port: int) -> Node | None:
+    """The node, in any environment, that has ``port``."""
+    with _store() as conn:
+        row = _node_with_port(conn, port)
+        return _row_to_node(row) if row is not None else None
+
+
 def next_org_node(environment_name: str, org_name: str) -> int:
     with _store() as conn:
         row: sqlite3.Row = conn.execute(
@@ -1474,13 +1663,6 @@ def next_org_node(environment_name: str, org_name: str) -> int:
         ).fetchone()
         return row[0] + 1 if row[0] is not None else 1
 
-
-def next_port() -> int:
-    with _store() as conn:
-        row: sqlite3.Row = conn.execute(
-            "SELECT MAX(port) FROM node"
-        ).fetchone()
-        return row[0] + 1 if row[0] is not None else 7001
 
 def get_node(environment_name: str, org_name: str, org_node: int) -> Node:
     with _store() as conn:
@@ -1494,7 +1676,7 @@ def get_node(environment_name: str, org_name: str, org_node: int) -> Node:
 
 
 def set_pid(node: Node, pid: int) -> Node:
-    with _store() as conn:
+    with _store(immediate=True) as conn:
         conn.execute(
            "UPDATE node SET pid = ?, state = ? WHERE id = ?", (pid, "RUNNING", node.id,)
         )
@@ -1506,7 +1688,7 @@ def set_pid(node: Node, pid: int) -> Node:
         return _row_to_node(row)
 
 def set_node_stopped(node: Node) -> Node:
-    with _store() as conn:
+    with _store(immediate=True) as conn:
         conn.execute(
            "UPDATE node SET pid = ?, state = ? WHERE id = ?", (None, "STOPPED", node.id,)
         )
@@ -1515,6 +1697,25 @@ def set_node_stopped(node: Node) -> Node:
         "SELECT * FROM node WHERE id = ?", (node.id,)
         ).fetchone()
         assert row is not None
+        return _row_to_node(row)
+
+
+def set_node_stopped_if_unchanged(node: Node) -> Node:
+    """The repair's write: ``node`` becomes ``STOPPED`` only if its row still has
+    the state and pid it was read with, all in one ``BEGIN IMMEDIATE``.
+
+    A start that wrote a new pid since the row was read is left alone, and the
+    row as it now is comes back.
+    """
+    with _store(immediate=True) as conn:
+        row = conn.execute("SELECT * FROM node WHERE id = ?", (node.id,)).fetchone()
+        assert row is not None
+        if row["state"] == node.node_state and row["pid"] == node.pid:
+            conn.execute(
+                "UPDATE node SET pid = ?, state = ? WHERE id = ?", (None, "STOPPED", node.id)
+            )
+            conn.commit()
+            row = conn.execute("SELECT * FROM node WHERE id = ?", (node.id,)).fetchone()
         return _row_to_node(row)
 
 
@@ -1536,6 +1737,87 @@ def get_nodes(environment: Environment, org: Organization | None = None) -> list
             return [
                 _row_to_node(row) for row in rows
             ]
+
+
+# --------------------------------------------------------------------------- #
+# Issued commands (vl-agent-cli-spec.md §3): the commands this machine sent
+# through the control plane, for `vl command show|watch --last`
+# --------------------------------------------------------------------------- #
+
+# How many issued commands are kept per environment.
+_ISSUED_COMMAND_KEEP = 50
+
+
+@dataclass(frozen=True)
+class IssuedCommand:
+    """A command this machine issued through the control plane."""
+
+    id: int
+    environment_name: str
+    correlation_id: str
+    command_type: str
+    scope: str
+    org_name: str | None
+    org_node: int | None
+    issued_at: str
+    expires_at: str
+
+
+def _row_to_issued_command(row: sqlite3.Row) -> IssuedCommand:
+    return IssuedCommand(
+        id=row["id"],
+        environment_name=row["environment_name"],
+        correlation_id=row["correlation_id"],
+        command_type=row["command_type"],
+        scope=row["scope"],
+        org_name=row["org_name"],
+        org_node=row["org_node"],
+        issued_at=row["issued_at"],
+        expires_at=row["expires_at"],
+    )
+
+
+def record_issued_command(
+    environment_name: str,
+    correlation_id: str,
+    command_type: str,
+    scope: str,
+    org_name: str | None,
+    org_node: int | None,
+    issued_at: str,
+    expires_at: str,
+) -> IssuedCommand:
+    """Record an issued command, keeping the newest ``_ISSUED_COMMAND_KEEP`` of its environment."""
+    with _store(immediate=True) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO issued_command (environment_name, correlation_id, command_type, scope,
+                                        org_name, org_node, issued_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (environment_name, correlation_id, command_type, scope, org_name, org_node,
+             issued_at, expires_at),
+        )
+        conn.execute(
+            "DELETE FROM issued_command WHERE environment_name = ? AND id NOT IN "
+            "(SELECT id FROM issued_command WHERE environment_name = ? ORDER BY id DESC LIMIT ?)",
+            (environment_name, environment_name, _ISSUED_COMMAND_KEEP),
+        )
+        row = conn.execute(
+            "SELECT * FROM issued_command WHERE id = ?", (cursor.lastrowid,)
+        ).fetchone()
+        assert row is not None  # just inserted
+        return _row_to_issued_command(row)
+
+
+def list_issued_commands(environment_name: str) -> list[IssuedCommand]:
+    """The environment's issued commands, newest first (``[0]`` is ``--last``)."""
+    with _store() as conn:
+        rows = conn.execute(
+            "SELECT * FROM issued_command WHERE environment_name = ? ORDER BY id DESC",
+            (environment_name,),
+        ).fetchall()
+    return [_row_to_issued_command(row) for row in rows]
 
 
 # --------------------------------------------------------------------------- #

@@ -119,7 +119,7 @@ def test_yes_runs_the_real_org_reset_for_every_org(
     for org_name in ("globo", "acme"):
         for n in (1, 2):
             sa = add_service_account(f"{org_name}-{n}", org_name, "NODE")
-            row = store.add_node("local", org_name, n, sa.id, 7000 + n)
+            row = store.add_node("local", org_name, n, sa.id)  # the store allocates a free port
             store.set_node_stopped(store.set_pid(row, 4300 + n))  # has run: org reset checks it
             root = tmp_path / "orgs" / org_name / "nodes" / f"node{n}"
             for sub in ("data", "snapshots"):
@@ -133,9 +133,9 @@ def test_yes_runs_the_real_org_reset_for_every_org(
         return {"state": "DOWN"}
 
     signals: list[int] = []
-    monkeypatch.setattr(network.org.node, "fetch_node_by_id", fetch_node_by_id)
-    monkeypatch.setattr(network.org.node.os, "kill", lambda pid, sig: signals.append(pid))
-    monkeypatch.setattr(network.org.node, "stop", lambda *a, **kw: signals.append(-1))
+    monkeypatch.setattr(nodeops, "fetch_node_by_id", fetch_node_by_id)
+    monkeypatch.setattr(nodeops.os, "kill", lambda pid, sig: signals.append(pid))
+    monkeypatch.setattr(nodeops, "stop_node", lambda *a, **kw: signals.append(-1))
     real = respx.post(RESET_URL, params={"dryRun": "false"}).mock(return_value=_ok(False))
 
     result = runner.invoke(app, ["network", "reset", "--yes"], env=WIDE)
@@ -410,8 +410,8 @@ def test_network_start_and_stop_without_an_identity_are_refused(verb: str, org_c
 # --------------------------------------------------------------------------- #
 
 
-from vl.commands import node as node_cmd
 from vl.commands._shared import CliError, report_errors
+from vl.lib import nodeops
 
 
 def _org_with_nodes(name: str, org_id: str, count: int) -> None:
@@ -420,26 +420,25 @@ def _org_with_nodes(name: str, org_id: str, count: int) -> None:
     for n in range(1, count + 1):
         sa = store.add_identity("local", "SERVICE_ACCOUNT", f"sa-{name}-{n}", f"{name}-{n}", f"{name}-{n}")
         store.set_svc_acct(sa.id, "local", name, f"client-{name}-{n}", "secret", role="NODE")
-        store.add_node("local", name, n, sa.id, 7000 + n)
+        store.add_node("local", name, n, sa.id)  # the store allocates a free port
 
 
 @pytest.fixture
 def node_starts(monkeypatch: pytest.MonkeyPatch) -> Any:
-    """Run network start through the real org start, with node.start replaced."""
+    """Run network start through the real org start, with nodeops.start_node replaced."""
 
     def install(failing: dict[tuple[str, int], str]) -> list[tuple[str, int]]:
         calls: list[tuple[str, int]] = []
 
-        def start(org_name: str, n: int, **_: Any) -> None:
+        def start(environment: store.Environment, org_name: str, n: int, emit: Any, **_: Any) -> Any:
             calls.append((org_name, n))
-            with report_errors():  # as the real command does
-                if failing.get((org_name, n)) == "sigabrt":
-                    raise node_cmd.NodeStartFailed(f"{org_name}/node{n}", -6, Path("/no/such.out"))
-                if failing.get((org_name, n)) == "exit75":
-                    raise node_cmd.NodeStartFailed(f"{org_name}/node{n}", 75, Path("/no/such.out"))
-                print(f"Started {org_name}/node{n} (pid: 100{n}).")
+            code = {"sigabrt": -6, "exit75": 75}.get(failing.get((org_name, n), ""))
+            if code is not None:
+                return nodeops.NodeResult(nodeops.Outcome.FAILED, nodeops.start_failure_reason(code), exit_code=code)
+            emit(f"Started {org_name}/node{n} (pid: 100{n}).")
+            return nodeops.NodeResult(nodeops.Outcome.STARTED, f"pid 100{n}", pid=1000 + n)
 
-        monkeypatch.setattr(network.org.node, "start", start)
+        monkeypatch.setattr(nodeops, "start_node", start)
         return calls
 
     _org_with_nodes("globo", "org-1", 2)
