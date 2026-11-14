@@ -280,6 +280,31 @@ def require_operator(
     return caller
 
 
+def require_org_admin(
+    environment: store.Environment, as_label: str | None, org: str
+) -> store.Identity:
+    """Like :func:`require_operator` for an org, but ``ORG_ADMIN`` of that org only.
+
+    For what the identity provider allows only an org's own admin to do, such as
+    creating a service account in it (vl-agent-cli-spec.md §6, ``vl agent create``):
+    a ``PLATFORM_ADMIN`` with no ``ORG_ADMIN`` entry for the org is refused here,
+    as the identity provider would refuse it.
+    """
+    caller = require_operator(environment, as_label, org)
+    organization = store.get_organization(environment.name, org)
+    claims = api.decode_jwt_payload(auth.get_token(caller, environment.idp_base_url))
+    if not any(
+        e.get("role") == _ORG_ADMIN and str(e.get("orgId")) == organization.server_org_id
+        for e in _orgs_entries(claims)
+    ):
+        raise CliError(
+            f"'{caller.label}' is not an ORG_ADMIN of '{organization.name}': this needs ORG_ADMIN "
+            f"of the org itself (PLATFORM_ADMIN is not enough: the identity provider only lets an "
+            f"org's admin create its service accounts)."
+        )
+    return caller
+
+
 def resolve_membership_org(
     identity: store.Identity, explicit: str | None
 ) -> str:

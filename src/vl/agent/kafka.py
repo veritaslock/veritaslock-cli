@@ -6,10 +6,18 @@
   consumer, one command at a time; a message is committed after it was handled, and one
   that cannot be decoded is logged at ERROR and committed, never retried.
 - **Results**: published to ``veritaslock-agent-results`` with ``acks=all``, key
-  ``correlationId``, serialized with the registered ``AgentCommandResult`` schema
-  (``TopicRecordNameStrategy``, no auto-registration, as the control plane does). The
-  same topic is consumed (group ``veritaslock-agent-results-<agentId>``) into
+  ``correlationId``, serialized with the ``AgentCommandResult`` schema as the
+  Schema Registry has it (the latest version of the subject
+  ``<topic>-com.veritaslock.protocol.events.agents.v1.AgentCommandResult``, the
+  control plane's ``TopicRecordNameStrategy``; never auto-registered). The same
+  topic is consumed (group ``veritaslock-agent-results-<agentId>``) into
   ``results.log``, committing after each row.
+- **Schemas**: the agent carries no copy. Their source of truth is
+  ``veritaslock-services/event-schema``, registered by the control plane; the
+  deserializer reads each message's writer schema from the registry by the id in
+  the message, and the serializer takes the latest registered version. At startup
+  the agent checks that the registered ``AgentCommandResult`` has the fields it
+  writes, and refuses to start (78) if not, naming the subject and version.
 - **Consumer health**: every error the library reports is logged (rate-limited); each
   consumer is checked every 30 s, and one that is behind its partition's high watermark
   with nothing delivered for 60 s is closed and created again; a second stall within
@@ -26,11 +34,10 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from importlib import resources
 from types import ModuleType
 from typing import Any
 
-from vl.agent import EXIT_FAILED, AgentExit
+from vl.agent import EXIT_CONFIG, EXIT_FAILED, AgentExit
 from vl.agent.config import Settings
 from vl.agent.handler import AgentIdentity, Command, TargetResult
 from vl.agent.resultslog import ResultRow
@@ -44,10 +51,23 @@ ERROR_LOG_INTERVAL_SECONDS = 30.0
 PUBLISH_ATTEMPTS = 3
 PUBLISH_TIMEOUT_SECONDS = 10.0
 
+# The record the results are written as, and the fields the agent writes
+# (result_record): the registered schema must have exactly these.
+RESULT_RECORD = "com.veritaslock.protocol.events.agents.v1.AgentCommandResult"
+RESULT_FIELDS = frozenset({
+    "eventId", "createdAt", "agentId", "agentName", "host", "correlationId", "command", "orgId",
+    "orgNode", "outcome", "detail", "exitCode", "completedAt",
+})
 
-def load_schema(name: str) -> str:
-    """The Avro schema the control plane registered (copied from ``event-schema``)."""
-    return resources.files("vl.agent.schemas").joinpath(f"{name}.avsc").read_text(encoding="utf-8")
+
+def result_subject(topic: str) -> str:
+    """The results subject: ``TopicRecordNameStrategy``'s ``<topic>-<record>``, with the
+    record named here because the serializer has no schema of its own to name it."""
+    return f"{topic}-{RESULT_RECORD}"
+
+
+def _result_subject_strategy(ctx: Any, _record_name: str | None) -> str:
+    return result_subject(str(ctx.topic))
 
 
 def _version_tuple(text: str) -> tuple[int, ...]:
@@ -128,7 +148,7 @@ class KafkaIO:
     """Consumers, the producer and the Avro serdes, built from the environment row."""
 
     def __init__(self, module: ModuleType, environment: store.Environment, settings: Settings,
-                 log: logging.Logger) -> None:
+                 log: logging.Logger, *, registry: Any = None) -> None:
         self._ck = module
         self._sr = importlib.import_module("confluent_kafka.schema_registry")
         self._avro = importlib.import_module("confluent_kafka.schema_registry.avro")
@@ -136,15 +156,20 @@ class KafkaIO:
         self._env = environment
         self._settings = settings
         self._log = log
-        self._registry = self._sr.SchemaRegistryClient({"url": environment.schema_reg_url})
+        self._registry = registry if registry is not None else self._sr.SchemaRegistryClient(
+            {"url": environment.schema_reg_url})
+        # No schema strings: the writer's schema comes from the registry, by the id
+        # each message carries.
         self._deserializer = self._avro.AvroDeserializer(self._registry)
+        # No schema string either: the latest registered version of the results
+        # subject, which the control plane registered from event-schema.
         self._serializer = self._avro.AvroSerializer(
             self._registry,
-            load_schema("AgentCommandResult"),
+            None,
             conf={
                 "auto.register.schemas": False,
                 "use.latest.version": True,
-                "subject.name.strategy": self._serialization.topic_record_subject_name_strategy,
+                "subject.name.strategy": _result_subject_strategy,
             },
         )
 
@@ -177,6 +202,46 @@ class KafkaIO:
         """Raise unless the broker answers a metadata request for the commands topic."""
         probe = self._ck.Producer({"bootstrap.servers": self._env.kafka_bootstrap})
         probe.list_topics(self._settings.commands_topic, timeout=timeout)
+
+    def check_result_schema(self) -> None:
+        """Startup: the registered results schema has exactly the fields the agent writes.
+
+        Raises ``AgentExit(78)`` naming the subject (and version) when the subject is
+        not registered or its fields differ; any other failure (the registry is not
+        answering) is raised as it is, for the caller's retries.
+        """
+        subject = result_subject(self._settings.results_topic)
+        url = self._env.schema_reg_url
+        try:
+            registered = self._registry.get_latest_version(subject)
+        except self._sr.SchemaRegistryError as exc:
+            status = getattr(exc, "http_status_code", None)
+            if status == 404:
+                raise AgentExit(EXIT_CONFIG, f"the Schema Registry at {url} has no subject {subject}: the "
+                                             f"control plane registers it from event-schema; check that the "
+                                             f"environment's schema_reg_url is the control plane's") from exc
+            if status is not None and 400 <= status < 500:
+                raise AgentExit(EXIT_CONFIG, f"the Schema Registry at {url} refused {subject}: {exc}") from exc
+            raise
+        try:
+            schema = json.loads(registered.schema.schema_str)
+            fields = {f["name"] for f in schema["fields"]}
+            required = {f["name"] for f in schema["fields"] if "default" not in f}
+        except (TypeError, ValueError, KeyError) as exc:
+            raise AgentExit(EXIT_CONFIG, f"{subject} version {registered.version} at {url} is not an Avro "
+                                         f"record schema: {exc}") from exc
+        missing = sorted(required - RESULT_FIELDS)
+        unknown = sorted(RESULT_FIELDS - fields)
+        if missing or unknown:
+            parts = []
+            if missing:
+                parts.append(f"it requires {', '.join(missing)}, which this agent does not write")
+            if unknown:
+                parts.append(f"it has no {', '.join(unknown)}, which this agent writes")
+            raise AgentExit(EXIT_CONFIG, f"the registered {subject} version {registered.version} at {url} "
+                                         f"does not match this agent's AgentCommandResult: {'; '.join(parts)}. "
+                                         f"Upgrade vl, or check the control plane's event-schema")
+        self._log.info("results schema: %s version %s", subject, registered.version)
 
     def decode(self, topic: str, value: bytes | None) -> Any:
         ctx = self._serialization.SerializationContext(topic, self._serialization.MessageField.VALUE)

@@ -58,6 +58,10 @@ class NodeResult:
 
 STILL_UP_DETAIL = "still reported UP by the control plane"
 
+# The node configuration key for a configured host (veritas-lock.conf's keys are
+# dotted lower case: http.port, org.node, kafka.broker).
+NODE_HOST_KEY = "node.host"
+
 
 # --------------------------------------------------------------------------- #
 # Where a node lives
@@ -190,7 +194,12 @@ def generate_veritaslock_config(environment: store.Environment, dest_config_dir:
         veritaslock_config.write(f"control.plane.base.url={environment.cp_base_url}\n")
         veritaslock_config.write(f"identity.provider.base.url={environment.idp_base_url}\n")
         veritaslock_config.write(f"http.port={node.port}\n")
-        veritaslock_config.write(f"org.node={node.org_node}")
+        veritaslock_config.write(f"org.node={node.org_node}\n")
+        # The environment's configured host (`vl env update --node-host`), used by
+        # the node in place of detecting one; with none set, the node detects it as
+        # it always has (verilock --print-host gives the same answer to the agent).
+        if environment.node_host is not None:
+            veritaslock_config.write(f"{NODE_HOST_KEY}={environment.node_host}\n")
 
 
 def populate_bin_dir(node_root: Path, src_dir: Path) -> None:

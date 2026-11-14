@@ -84,3 +84,16 @@ def test_add_agent_takes_the_write_lock_before_it_reads(acct: store.Identity, is
     with pytest.raises(store.AgentExistsError):
         store.add_agent("local", "globo", acct.id)
     t.join()
+
+
+def test_the_list_repair_never_clobbers_a_start_that_came_in_between() -> None:
+    store.ensure_local_environment_seeded()
+    store.upsert_organization("local", "globo", "org-1", "Globo", True, "t")
+    sa = store.add_identity("local", "SERVICE_ACCOUNT", "sa-a", "globo-agent", "globo-agent")
+    store.set_svc_acct(sa.id, "local", "globo", "client-a", "secret", role="NODE_AGENT")
+    seen = store.set_agent_pid(store.add_agent("local", "globo", sa.id), 1111)  # read by `list`: pid 1111 dead
+    store.set_agent_pid(seen, 2222)  # meanwhile `vl agent start` recorded a new one
+    after = store.set_agent_stopped_if_unchanged(seen)
+    assert (after.state, after.pid) == ("RUNNING", 2222)
+    unchanged = store.get_agent("local", "globo")
+    assert store.set_agent_stopped_if_unchanged(unchanged).state == "STOPPED"

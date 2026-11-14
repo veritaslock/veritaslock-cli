@@ -125,3 +125,36 @@ def process_age_seconds(pid: int | None, *, proc_root: Path = PROC) -> float | N
     except (OSError, ValueError, IndexError):
         return None
     return max(0.0, uptime - start_ticks / ticks_per_second)
+
+
+def cmdline(pid: int | None, *, proc_root: Path = PROC) -> list[str] | None:
+    """``/proc/<pid>/cmdline`` as its arguments; ``None`` if it can't be read."""
+    if pid is None or pid <= 0:
+        return None
+    try:
+        raw = (proc_root / str(pid) / "cmdline").read_bytes()
+    except OSError:
+        return None
+    return [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+
+
+def _has_pair(args: list[str], first: str, second: str) -> bool:
+    return any(a == first and b == second for a, b in zip(args, args[1:]))
+
+
+def is_agent_process(pid: int | None, label: str, *, proc_root: Path = PROC) -> bool:
+    """``pid`` is alive, not a zombie, and is the node agent for ``label``: its command
+    line has ``-m vl.agent`` (as `vl agent start` runs it) or runs ``vl-agent``, and
+    ``--as <label>``. A reused pid fails this and is never signalled. Where ``/proc``
+    is unavailable, ``kill -0`` alone, as for nodes."""
+    if pid is None or pid <= 0:
+        return False
+    if not _proc_available(proc_root):
+        return _kill0(pid)
+    if not is_alive(pid, proc_root=proc_root):
+        return False
+    args = cmdline(pid, proc_root=proc_root)
+    if not args:
+        return False
+    runs_agent = _has_pair(args, "-m", "vl.agent") or any(Path(a).name == "vl-agent" for a in args[:2])
+    return runs_agent and _has_pair(args, "--as", label)

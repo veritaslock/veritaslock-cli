@@ -112,10 +112,12 @@ def test_migration_from_v9_keeps_every_row_and_adds_the_v10_schema(isolated_stor
     nodes = store.get_nodes(store.get_environment("local"))
 
     after = _dump(isolated_store)
-    assert after["user_version"] == store.SCHEMA_VERSION == 10
+    # Through 10 and on to the current version (11 adds environment.node_host, NULL).
+    assert after["user_version"] == store.SCHEMA_VERSION == 11
     assert after["journal_mode"] == "wal"
     for table, rows in before["rows"].items():
-        assert after["rows"][table] == rows, table  # nothing lost or changed
+        expected = [(*row, None) for row in rows] if table == "environment" else rows
+        assert after["rows"][table] == expected, table  # nothing lost or changed
     assert [(n.org_name, n.org_node, n.port) for n in nodes] == [
         ("acme", 1, 7003), ("globo", 1, 7001), ("globo", 2, 7002)
     ]
@@ -140,7 +142,7 @@ def test_migration_refuses_nodes_that_share_a_port_and_changes_nothing(isolated_
         store.get_environment("local")
 
     message = str(refused.value)
-    assert "can't be upgraded to schema version 10" in message
+    assert f"can't be upgraded to schema version {store.SCHEMA_VERSION}" in message
     assert "port 7001: globo/node1, acme/node1" in message
     assert "port 7005: acme/node2, globo/node3" in message
     assert "7002" not in message

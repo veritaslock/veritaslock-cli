@@ -126,3 +126,139 @@ class ResultsLog:
             if self._file is not None:
                 self._file.close()
                 self._file = None
+
+
+# --------------------------------------------------------------------------- #
+# Reading (`vl agent results`, and later `vl`'s wait): one result per line, so
+# counting and ordering are by line, and a header is never a result.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class Line:
+    """One result as the file has it: the raw line (no newline) and its fields."""
+
+    raw: str
+    fields: tuple[str, ...]
+
+    def get(self, column: str) -> str:
+        i = HEADER.index(column)
+        return self.fields[i] if i < len(self.fields) else ""
+
+
+def parse_line(raw: str) -> Line | None:
+    """A result line; ``None`` for a header, a blank line or one that does not parse."""
+    text = raw.rstrip("\r\n")
+    if not text:
+        return None
+    try:
+        fields = tuple(next(csv.reader([text], delimiter="|")))
+    except (csv.Error, StopIteration):
+        return None
+    if fields == HEADER:
+        return None
+    return Line(text, fields)
+
+
+def result_files(path: Path) -> list[Path]:
+    """The current file and its rotated ones that exist, newest first:
+    ``results.log``, ``results.log.1``, ``results.log.2``, …"""
+    rotated = []
+    for p in path.parent.glob(f"{path.name}.*"):
+        suffix = p.name[len(path.name) + 1:]
+        if suffix.isdigit() and p.is_file():
+            rotated.append((int(suffix), p))
+    current = [path] if path.is_file() else []
+    return current + [p for _, p in sorted(rotated)]
+
+
+def _lines(text: str) -> list[Line]:
+    return [line for line in (parse_line(raw) for raw in text.splitlines()) if line is not None]
+
+
+def read_file(path: Path) -> list[Line]:
+    """A file's results, oldest first; nothing if it is gone (rotated meanwhile)."""
+    try:
+        return _lines(path.read_text(encoding="utf-8", errors="replace"))
+    except FileNotFoundError:
+        return []
+
+
+def newest_first(path: Path, limit: int | None = None, *, current: list[Line] | None = None) -> list[Line]:
+    """Up to ``limit`` results (all with ``None``), newest first, from the current file
+    and then the rotated ones, so that a rotation never leaves a short answer.
+    ``current`` is the current file's results when the caller has already read them."""
+    found: list[Line] = []
+    rotated = [p for p in result_files(path) if p != path]
+    found.extend(reversed(current if current is not None else read_file(path)))
+    for p in rotated:
+        if limit is not None and len(found) >= limit:
+            break
+        found.extend(reversed(read_file(p)))
+    return found if limit is None else found[:limit]
+
+
+class Follower:
+    """``tail -F`` of the current results file: the lines added after the point where it
+    was opened, across a rotation (the old file is read to its end first, then the new
+    one from its start), and across the file not existing yet. A partly written line is
+    held back until its newline arrives."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._f: TextIO | None = None
+        self._ino: int | None = None
+        self._partial = ""
+
+    def open_at_end(self) -> list[Line]:
+        """Open the current file and read it all: its results now, oldest first. Following
+        starts after them, so nothing is missed or shown twice."""
+        if not self._open():
+            return []
+        assert self._f is not None
+        return _lines(self._read_complete())
+
+    def _open(self) -> bool:
+        try:
+            f = open(self.path, "r", encoding="utf-8", errors="replace", newline="")
+        except FileNotFoundError:
+            return False
+        self._f = f
+        self._ino = os.fstat(f.fileno()).st_ino
+        self._partial = ""
+        return True
+
+    def _read_complete(self) -> str:
+        assert self._f is not None
+        text = self._partial + self._f.read()
+        cut = text.rfind("\n") + 1
+        self._partial = text[cut:]
+        return text[:cut]
+
+    def _rotated(self) -> bool:
+        try:
+            st = os.stat(self.path)
+        except FileNotFoundError:
+            return False  # rotated away and not created yet: keep reading the old one
+        assert self._f is not None
+        return st.st_ino != self._ino or st.st_size < self._f.tell()
+
+    def poll(self) -> list[Line]:
+        """The results added since the last call."""
+        if self._f is None:
+            if not self._open():
+                return []
+        found = _lines(self._read_complete())
+        if self._rotated():
+            assert self._f is not None
+            rest, self._partial = self._partial + self._f.read(), ""  # the old file is complete now
+            found += _lines(rest)
+            self.close()
+            if self._open():
+                found += _lines(self._read_complete())
+        return found
+
+    def close(self) -> None:
+        if self._f is not None:
+            self._f.close()
+            self._f = None

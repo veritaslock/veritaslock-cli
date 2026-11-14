@@ -343,6 +343,7 @@ def run(argv: Sequence[str], *, sleep: Callable[[float], None] = time.sleep) -> 
         # Kafka, before anything consumes.
         kafka = KafkaIO(module, environment, settings, log)
         _kafka_reachable(kafka, sleep)
+        _registry_ready(kafka, sleep)
         producer = kafka.producer()
         results = ResultsLog(config.results_path(org.name), max_bytes=settings.results_max_bytes,
                              keep=settings.results_keep)
@@ -414,6 +415,18 @@ def _kafka_reachable(kafka: KafkaIO, sleep: Callable[[float], None]) -> None:
         except Exception as exc:
             raise api.ApiError(0, f"kafka at {kafka.bootstrap}: {exc}") from exc
     cp.with_retries("kafka", probe, log, sleep=sleep)
+
+
+def _registry_ready(kafka: KafkaIO, sleep: Callable[[float], None]) -> None:
+    """The registered results schema fits (else 78); the registry retried like the broker (69)."""
+    def probe() -> None:
+        try:
+            kafka.check_result_schema()
+        except AgentExit:
+            raise
+        except Exception as exc:
+            raise api.ApiError(0, f"schema registry: {exc}") from exc
+    cp.with_retries("schema registry", probe, log, sleep=sleep)
 
 
 def main() -> None:
