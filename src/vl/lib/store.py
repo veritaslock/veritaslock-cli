@@ -17,6 +17,9 @@ and bumping ``SCHEMA_VERSION`` (§8 of the ``vl env`` spec):
 * v10 — a unique ``node.port``, and the ``agent`` and ``issued_command`` tables
   (node agent support, vl-agent-cli-spec.md §3). Refused, changing nothing, if
   two existing nodes share a port.
+* v11 — a nullable ``environment.node_host``: the address every node and agent of
+  the environment on this host uses in place of detecting one (``vl env add|update
+  --node-host``). Nothing else changes.
 
 Every connection runs in WAL mode with a 10-second busy timeout (§5.2 of the
 same spec), so ``vl`` and the node agents can share the file; a transaction
@@ -51,7 +54,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 # How long a connection waits for another's write lock before failing (§5.2).
 BUSY_TIMEOUT_MS = 10_000
@@ -287,6 +290,12 @@ _MIGRATIONS: tuple[str, ...] = (
         expires_at        TEXT NOT NULL
     );
     """,
+    # 10 -> 11: the configured node host (NULL: detect it, as before). `vl node
+    # start` renders it into the node's configuration as node.host, and `vl agent
+    # start` passes it to the agent as --host.
+    """
+    ALTER TABLE environment ADD COLUMN node_host TEXT;
+    """,
 )
 
 # Auto-seeded on first store-open so a fresh install works with zero setup (§4).
@@ -376,6 +385,9 @@ class Environment:
     schema_reg_url: str
     is_default: bool
     created_at: str
+    # The address this host's nodes and agents use instead of detecting one; None
+    # to detect it (`verilock --print-host`, the node's own detection).
+    node_host: str | None = None
 
 
 @dataclass(frozen=True)
@@ -674,6 +686,8 @@ def _row_to_env(row: sqlite3.Row) -> Environment:
         kafka_bootstrap=row["kafka_bootstrap"],
         is_default=bool(row["is_default"]),
         created_at=row["created_at"],
+        # Absent only while an older SCHEMA_VERSION is being exercised (the tests).
+        node_host=row["node_host"] if "node_host" in row.keys() else None,
     )
 
 
@@ -703,6 +717,7 @@ def add_environment(
     token_url: str,
     schema_reg_url: str,
     kafka_bootstrap: str,
+    node_host: str | None = None,
 ) -> Environment:
     """Insert a new environment. Does not make it the default."""
     with _store(immediate=True) as conn:
@@ -714,9 +729,9 @@ def add_environment(
         conn.execute(
             """
             INSERT INTO environment (name, idp_base_url, cp_base_url, di_base_url, token_url, schema_reg_url,
-                                     kafka_bootstrap, is_default, created_at)
+                                     kafka_bootstrap, is_default, created_at, node_host)
             VALUES (:name, :idp_base_url, :cp_base_url, :di_base_url, :token_url, :schema_reg_url,
-                    :kafka_bootstrap, 0, :created_at)
+                    :kafka_bootstrap, 0, :created_at, :node_host)
             """,
             {
                 "name": name,
@@ -727,6 +742,7 @@ def add_environment(
                 "schema_reg_url": schema_reg_url,
                 "kafka_bootstrap": kafka_bootstrap,
                 "created_at": _now(),
+                "node_host": node_host,
             },
         )
         conn.commit()
@@ -796,9 +812,18 @@ def update_environment(
     token_url: str | None = None,
     schema_reg_url: str | None = None,
     kafka_bootstrap: str | None = None,
+    node_host: str | None = None,
+    *,
+    clear_node_host: bool = False,
 ) -> Environment:
-    """Partial update — only the non-``None`` fields are changed."""
-    fields = {
+    """Partial update — only the non-``None`` fields are changed.
+
+    ``node_host`` sets the configured node host; ``clear_node_host`` sets it back to
+    ``NULL`` (detect it), and cannot be combined with ``node_host``.
+    """
+    if node_host is not None and clear_node_host:
+        raise ValueError("node_host and clear_node_host cannot both be given")
+    fields: dict[str, str | None] = {
         key: value
         for key, value in {
             "idp_base_url": idp_base_url,
@@ -807,9 +832,12 @@ def update_environment(
             "token_url": token_url,
             "schema_reg_url": schema_reg_url,
             "kafka_bootstrap": kafka_bootstrap,
+            "node_host": node_host,
         }.items()
         if value is not None
     }
+    if clear_node_host:
+        fields["node_host"] = None
 
     with _store(immediate=True) as conn:
         if _find(conn, name) is None:
@@ -1929,6 +1957,29 @@ def set_agent_stopped(agent: Agent) -> Agent:
     with _store(immediate=True) as conn:
         conn.execute("UPDATE agent SET pid = NULL, state = 'STOPPED' WHERE id = ?", (agent.id,))
         return _agent_by_id(conn, agent.id)
+
+
+def set_agent_stopped_if_unchanged(agent: Agent) -> Agent:
+    """The repair `vl agent list` makes for a ``RUNNING`` row whose process is gone:
+    ``STOPPED`` only if the row still has the state and pid it was read with, in one
+    ``BEGIN IMMEDIATE``, so a `vl agent start` that recorded a new pid meanwhile is
+    left alone. Returns the row as it now is."""
+    with _store(immediate=True) as conn:
+        conn.execute(
+            "UPDATE agent SET pid = NULL, state = 'STOPPED' WHERE id = ? AND state = ? AND pid IS ?",
+            (agent.id, agent.state, agent.pid),
+        )
+        return _agent_by_id(conn, agent.id)
+
+
+def get_identity_by_id(identity_id: int) -> Identity:
+    """The identity row with this local id (an ``agent`` or ``node`` row's
+    ``svc_acct_id``), or ``IdentityNotFoundError``."""
+    with _store() as conn:
+        row = conn.execute("SELECT * FROM identity WHERE id = ?", (identity_id,)).fetchone()
+        if row is None:
+            raise IdentityNotFoundError(f"No identity with local id {identity_id}.")
+        return _row_to_identity(row)
 
 
 # --------------------------------------------------------------------------- #

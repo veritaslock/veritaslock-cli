@@ -12,7 +12,7 @@ from typing import Annotated
 
 import typer
 
-from vl.lib import store
+from vl.lib import host, store
 from vl.lib.cli import HelpOnErrorGroup
 from vl.lib.output import console, render
 
@@ -33,15 +33,36 @@ def _report_errors() -> Iterator[None]:
         raise typer.Exit(1) from exc
 
 
-def _env_row(env: store.Environment) -> dict[str, str]:
+NodeHostOption = Annotated[
+    str | None,
+    typer.Option(
+        "--node-host",
+        help="The address this host's nodes and agents use instead of detecting one "
+        "(rendered as node.host, passed to the agent as --host).",
+    ),
+]
+
+
+def _env_row(env: store.Environment) -> dict[str, str | None]:
     return {
         "name": env.name,
         "idp_base_url": env.idp_base_url,
         "cp_base_url": env.cp_base_url,
         "di_base_url": env.di_base_url,
         "kafka_bootstrap": env.kafka_bootstrap or "",
+        # None (an empty cell, null in JSON): detected, as before.
+        "node_host": env.node_host,
         "default": "*" if env.is_default else "",
     }
+
+
+def _checked_node_host(value: str | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        return host.check_node_host(value)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--node-host") from exc
 
 
 @app.command("add")
@@ -64,11 +85,14 @@ def add(
     ],
     kafka: Annotated[
         str, typer.Option("--kafka", help="Kafka bootstrap servers.")
-    ]
+    ],
+    node_host: NodeHostOption = None,
 ) -> None:
     """Add a new environment (does not make it the default)."""
+    node_host = _checked_node_host(node_host)
     with _report_errors():
-        env = store.add_environment(name, idp_url, cp_url, di_url, token_url, schema_reg_url, kafka)
+        env = store.add_environment(name, idp_url, cp_url, di_url, token_url, schema_reg_url, kafka,
+                                    node_host=node_host)
     render(_env_row(env), title="Environment added")
 
 
@@ -121,16 +145,28 @@ def update(
     kafka: Annotated[
         str | None, typer.Option("--kafka", help="New Kafka bootstrap servers.")
     ] = None,
+    node_host: NodeHostOption = None,
+    clear_node_host: Annotated[
+        bool,
+        typer.Option("--clear-node-host", help="Remove the configured node host: detect it again."),
+    ] = False,
 ) -> None:
     """Update one or more fields of an environment."""
-    if idp_url is None and cp_url is None and di_url is None and kafka is None:
+    if node_host is not None and clear_node_host:
+        raise typer.BadParameter("give --node-host or --clear-node-host, not both",
+                                 param_hint="--clear-node-host")
+    node_host = _checked_node_host(node_host)
+    given = (idp_url, cp_url, di_url, token_url, schema_reg_url, kafka, node_host)
+    if all(value is None for value in given) and not clear_node_host:
         console.print(
             "[red]Error:[/red] nothing to update — supply at least one of "
-            "--idp-url / --cp-url / --di-url / --kafka."
+            "--idp-url / --cp-url / --di-url / --token-url / --schema-reg-url / --kafka / "
+            "--node-host / --clear-node-host."
         )
         raise typer.Exit(1)
     with _report_errors():
-        env = store.update_environment(name, idp_url, cp_url, di_url, token_url, schema_reg_url, kafka)
+        env = store.update_environment(name, idp_url, cp_url, di_url, token_url, schema_reg_url, kafka,
+                                       node_host, clear_node_host=clear_node_host)
     render(_env_row(env), title="Environment updated")
 
 
