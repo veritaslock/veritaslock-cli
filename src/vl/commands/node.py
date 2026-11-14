@@ -442,6 +442,9 @@ def _list_scope(environment: store.Environment, caller: store.Identity,
         render([{"org": n.org_name, "node": n.org_node, "where": "local", "host": None, "port": n.port,
                  "state": n.node_state, "pid": n.pid} for n in rows], title=title)
         return
+    moved = resolved.moved_note()
+    if moved:
+        note(moved)
     if remote_only:
         render([
             {"org": n.org_name, "node": n.org_node, "host": n.host, "port": (n.cp or {}).get("port"),

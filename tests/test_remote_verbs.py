@@ -174,7 +174,7 @@ def test_a_refused_listing_aborts_with_the_control_planes_error(status: int, wor
 def test_a_stale_copied_row_makes_the_scope_remote(world: dict[str, list[Any]]) -> None:
     add_user("ops", GLOBO_ADMIN)
     node("globo", 1)
-    listing(cp_row("org-1", 1, THERE))  # registered from the other host
+    listing(cp_row("org-1", 1, THERE, "UP"))  # registered from the other host, may be running there
     respx.post(f"{CP}/v1/orgs/org-1/commands").mock(return_value=accepted([("org-1", 1, "lab-2")]))
     result = invoke("org", "start", "globo", "--no-wait")
     assert result.exit_code == 0 and world["start"] == []

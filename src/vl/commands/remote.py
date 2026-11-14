@@ -197,6 +197,9 @@ def decide(environment: store.Environment, caller: store.Identity, *,
     except scope_mod.ScopeUnreachable as exc:
         print_error(exc)
         raise typer.Exit(scope_mod.EXIT_UNREACHABLE) from exc
+    moved = resolved.moved_note()
+    if moved:
+        note(moved)
     return resolved.why_remote() if resolved.remote else None
 
 
