@@ -1821,6 +1821,117 @@ def list_issued_commands(environment_name: str) -> list[IssuedCommand]:
 
 
 # --------------------------------------------------------------------------- #
+# Agents (vl-agent-cli-spec.md §3, §6): one row per node agent created on this
+# host, at most one per org and environment, like ``node``
+# --------------------------------------------------------------------------- #
+
+
+class AgentNotFoundError(StoreError):
+    """No agent row for the org in the environment."""
+
+
+class AgentExistsError(StoreError):
+    """The org already has an agent in the environment."""
+
+
+@dataclass(frozen=True)
+class Agent:
+    """A node agent created on this host: its ``NODE_AGENT`` account and local state."""
+
+    id: int
+    environment_name: str
+    org_name: str
+    svc_acct_id: int
+    pid: int | None
+    state: str
+    created_at: str
+
+
+def _row_to_agent(row: sqlite3.Row) -> Agent:
+    return Agent(
+        id=row["id"],
+        environment_name=row["environment_name"],
+        org_name=row["org_name"],
+        svc_acct_id=row["svc_acct_id"],
+        pid=row["pid"],
+        state=row["state"],
+        created_at=row["created_at"],
+    )
+
+
+def _agent_row(conn: sqlite3.Connection, environment_name: str, org_name: str) -> sqlite3.Row | None:
+    row: sqlite3.Row | None = conn.execute(
+        "SELECT * FROM agent WHERE environment_name = ? AND org_name = ?",
+        (environment_name, org_name),
+    ).fetchone()
+    return row
+
+
+def _agent_by_id(conn: sqlite3.Connection, agent_id: int) -> Agent:
+    row = conn.execute("SELECT * FROM agent WHERE id = ?", (agent_id,)).fetchone()
+    if row is None:
+        raise AgentNotFoundError(f"No agent with id {agent_id} (it was deleted).")
+    return _row_to_agent(row)
+
+
+def add_agent(environment_name: str, org_name: str, svc_acct_id: int) -> Agent:
+    """Create the org's agent row (``NEW``, no pid). ``AgentExistsError`` if the org
+    already has one in the environment; the check and the insert are one
+    ``BEGIN IMMEDIATE`` transaction, so two concurrent creates give one row."""
+    with _store(immediate=True) as conn:
+        if _agent_row(conn, environment_name, org_name) is not None:
+            raise AgentExistsError(
+                f"Org {org_name!r} already has an agent in environment {environment_name!r}. "
+                f"Run `vl agent list` to see it."
+            )
+        cursor = conn.execute(
+            """
+            INSERT INTO agent (environment_name, org_name, svc_acct_id, state, created_at)
+            VALUES (?, ?, ?, 'NEW', ?)
+            """,
+            (environment_name, org_name, svc_acct_id, _now()),
+        )
+        assert cursor.lastrowid is not None
+        return _agent_by_id(conn, cursor.lastrowid)
+
+
+def get_agent(environment_name: str, org_name: str) -> Agent:
+    """The org's agent row, or ``AgentNotFoundError``."""
+    with _store() as conn:
+        row = _agent_row(conn, environment_name, org_name)
+        if row is None:
+            raise AgentNotFoundError(
+                f"No agent for org {org_name!r} in environment {environment_name!r}. "
+                f"Create one with `vl agent create {org_name}`."
+            )
+        return _row_to_agent(row)
+
+
+def list_agents(environment_name: str) -> list[Agent]:
+    """The environment's agent rows, by org name."""
+    with _store() as conn:
+        rows = conn.execute(
+            "SELECT * FROM agent WHERE environment_name = ? ORDER BY org_name",
+            (environment_name,),
+        ).fetchall()
+    return [_row_to_agent(row) for row in rows]
+
+
+def set_agent_pid(agent: Agent, pid: int) -> Agent:
+    """Record a started agent: ``pid`` and ``RUNNING``, then the row as it now is."""
+    with _store(immediate=True) as conn:
+        conn.execute("UPDATE agent SET pid = ?, state = 'RUNNING' WHERE id = ?", (pid, agent.id))
+        return _agent_by_id(conn, agent.id)
+
+
+def set_agent_stopped(agent: Agent) -> Agent:
+    """Record a stopped agent: no pid and ``STOPPED``, then the row as it now is."""
+    with _store(immediate=True) as conn:
+        conn.execute("UPDATE agent SET pid = NULL, state = 'STOPPED' WHERE id = ?", (agent.id,))
+        return _agent_by_id(conn, agent.id)
+
+
+# --------------------------------------------------------------------------- #
 # Command history (`vl history`)
 # --------------------------------------------------------------------------- #
 
