@@ -168,15 +168,26 @@ def reset(
         bool | None,
         typer.Option("--yes", help="Skip the confirmation prompt."),
     ] = None,
+    local: LocalOption = False,
+    remote: RemoteOption = False,
+    no_wait: NoWaitOption = False,
     env: EnvOption = None,
     as_: AsOption = None) -> None:
     """
     Clears control-plane study and block data and resets all nodes in network.
     Requires all nodes in the network to be down.
+
+    When some node is on another host (or with --remote), the node data is reset by
+    one network-scope RESET command through the control plane, after the control
+    plane's own reset, and the verb waits for its results (vl-agent-cli-spec.md §7.3).
     """
     with report_errors():
         environment = store.get_environment(env)
         caller = store.resolve_identity(environment.name, as_)
+        why = remote_mod.decide(environment, caller, local=local, remote=remote)
+        if why is not None:
+            # §7.1 step 1: a PLATFORM_ADMIN user, before anything is changed.
+            caller = require_operator(environment, as_)
         if not yes:
             if not sys.stdin.isatty():
                 raise CliError("vl network reset requires confirmation; pass --yes to run non-interactively")
@@ -196,6 +207,10 @@ def reset(
 
         if yes:
             reset_cp_state(caller, environment, dry_run=False)
+            if why is not None:
+                # The control plane's reset first, then the node data (§7.3, §13 item 4).
+                raise typer.Exit(remote_mod.run(environment, caller, "NETWORK", "reset", why=why,
+                                                no_wait=no_wait, include_snapshots=True))
             orgs = curate_orgs(environment)
             orgs.reverse()
             for_each_org(orgs, lambda org_: org.reset(org_.name, include_snapshots=True, yes=True, local=True,

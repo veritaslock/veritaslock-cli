@@ -327,3 +327,83 @@ def test_no_wait_is_ignored_when_the_verb_runs_locally(world: dict[str, list[Any
     result = invoke("org", "stop", "globo", "--no-wait")
     assert result.exit_code == 0 and world["stop"] == [("globo", 1)]
     assert "vl command show" not in result.output
+
+
+# --- vl network reset when some node is remote (§7.3) ---------------------------------------
+
+RESET = f"{CP}/v1/network/reset"
+
+
+@respx.mock
+def test_network_reset_resets_the_control_plane_then_issues_one_network_reset_and_waits(
+        world: dict[str, list[Any]], monkeypatch: pytest.MonkeyPatch) -> None:
+    from vl.commands import wait as wait_mod
+    monkeypatch.setattr(wait_mod, "_sleep", lambda s: None)
+    add_user("ops", PA)
+    node("globo", 1)
+    listing(cp_row("org-1", 1), cp_row("org-1", 4, THERE))
+    order: list[str] = []
+    respx.post(RESET).mock(side_effect=lambda r: (order.append("cp-reset"),
+                                                  httpx.Response(200, json={"deleted": {}}))[1])
+    issue = respx.post(f"{CP}/v1/network/commands").mock(side_effect=lambda r: (
+        order.append("command"), accepted([("org-1", 1, "dev-box"), ("org-1", 4, "lab-2")]))[1])
+    respx.get(f"{CP}/v1/commands/{CID}").mock(return_value=httpx.Response(200, json={
+        "correlationId": CID, "status": "SUCCEEDED",
+        "counts": {"targets": 2, "done": 2, "failed": 0, "noAnswer": 0, "skipped": 0, "pending": 0},
+        "targets": [{"orgId": "org-1", "orgNode": n, "state": "DONE", "outcome": "RESET", "detail": "deleted",
+                     "completedAt": "2026-11-14T12:00:01Z"} for n in (1, 4)]}))
+
+    result = invoke("network", "reset", "--yes")
+
+    assert result.exit_code == 0, result.output
+    assert order == ["cp-reset", "command"]
+    assert json.loads(issue.calls.last.request.content) == {
+        "type": "RESET", "command": "vl network reset", "options": {"includeSnapshots": True}}
+    assert world["reset"] == []  # no local loop: the local node is the agent's
+    assert "2 of 2 succeeded." in result.output
+    [rec] = store.list_issued_commands("local")
+    assert (rec.command_type, rec.scope) == ("RESET", "NETWORK")
+
+
+@respx.mock
+def test_network_reset_refused_by_the_control_plane_issues_no_command() -> None:
+    add_user("ops", PA)
+    node("globo", 1)
+    listing(cp_row("org-1", 4, THERE))
+    respx.post(RESET).mock(return_value=httpx.Response(409, json={"detail": "not down", "context": {
+        "nodes": [{"orgName": "globo", "orgNode": 4, "state": "UP"}]}}))
+    issue = respx.post(f"{CP}/v1/network/commands")
+    result = invoke("network", "reset", "--yes")
+    assert result.exit_code == 1 and "globo/node4 (UP)" in result.output and issue.call_count == 0
+
+
+@respx.mock
+def test_a_409_on_the_reset_command_names_the_nodes() -> None:
+    add_user("ops", PA)
+    listing(cp_row("org-1", 4, THERE))
+    respx.post(RESET).mock(return_value=httpx.Response(200, json={"deleted": {}}))
+    respx.post(f"{CP}/v1/network/commands").mock(return_value=httpx.Response(409, json={
+        "detail": "must be DOWN", "context": {"reason": "NOT_DOWN", "nodes": [
+            {"orgId": "org-1", "orgName": "globo", "orgNode": 4, "state": "UP"}]}}))
+    result = invoke("network", "reset", "--yes")
+    assert result.exit_code == 1 and "Not down: globo/4 (UP)" in " ".join(result.output.split())
+
+
+@respx.mock
+def test_network_reset_remote_needs_a_platform_admin_before_anything_changes() -> None:
+    add_user("ops", GLOBO_ADMIN)
+    reset = respx.post(RESET)
+    result = invoke("network", "reset", "--yes", "--remote")
+    assert result.exit_code == 1 and "PLATFORM_ADMIN" in result.output and reset.call_count == 0
+
+
+@respx.mock
+def test_network_reset_with_everything_here_is_the_local_form(world: dict[str, list[Any]]) -> None:
+    add_user("ops", PA)
+    node("globo", 1)
+    listing(cp_row("org-1", 1))
+    respx.post(RESET).mock(return_value=httpx.Response(200, json={"deleted": {}}))
+    issue = respx.post(f"{CP}/v1/network/commands")
+    result = invoke("network", "reset", "--yes")
+    assert result.exit_code == 0, result.output
+    assert issue.call_count == 0 and world["reset"] == [("globo", 1)]
