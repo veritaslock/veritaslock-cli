@@ -218,6 +218,35 @@ class Follower:
         assert self._f is not None
         return _lines(self._read_complete())
 
+    def open_from(self, ino: int | None, size: int) -> list[Line]:
+        """Follow from where the file was when ``(ino, size)`` was recorded (`vl`'s wait
+        records it before it sends a command, so a result written at once is not missed).
+
+        Returns the results already written since then, oldest first. If the file was
+        rotated in between, the rest of the old one (now ``.1``) comes first; if it did
+        not exist then, everything in it now is new.
+        """
+        found: list[Line] = []
+        old = Path(f"{self.path}.1")
+        if ino is not None:
+            try:
+                current_ino: int | None = os.stat(self.path).st_ino
+            except FileNotFoundError:
+                current_ino = None
+            if current_ino != ino and old.is_file() and os.stat(old).st_ino == ino:
+                with open(old, "r", encoding="utf-8", errors="replace", newline="") as f:
+                    f.seek(size)
+                    found += _lines(f.read())
+                size = 0
+            elif current_ino != ino:
+                size = 0
+        if not self._open():
+            return found
+        assert self._f is not None
+        if size and os.fstat(self._f.fileno()).st_size >= size:
+            self._f.seek(size)
+        return found + _lines(self._read_complete())
+
     def _open(self) -> bool:
         try:
             f = open(self.path, "r", encoding="utf-8", errors="replace", newline="")
