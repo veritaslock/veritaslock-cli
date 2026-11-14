@@ -236,3 +236,117 @@ def test_the_final_answer_decides_even_against_the_lines_printed(clock: Clock, s
         "FAILED", target("org-1", 1, "FAILED", "EXPIRED"))))  # the control plane decided otherwise
     out = stop()
     assert out.exit_code == 1 and "  globo/1        STOPPED" in out.output
+
+
+# --- exit codes (§7.6) ---------------------------------------------------------------------------
+
+
+def _five(states: list[tuple[str, str | None]]) -> list[dict[str, Any]]:
+    return [target("org-1", i + 1, s, o) for i, (s, o) in enumerate(states)]
+
+
+@pytest.mark.parametrize("status, states, code, closing", [
+    ("SUCCEEDED", [("DONE", "STOPPED")] * 5, 0, "5 of 5 succeeded."),
+    ("FAILED", [("DONE", "STOPPED")] * 4 + [("FAILED", "FAILED")], 1, "4 of 5 succeeded, 1 failed."),
+    ("INCOMPLETE", [("DONE", "STOPPED")] * 4 + [("NO_ANSWER", None)], 3, "4 of 5 succeeded; 1 did not answer."),
+    ("INCOMPLETE", [("DONE", "STOPPED")] * 4 + [("SKIPPED", "SKIPPED")], 3,
+     "4 of 5 succeeded; 1 skipped (no agent)."),
+    ("FAILED", [("DONE", "STOPPED")] * 3 + [("FAILED", "FAILED"), ("NO_ANSWER", None)], 1,
+     "3 of 5 succeeded, 1 failed."),
+])
+@respx.mock
+def test_the_exit_status_follows_the_final_answer(status: str, states: list[tuple[str, str | None]], code: int,
+                                                  closing: str, clock: Clock) -> None:
+    respx.post(f"{CP}/v1/orgs/org-1/commands").mock(return_value=accepted(
+        *[("org-1", i + 1) for i in range(5)], wait_until=T0))  # waitUntil reached at once
+    respx.get(f"{CP}/v1/commands/{CID}").mock(return_value=httpx.Response(200, json=answer(status, *_five(states))))
+    out = stop()
+    assert out.exit_code == code, out.output
+    assert closing in out.output
+
+
+@respx.mock
+def test_giving_up_at_wait_until_reports_no_answer(clock: Clock) -> None:
+    respx.post(f"{CP}/v1/orgs/org-1/commands").mock(return_value=accepted(
+        ("org-1", 1), ("org-1", 2), wait_until=T0 + timedelta(seconds=6)))
+    pending = answer("PENDING", target("org-1", 1, "DONE", "STOPPED"), target("org-1", 2, "PENDING"))
+    final = answer("INCOMPLETE", target("org-1", 1, "DONE", "STOPPED"),
+                   target("org-1", 2, "NO_ANSWER", agent_state="STALE"))
+    calls: list[int] = []
+
+    def answer_for(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(200, json=final if clock.now >= T0 + timedelta(seconds=6) else pending)
+
+    respx.get(f"{CP}/v1/commands/{CID}").mock(side_effect=answer_for)
+    out = stop()
+    assert out.exit_code == 3, out.output
+    assert "NO_ANSWER" in out.output and "STALE" in out.output and "1 of 2 succeeded; 1 did not answer." in out.output
+
+
+@respx.mock
+def test_still_pending_after_wait_until_is_asked_again_every_second_for_5_seconds_then_3(clock: Clock) -> None:
+    respx.post(f"{CP}/v1/orgs/org-1/commands").mock(return_value=accepted(("org-1", 1), wait_until=T0))
+    route = respx.get(f"{CP}/v1/commands/{CID}").mock(return_value=httpx.Response(200, json=answer(
+        "PENDING", target("org-1", 1, "PENDING"))))
+    before = clock.now
+    out = stop()
+    assert out.exit_code == 3, out.output
+    # One poll during the wait (it ends at once), the final answer, and five more.
+    assert route.call_count == 1 + 1 + 5
+    assert clock.now - before == timedelta(seconds=5)
+    assert "1 not answered yet" in out.output
+
+
+@respx.mock
+def test_pending_that_settles_within_the_retries_is_its_answer(clock: Clock) -> None:
+    respx.post(f"{CP}/v1/orgs/org-1/commands").mock(return_value=accepted(("org-1", 1), wait_until=T0))
+    pending = httpx.Response(200, json=answer("PENDING", target("org-1", 1, "PENDING")))
+    done = httpx.Response(200, json=answer("SUCCEEDED", target("org-1", 1, "DONE", "STOPPED")))
+    respx.get(f"{CP}/v1/commands/{CID}").mock(side_effect=[pending, pending, pending, done])
+    assert stop().exit_code == 0
+
+
+@respx.mock
+def test_the_control_plane_unreachable_at_the_final_answer_is_4_even_after_lines(clock: Clock,
+                                                                                stand_ins: list[int]) -> None:
+    path = running_agent("globo", stand_ins)
+    respx.post(f"{CP}/v1/orgs/org-1/commands").mock(return_value=accepted(("org-1", 1)))
+    clock.steps = [lambda: write(path, result("globo", 1))]
+    respx.get(f"{CP}/v1/commands/{CID}").mock(side_effect=httpx.ConnectError("refused"))
+    out = stop()
+    assert out.exit_code == 4, out.output
+    assert "  globo/1" in out.output  # the line was printed before
+    flat = " ".join(out.output.split())
+    assert "the outcome could not be confirmed (1 result seen above)" in flat and CID in flat
+
+
+@respx.mock
+def test_the_control_plane_unreachable_when_issuing_is_4() -> None:
+    respx.post(f"{CP}/v1/orgs/org-1/commands").mock(side_effect=httpx.ConnectError("refused"))
+    out = stop()
+    assert out.exit_code == 4 and "Whether it was published is not known" in " ".join(out.output.split())
+    assert store.list_issued_commands("local") == []
+
+
+@respx.mock
+def test_ctrl_c_stops_waiting_exits_130_and_leaves_the_command_running(clock: Clock) -> None:
+    respx.post(f"{CP}/v1/orgs/org-1/commands").mock(return_value=accepted(("org-1", 1)))
+    route = respx.get(f"{CP}/v1/commands/{CID}").mock(return_value=httpx.Response(200, json=answer(
+        "PENDING", target("org-1", 1, "PENDING"))))
+
+    def interrupt() -> None:
+        raise KeyboardInterrupt
+
+    clock.steps = [interrupt]
+    out = stop()
+    assert out.exit_code == 130, out.output
+    assert f"the command keeps running. Command {CID}. See: vl command show {CID}" in " ".join(out.output.split())
+    assert route.call_count == 1  # the poll before Ctrl-C; no final answer, nothing cancelled
+    assert not any(c.request.method == "DELETE" for c in respx.calls)
+
+
+def test_exit_status_order() -> None:
+    from vl.commands import exits
+    assert exits.exit_status("FAILED", unreachable=True) == 4
+    assert [exits.exit_status(s) for s in ("FAILED", "INCOMPLETE", "PENDING", "SUCCEEDED", None)] == [1, 3, 3, 0, 3]
