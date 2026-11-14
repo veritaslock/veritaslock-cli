@@ -97,9 +97,11 @@ def is_this_machine(host: str | None, local: set[str] | None = None) -> bool:
 
 # A configured node host (`vl env add|update --node-host`): an IPv4 or IPv6 address
 # or a host name, which `vl node start` writes into a key=value file and `vl agent
-# start` passes as --host. Nothing that could break the line or add a key.
+# start` passes as --host. Nothing that could break the line or add a key. At most
+# 255 characters, the control plane's column for node and agent hosts, which the
+# node (choose_host, veritaslock-node) also enforces; the node refuses whitespace.
 _NODE_HOST_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_:")
-NODE_HOST_MAX = 253
+NODE_HOST_MAX = 255
 
 
 def check_node_host(value: str) -> str:

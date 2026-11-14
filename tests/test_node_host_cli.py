@@ -62,7 +62,7 @@ def test_set_and_clear_together_is_a_usage_error() -> None:
     assert _show()["node_host"] is None
 
 
-@pytest.mark.parametrize("bad", ["", "   ", "host name", "h\nkafka.broker=evil:9092", "a=b", "x" * 254])
+@pytest.mark.parametrize("bad", ["", "   ", "host name", "h\nkafka.broker=evil:9092", "a=b", "x" * 256])
 def test_a_value_that_is_not_an_address_is_refused(bad: str) -> None:
     result = runner.invoke(app, [*ADD, "--node-host", bad])
     assert result.exit_code == 2, result.output
@@ -70,7 +70,7 @@ def test_a_value_that_is_not_an_address_is_refused(bad: str) -> None:
         store.get_environment("lab")
 
 
-@pytest.mark.parametrize("good", ["192.168.8.2", "fe80::1", "dev-box.lan", "node_7"])
+@pytest.mark.parametrize("good", ["192.168.8.2", "fe80::1", "dev-box.lan", "node_7", "x" * 255])
 def test_addresses_and_names_are_accepted(good: str) -> None:
     assert runner.invoke(app, [*ADD, "--node-host", good]).exit_code == 0
     assert _show()["node_host"] == good
