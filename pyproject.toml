@@ -19,6 +19,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The node agent (vl-agent-spec.md §8 item 3): Kafka with Avro and the Schema
+# Registry. 2.16.0 bundles librdkafka 2.16.0 (the re-bootstrap fix); the agent
+# refuses to start below it.
+agent = [
+    "confluent-kafka[avro,schemaregistry]>=2.16.0",
+]
 dev = [
     "mypy>=1.10",
     "pytest>=8.0",
@@ -27,6 +33,7 @@ dev = [
 
 [project.scripts]
 vl = "vl.app:main"
+vl-agent = "vl.agent.runner:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/vl"]

@@ -427,6 +427,7 @@ def stop_nodes_to_down(
     polls: int = 20,
     poll_interval: float = 0.25,
     lock_wait: float = nodelock.DEFAULT_WAIT_SECONDS,
+    on_result: Callable[[store.Node, NodeResult], None] | None = None,
 ) -> list[tuple[store.Node, NodeResult]]:
     """Stop each node (descending), then wait until the control plane reports it ``DOWN``.
 
@@ -437,6 +438,11 @@ def stop_nodes_to_down(
     protocol events: 0.5 seconds, 2 seconds before GLOBO's last node. Any
     exception is that node's ``FAILED`` and the loop goes on. Returns
     ``(node, result)`` in the order stopped.
+
+    ``on_result(node, result)``, if given, is called with each node's final
+    result as soon as it is known, before the next node is stopped (the agent
+    publishes it then, vl-agent-spec.md §4.4). It is called outside the per-node
+    guard, so it must not raise.
     """
     ordered = list(reversed(nodes))
     results: list[tuple[store.Node, NodeResult]] = []
@@ -451,21 +457,22 @@ def stop_nodes_to_down(
             result = stop_node(environment, node_.org_name, node_.org_node, emit, lock_wait=lock_wait)
             if result.detail == nodelock.BUSY_DETAIL:
                 emit(f"Warning: {_label(node_)}: {nodelock.BUSY_DETAIL}")
-                results.append((node_, result))
-                continue
-            down = False
-            for _ in range(polls):
-                time.sleep(poll_interval)
-                if not node_is_up(environment, node_):
-                    down = True
-                    break
-            if not down:
-                emit(f"Warning: {node_.org_name}-node{node_.org_node} is still reported UP by the control plane.")
-                result = NodeResult(Outcome.FAILED, STILL_UP_DETAIL, pid=result.pid)
-            results.append((node_, result))
+            else:
+                down = False
+                for _ in range(polls):
+                    time.sleep(poll_interval)
+                    if not node_is_up(environment, node_):
+                        down = True
+                        break
+                if not down:
+                    emit(f"Warning: {node_.org_name}-node{node_.org_node} is still reported UP by the control plane.")
+                    result = NodeResult(Outcome.FAILED, STILL_UP_DETAIL, pid=result.pid)
         except Exception as e:
             emit(f"Warning: {e}")
-            results.append((node_, NodeResult(Outcome.FAILED, str(e))))
+            result = NodeResult(Outcome.FAILED, str(e))
+        results.append((node_, result))
+        if on_result is not None:
+            on_result(node_, result)
     return results
 
 
