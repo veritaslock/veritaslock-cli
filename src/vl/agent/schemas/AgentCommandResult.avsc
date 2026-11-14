@@ -1,0 +1,30 @@
+{
+  "type": "record",
+  "name": "AgentCommandResult",
+  "namespace": "com.veritaslock.protocol.events.agents.v1",
+  "doc": "What an agent did for one target node of a command (cp-agent-commands-spec.md §4), published on veritaslock-agent-results, keyed by correlationId. Consumed by the control plane, which fills in the target row, and by every agent, to log it. agentName, host and command are there so a reader needs no lookup.",
+  "fields": [
+    { "name": "eventId", "type": "string", "doc": "UUID for event tracing" },
+    { "name": "createdAt", "type": "string", "doc": "ISO-8601 timestamp" },
+
+    { "name": "agentId", "type": "string", "doc": "The agent that acted" },
+    { "name": "agentName", "type": "string", "doc": "The agent's name (e.g. dev-box)" },
+    { "name": "host", "type": "string", "doc": "The agent's host" },
+    { "name": "correlationId", "type": "string", "doc": "The command's correlationId; also the Kafka message key" },
+    { "name": "command", "type": "string", "doc": "The command as the person typed it, copied from the command message" },
+    { "name": "orgId", "type": "string", "doc": "The node's org" },
+    { "name": "orgNode", "type": "int", "doc": "The node's number within its org" },
+    {
+      "name": "outcome",
+      "doc": "What happened. No SKIPPED: only the control plane sets that, for a node with no agent",
+      "type": {
+        "type": "enum",
+        "name": "AgentCommandOutcome",
+        "symbols": ["STARTED", "STOPPED", "ALREADY_RUNNING", "ALREADY_STOPPED", "RESET", "FAILED", "EXPIRED"]
+      }
+    },
+    { "name": "detail", "type": "string", "doc": "A human-readable explanation" },
+    { "name": "exitCode", "type": ["null", "int"], "doc": "The exit code of what the agent ran, if any", "default": null },
+    { "name": "completedAt", "type": { "type": "long", "logicalType": "timestamp-millis" }, "doc": "The agent's clock" }
+  ]
+}

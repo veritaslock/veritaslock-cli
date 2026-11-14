@@ -1,0 +1,48 @@
+{
+  "type": "record",
+  "name": "AgentCommand",
+  "namespace": "com.veritaslock.protocol.events.agents.v1",
+  "doc": "A command from the control plane to the node agents (cp-agent-commands-spec.md §4), published on veritaslock-agent-commands, keyed by correlationId. Every agent reads every command and acts only on the targets that carry its own agentId; it drops a correlationId it has already handled and ignores a command past expiresAt.",
+  "fields": [
+    { "name": "eventId", "type": "string", "doc": "UUID for event tracing" },
+    { "name": "createdAt", "type": "string", "doc": "ISO-8601 timestamp" },
+    { "name": "createdBy", "type": ["null", "string"], "doc": "The user who issued the command", "default": null },
+
+    { "name": "correlationId", "type": "string", "doc": "UUID of the command; also the Kafka message key, and copied into every result" },
+    {
+      "name": "commandType",
+      "doc": "What the agent does",
+      "type": { "type": "enum", "name": "AgentCommandType", "symbols": ["START", "STOP", "RESET"] }
+    },
+    { "name": "command", "type": "string", "doc": "The command as the person typed it, for display only (e.g. vl network stop); it has no effect on what the agent does" },
+    {
+      "name": "scope",
+      "doc": "Which nodes the command was issued for",
+      "type": { "type": "enum", "name": "AgentCommandScope", "symbols": ["NETWORK", "ORG", "NODE"] }
+    },
+    { "name": "issuedAt", "type": { "type": "long", "logicalType": "timestamp-millis" }, "doc": "The control plane's clock" },
+    { "name": "expiresAt", "type": { "type": "long", "logicalType": "timestamp-millis" }, "doc": "The control plane's clock; an agent ignores the command after this" },
+    {
+      "name": "targets",
+      "doc": "Exactly the nodes to act on, in the order to act: by org, then orgNode ascending for START and RESET, descending for STOP",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "AgentCommandTarget",
+          "fields": [
+            { "name": "agentId", "type": "string", "doc": "The agent that acts on this node" },
+            { "name": "orgId", "type": "string", "doc": "The node's org" },
+            { "name": "orgNode", "type": "int", "doc": "The node's number within its org" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "options",
+      "doc": "includeSnapshots (\"true\") for RESET; empty otherwise",
+      "type": { "type": "map", "values": "string" },
+      "default": {}
+    }
+  ]
+}
