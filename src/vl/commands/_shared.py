@@ -24,6 +24,20 @@ AsOption = Annotated[
     ),
 ]
 
+LocalOption = Annotated[
+    bool,
+    typer.Option("--local", help="Act on this host's nodes only, with the local loop, whatever is elsewhere."),
+]
+RemoteOption = Annotated[
+    bool,
+    typer.Option("--remote", help="Send the command through the control plane even if every node is here."),
+]
+NoWaitOption = Annotated[
+    bool,
+    typer.Option("--no-wait", help="When the command goes through the control plane, return once it is "
+                                   "published instead of waiting for the results."),
+]
+
 
 class CliError(Exception):
     """An expected command failure that should surface as one clean line."""

@@ -891,15 +891,23 @@ def test_reset_returns_whether_it_deleted(
 
 
 @pytest.mark.parametrize("command", list(COMMANDS))
-def test_missing_node_has_a_real_message(command: str, work: Work, kills: Kills) -> None:
+@respx.mock
+def test_a_node_with_no_local_row_goes_to_the_control_plane_whose_404_is_the_message(
+        command: str, work: Work, kills: Kills) -> None:
+    # vl-agent-cli-spec.md §2: a node not in this store is remote, a node-scope command.
     _globo_and_acme()
     add_user("ops", [{"orgId": "org-1", "role": "ORG_ADMIN"}])
+    route = respx.post("http://localhost:8082/v1/orgs/org-1/nodes/7/commands").mock(
+        return_value=httpx.Response(404, json={"detail": "Node not found: org org-1, node 7",
+                                               "errorCode": "NODE_NOT_FOUND"}))
 
     args = [a if a != "1" else "7" for a in COMMANDS[command]]
     result = runner.invoke(app, args, env=WIDE)
 
     assert result.exit_code == 1
-    assert "No node globo/node7 in environment 'local'" in result.output
+    assert "Node not found: org org-1, node 7" in result.output
+    assert "not on this machine" in result.output
+    assert _json.loads(route.calls.last.request.content)["type"] == command.upper()
 
 
 # --------------------------------------------------------------------------- #

@@ -13,8 +13,10 @@ from typing import Annotated, Any
 import typer
 
 from vl.commands import node
+from vl.commands import remote as remote_mod
 from vl.commands._shared import (
-    AsOption, EnvOption, report_errors, CliError, failure_reason, print_error, require_operator,
+    AsOption, EnvOption, LocalOption, NoWaitOption, RemoteOption, report_errors, CliError, failure_reason,
+    print_error, require_operator,
 )
 from vl.lib import api, auth, nodeops, store
 from vl.lib.cli import HelpOnErrorGroup
@@ -193,13 +195,20 @@ def start(
         str, typer.Argument(help="Canonical org name (sent to the server as-is).")
     ],
     *,
+    local: LocalOption = False,
+    remote: RemoteOption = False,
+    no_wait: NoWaitOption = False,
     env: EnvOption = None,
     as_: AsOption = None) -> None:
     """Start all nodes in an organization. Needs ORG_ADMIN of the org, or PLATFORM_ADMIN."""
     with report_errors():
         environment = store.get_environment(env)
-        require_operator(environment, as_, org)
+        caller = require_operator(environment, as_, org)
         organization = store.get_organization(environment.name, org)
+        why = remote_mod.decide(environment, caller, organization=organization, local=local, remote=remote)
+        if why is not None:
+            raise typer.Exit(remote_mod.run(environment, caller, "ORG", "start", organization, why=why,
+                                            no_wait=no_wait))
         nodes = store.get_nodes(environment, organization)
         failures: list[tuple[str, str]] = []
         for node_ in nodes:
@@ -233,13 +242,20 @@ def stop(
         str, typer.Argument(help="Canonical org name (sent to the server as-is).")
     ],
     *,
+    local: LocalOption = False,
+    remote: RemoteOption = False,
+    no_wait: NoWaitOption = False,
     env: EnvOption = None,
     as_: AsOption = None) -> None:
     """Stop all nodes in an organization. Needs ORG_ADMIN of the org, or PLATFORM_ADMIN."""
     with report_errors():
         environment = store.get_environment(env)
-        require_operator(environment, as_, org)
+        caller = require_operator(environment, as_, org)
         organization = store.get_organization(environment.name, org)
+        why = remote_mod.decide(environment, caller, organization=organization, local=local, remote=remote)
+        if why is not None:
+            raise typer.Exit(remote_mod.run(environment, caller, "ORG", "stop", organization, why=why,
+                                            no_wait=no_wait))
         nodes = store.get_nodes(environment, organization)
         results = nodeops.stop_nodes_to_down(environment, nodes, note)
         # A node that was already stopped is not a failure (§9).
@@ -314,6 +330,9 @@ def reset(
         bool | None,
         typer.Option("--yes", help="Skip the confirmation prompt."),
     ] = None,
+    local: LocalOption = False,
+    remote: RemoteOption = False,
+    no_wait: NoWaitOption = False,
     env: EnvOption = None,
     as_: AsOption = None) -> None:
     """Reset all nodes in an organization. Needs ORG_ADMIN of the org, or PLATFORM_ADMIN.
@@ -323,9 +342,17 @@ def reset(
     """
     with report_errors():
         environment = store.get_environment(env)
-        require_operator(environment, as_, org)
+        caller = require_operator(environment, as_, org)
         organization = store.get_organization(environment.name, org)
         org_name = organization.name
+        why = remote_mod.decide(environment, caller, organization=organization, local=local, remote=remote)
+        if why is not None:
+            # The agents and the control plane check that every node is DOWN.
+            if not yes and not remote_mod.confirm_reset(
+                    f"ALL nodes in org '{org_name}', on every host", include_snapshots):
+                return
+            raise typer.Exit(remote_mod.run(environment, caller, "ORG", "reset", organization, why=why,
+                                            no_wait=no_wait, include_snapshots=include_snapshots))
         nodes = store.get_nodes(environment, organization)
         nodes.reverse()
         not_down = nodes_not_down(environment, nodes)

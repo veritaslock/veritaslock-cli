@@ -13,11 +13,14 @@ from typing import Annotated, Any
 import typer
 from rich.markup import escape
 
+from vl.commands import remote as remote_mod
 from vl.commands import scope as scope_mod
 from vl.commands import svc_acct
 from vl.commands._shared import (
     AsOption,
     EnvOption,
+    NoWaitOption,
+    RemoteOption,
     report_errors,
     resolve_org, assert_label_free, CliError, require_operator,
 )
@@ -147,20 +150,44 @@ def start_failure_error(org: str, org_node: int, result: nodeops.NodeResult) -> 
     return CliError(f"{label}: {result.detail}")
 
 
+def _maybe_remote(environment: store.Environment, caller: store.Identity, org_name: str, org_node: int,
+                  verb: str, *, remote: bool, no_wait: bool, yes: bool = False,
+                  include_snapshots: bool = False) -> None:
+    """A node with a row in this store is local, with no lookup (vl-agent-cli-spec.md §2);
+    one without a row, or ``--remote``, is a node-scope command through the control plane.
+    Returns for the local path; exits for the remote one."""
+    try:
+        store.get_node(environment.name, org_name, org_node)
+        has_row = True
+    except store.NodeNotFoundError:
+        has_row = False
+    if has_row and not remote:
+        return
+    why = ("--remote: sending the command through the control plane." if remote else
+           f"Node {org_name}/{org_node} is not on this machine: sending the command through the control plane.")
+    if verb == "reset" and not yes and not remote_mod.confirm_reset(f"{org_name}/node{org_node}", include_snapshots):
+        raise typer.Exit(0)
+    organization = store.get_organization(environment.name, org_name)
+    raise typer.Exit(remote_mod.run(environment, caller, "NODE", verb, organization, org_node, why=why,
+                                    no_wait=no_wait, include_snapshots=include_snapshots))
+
+
 @app.command("start")
 def start(
     org: Annotated[str, typer.Argument(help="Organization name.")],
     org_node: Annotated[int, typer.Argument(help="Node number to start")],
     *,
+    remote: RemoteOption = False,
+    no_wait: NoWaitOption = False,
     env: EnvOption = None,
     as_: AsOption = None,
 ) -> None:
     """Start the node. Needs ORG_ADMIN of the node's org, or PLATFORM_ADMIN."""
     with report_errors():
         environment = store.get_environment(env)
-        require_operator(environment, as_, org)
+        caller = require_operator(environment, as_, org)
         org_name = store.get_organization(environment.name, org).name
-        store.get_node(environment.name, org_name, org_node)  # no such node: the store's error
+        _maybe_remote(environment, caller, org_name, org_node, "start", remote=remote, no_wait=no_wait)
         result = nodeops.start_node(environment, org_name, org_node, note)
         if result.outcome is nodeops.Outcome.FAILED:
             raise start_failure_error(org_name, org_node, result)
@@ -171,15 +198,17 @@ def stop(
     org: Annotated[str, typer.Argument(help="Organization name.")],
     org_node: Annotated[int, typer.Argument(help="Node number to stop")],
     *,
+    remote: RemoteOption = False,
+    no_wait: NoWaitOption = False,
     env: EnvOption = None,
     as_: AsOption = None,
 ) -> None:
     """Stop the node. Needs ORG_ADMIN of the node's org, or PLATFORM_ADMIN."""
     with report_errors():
         environment = store.get_environment(env)
-        require_operator(environment, as_, org)
+        caller = require_operator(environment, as_, org)
         org_name = store.get_organization(environment.name, org).name
-        store.get_node(environment.name, org_name, org_node)
+        _maybe_remote(environment, caller, org_name, org_node, "stop", remote=remote, no_wait=no_wait)
         result = nodeops.stop_node(environment, org_name, org_node, note)
         # A node that would not die has had its own line ("Failure to shutdown …"),
         # and exits 0 as it always has; a busy node is an error.
@@ -200,14 +229,18 @@ def reset(
         bool | None,
         typer.Option("--yes", help="Skip the confirmation prompt."),
     ] = None,
+    remote: RemoteOption = False,
+    no_wait: NoWaitOption = False,
     env: EnvOption = None,
     as_: AsOption = None,
 ) -> bool:
     """Reset the node. Needs ORG_ADMIN of the node's org, or PLATFORM_ADMIN."""
     with report_errors():
         environment = store.get_environment(env)
-        require_operator(environment, as_, org)
+        caller = require_operator(environment, as_, org)
         org_name = store.get_organization(environment.name, org).name
+        _maybe_remote(environment, caller, org_name, org_node, "reset", remote=remote, no_wait=no_wait,
+                      yes=bool(yes), include_snapshots=include_snapshots)
         node = store.get_node(environment.name, org_name, org_node)
         if yes is None:
             # The check comes before the prompt, so an up node is reported without

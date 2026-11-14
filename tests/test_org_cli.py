@@ -13,6 +13,19 @@ from vl.app import app
 from vl.lib import store
 
 runner = CliRunner()
+
+
+import pytest  # noqa: E402  (the module's other imports come later)
+
+
+@pytest.fixture(autouse=True)
+def every_node_is_local(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests are about the local loops: the control plane's listing, which
+    decides local or remote (vl-agent-cli-spec.md §2), knows none of these nodes, so
+    every one of them is local. Scope resolution is tested in test_scope.py and
+    test_remote_verbs.py."""
+    from vl.commands import scope as scope_mod
+    monkeypatch.setattr(scope_mod, "fetch_cp_nodes", lambda environment, caller: [])
 IDP = "http://localhost:8080"
 # Decodable, so commands that check the caller's role can read it.
 CALLER_JWT = fake_jwt("u-root", typ="user", orgs=[{"orgId": "org-1", "role": "ORG_ADMIN"}])

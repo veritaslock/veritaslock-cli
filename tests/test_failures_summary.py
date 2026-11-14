@@ -25,6 +25,16 @@ from vl.lib import nodeops, store
 from vl.lib.nodeops import NodeResult, Outcome
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def every_node_is_local(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests are about the local loops: the control plane's listing, which
+    decides local or remote (vl-agent-cli-spec.md §2), knows none of these nodes, so
+    every one of them is local. Scope resolution is tested in test_scope.py and
+    test_remote_verbs.py."""
+    from vl.commands import scope as scope_mod
+    monkeypatch.setattr(scope_mod, "fetch_cp_nodes", lambda environment, caller: [])
 WIDE = {"COLUMNS": "200"}
 RESET_URL = "http://localhost:8082/v1/network/reset"
 
