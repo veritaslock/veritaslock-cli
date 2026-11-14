@@ -21,7 +21,6 @@ from vl.agent.kafka import (
     ResultPublisher,
     StallWatch,
     import_kafka,
-    load_schema,
     result_row,
 )
 from vl.agent.resultslog import ResultsLog
@@ -81,18 +80,8 @@ def test_consumer_and_producer_settings(kafka: KafkaIO) -> None:
     assert p.conf["acks"] == "all" and p.conf["bootstrap.servers"] == "kafka:9092"
     ser = kafka._serializer
     assert ser.client.conf == {"url": "http://sr:8081"}
-    assert ser.conf["auto.register.schemas"] is False
-    assert ser.conf["subject.name.strategy"] is fk.topic_record_subject_name_strategy
-    assert ser.schema["name"] == "AgentCommandResult"
-
-
-def test_the_bundled_schemas_are_the_registered_ones() -> None:
-    result = json.loads(load_schema("AgentCommandResult"))
-    assert result["namespace"] == "com.veritaslock.protocol.events.agents.v1"
-    assert [f["name"] for f in result["fields"]] == [
-        "eventId", "createdAt", "agentId", "agentName", "host", "correlationId", "command", "orgId",
-        "orgNode", "outcome", "detail", "exitCode", "completedAt"]
-    assert json.loads(load_schema("AgentCommand"))["name"] == "AgentCommand"
+    assert ser.conf["auto.register.schemas"] is False and ser.conf["use.latest.version"] is True
+    assert ser.schema is None  # no copy: the registry's latest version
 
 
 # --- publishing ----------------------------------------------------------------------
@@ -117,21 +106,21 @@ def test_a_failed_publish_is_retried_then_logged(kafka: KafkaIO, caplog: pytest.
     producer = kafka.producer()
     producer.fail_next = 2
     sleeps: list[float] = []
-    publish = ResultPublisher(kafka, producer, ME, "res", LOG, sleep=sleeps.append)
+    publish = ResultPublisher(kafka, producer, ME, "veritaslock-agent-results", LOG, sleep=sleeps.append)
     publish(command(), TargetResult("org-1", 3, "STARTED", "pid 1", None, T0))
-    assert len(fk.BROKER.topics["res"]) == 1 and len(sleeps) == 2
+    assert len(fk.BROKER.topics["veritaslock-agent-results"]) == 1 and len(sleeps) == 2
     producer.fail_next = 5
     with caplog.at_level(logging.ERROR, logger="test.agent.kafka"):
         publish(command(), TargetResult("org-1", 3, "STARTED", "pid 1", None, T0))
-    assert len(fk.BROKER.topics["res"]) == 1
+    assert len(fk.BROKER.topics["veritaslock-agent-results"]) == 1
     assert any("NO_ANSWER" in r.message for r in caplog.records)
 
 
 def test_a_result_that_does_not_fit_the_schema_is_never_published(kafka: KafkaIO) -> None:
     producer = kafka.producer()
-    publish = ResultPublisher(kafka, producer, ME, "res", LOG, sleep=lambda s: None)
+    publish = ResultPublisher(kafka, producer, ME, "veritaslock-agent-results", LOG, sleep=lambda s: None)
     publish(command(), TargetResult("org-1", 3, "SKIPPED_UP", "x", None, T0))  # not an enum symbol
-    assert "res" not in fk.BROKER.topics
+    assert "veritaslock-agent-results" not in fk.BROKER.topics
 
 
 # --- consumer health -----------------------------------------------------------------

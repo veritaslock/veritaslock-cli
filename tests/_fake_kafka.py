@@ -1,7 +1,10 @@
 """A stand-in for ``confluent_kafka`` (not installed in the test environment, and never
 pointed at a real broker): an in-memory broker with one partition per topic, consumer
-groups with committed offsets, and "Avro" serdes that are JSON underneath but check
-every record against the schema string they were given, field by field."""
+groups with committed offsets, a Schema Registry holding the services' schemas (the
+copies in ``tests/fixtures/event-schema``), and "Avro" serdes that are JSON underneath
+but check every record, field by field, against the schema the registry has for the
+subject. Names live where the real library has them (``topic_record_subject_name_strategy``
+is in ``confluent_kafka.schema_registry``, not ``confluent_kafka.serialization``)."""
 
 from __future__ import annotations
 
@@ -12,6 +15,8 @@ import time
 import types
 from collections.abc import Callable
 from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -177,13 +182,54 @@ class MessageField:
     KEY = "key"
 
 
-def topic_record_subject_name_strategy(ctx: SerializationContext, record_name: str) -> str:
-    return f"{ctx.topic}-{record_name}"
+def topic_record_subject_name_strategy(ctx: SerializationContext, record_name: str | None) -> str | None:
+    # As the real one: no record name (a serializer built without a schema), no subject.
+    return f"{ctx.topic}-{record_name}" if record_name is not None else None
+
+
+SCHEMA_FIXTURES = Path(__file__).parent / "fixtures" / "event-schema"
+NAMESPACE = "com.veritaslock.protocol.events.agents.v1"
+
+
+def fixture_schema(name: str) -> str:
+    """A copy of a services schema (tests/fixtures/event-schema/README.md)."""
+    return (SCHEMA_FIXTURES / f"{name}.avsc").read_text(encoding="utf-8")
+
+
+class SchemaRegistryError(Exception):
+    def __init__(self, http_status_code: int, error_code: int, error_message: str) -> None:
+        super().__init__(error_message)
+        self.http_status_code, self.error_code, self.error_message = http_status_code, error_code, error_message
+
+
+class Registry:
+    """Subjects and their versions, as the control plane registered them."""
+
+    def __init__(self) -> None:
+        self.subjects: dict[str, list[str]] = {}
+        self.down = False
+        self.lookups: list[str] = []
+
+    def register(self, subject: str, schema_str: str) -> None:
+        self.subjects.setdefault(subject, []).append(schema_str)
+
+
+REGISTRY = Registry()
 
 
 class SchemaRegistryClient:
     def __init__(self, conf: dict[str, Any]) -> None:
         self.conf = conf
+
+    def get_latest_version(self, subject: str, fmt: str | None = None) -> Any:
+        REGISTRY.lookups.append(subject)
+        if REGISTRY.down:
+            raise ConnectionError("schema registry: connection refused")
+        versions = REGISTRY.subjects.get(subject)
+        if not versions:
+            raise SchemaRegistryError(404, 40401, f"Subject '{subject}' not found.")
+        return SimpleNamespace(schema=SimpleNamespace(schema_str=versions[-1]), version=len(versions),
+                               schema_id=len(versions), subject=subject)
 
 
 def check_against_schema(schema: dict[str, Any], record: dict[str, Any]) -> None:
@@ -208,11 +254,23 @@ def check_against_schema(schema: dict[str, Any], record: dict[str, Any]) -> None
 
 
 class AvroSerializer:
-    def __init__(self, client: SchemaRegistryClient, schema_str: str, conf: dict[str, Any] | None = None) -> None:
-        self.client, self.schema, self.conf = client, json.loads(schema_str), conf or {}
+    def __init__(self, client: SchemaRegistryClient, schema_str: str | None = None,
+                 conf: dict[str, Any] | None = None) -> None:
+        self.client, self.conf = client, conf or {}
+        self.schema = json.loads(schema_str) if schema_str is not None else None
+        assert not (self.conf.get("use.latest.version") and self.conf.get("auto.register.schemas", True)), \
+            "cannot enable both use.latest.version and auto.register.schemas"
 
     def __call__(self, obj: dict[str, Any], ctx: SerializationContext) -> bytes:
-        check_against_schema(self.schema, obj)
+        schema = self.schema
+        name = f"{schema['namespace']}.{schema['name']}" if schema is not None else None
+        strategy = self.conf.get("subject.name.strategy", topic_record_subject_name_strategy)
+        subject = strategy(ctx, name)
+        if self.conf.get("use.latest.version") and subject is not None:
+            schema = json.loads(self.client.get_latest_version(subject).schema.schema_str)
+        if schema is None:  # the real library fails here too, with no schema to write
+            raise TypeError("argument of type 'NoneType' is not a container or iterable")
+        check_against_schema(schema, obj)
         return json.dumps(obj, default=lambda d: int(d.timestamp() * 1000)).encode()
 
 
@@ -234,8 +292,12 @@ class AvroDeserializer:
 
 def install(monkeypatch: pytest.MonkeyPatch, librdkafka: str = "2.16.0") -> types.ModuleType:
     """Put the fake ``confluent_kafka`` (and its submodules) in ``sys.modules``."""
-    global BROKER
+    global BROKER, REGISTRY
     BROKER = Broker()
+    REGISTRY = Registry()
+    for topic, name in (("veritaslock-agent-commands", "AgentCommand"),
+                        ("veritaslock-agent-results", "AgentCommandResult")):
+        REGISTRY.register(f"{topic}-{NAMESPACE}.{name}", fixture_schema(name))
     me = sys.modules[__name__]
     ck = types.ModuleType("confluent_kafka")
     ck.Consumer = Consumer  # type: ignore[attr-defined]
@@ -246,11 +308,14 @@ def install(monkeypatch: pytest.MonkeyPatch, librdkafka: str = "2.16.0") -> type
     ck.broker = lambda: BROKER  # type: ignore[attr-defined]
     sr = types.ModuleType("confluent_kafka.schema_registry")
     sr.SchemaRegistryClient = SchemaRegistryClient  # type: ignore[attr-defined]
+    sr.SchemaRegistryError = SchemaRegistryError  # type: ignore[attr-defined]
+    sr.topic_record_subject_name_strategy = topic_record_subject_name_strategy  # type: ignore[attr-defined]
+    sr.registry = lambda: REGISTRY  # type: ignore[attr-defined]
     avro = types.ModuleType("confluent_kafka.schema_registry.avro")
     avro.AvroSerializer = AvroSerializer  # type: ignore[attr-defined]
     avro.AvroDeserializer = AvroDeserializer  # type: ignore[attr-defined]
     ser = types.ModuleType("confluent_kafka.serialization")
-    for name in ("SerializationContext", "MessageField", "topic_record_subject_name_strategy"):
+    for name in ("SerializationContext", "MessageField"):
         setattr(ser, name, getattr(me, name))
     for name, mod in (("confluent_kafka", ck), ("confluent_kafka.schema_registry", sr),
                       ("confluent_kafka.schema_registry.avro", avro), ("confluent_kafka.serialization", ser)):

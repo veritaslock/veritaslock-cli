@@ -134,6 +134,21 @@ def test_an_unreachable_broker_exits_69_and_consumes_nothing(agent_account: stor
     assert fk.BROKER.consumers == []
 
 
+def test_a_results_subject_missing_from_the_registry_exits_78_and_consumes_nothing(
+        agent_account: store.Identity, ck: Any, stub: ControlPlaneStub) -> None:
+    fk.REGISTRY.subjects.clear()
+    assert runner.run(["--as", "globo-agent", "--host", "h"], sleep=no_sleep) == EXIT_CONFIG
+    assert fk.BROKER.consumers == []
+
+
+def test_an_unreachable_schema_registry_exits_69_and_consumes_nothing(
+        agent_account: store.Identity, ck: Any, stub: ControlPlaneStub) -> None:
+    fk.REGISTRY.down = True
+    assert runner.run(["--as", "globo-agent", "--host", "h"], sleep=no_sleep) == EXIT_UNAVAILABLE
+    assert len(fk.REGISTRY.lookups) == 8  # the first try and seven retries
+    assert fk.BROKER.consumers == []
+
+
 # --- one run end to end ----------------------------------------------------------------
 
 
