@@ -144,7 +144,8 @@ def test_results_are_printed_as_they_arrive_from_the_local_agents_file(clock: Cl
     respx.post(f"{CP}/v1/orgs/org-1/commands").mock(return_value=accepted(("org-1", 2), ("org-1", 1)))
     final = respx.get(f"{CP}/v1/commands/{CID}").mock(return_value=httpx.Response(200, json=answer(
         "SUCCEEDED", target("org-1", 1, "DONE", "STOPPED"), target("org-1", 2, "DONE", "STOPPED"))))
-    clock.steps = [lambda: write(path, result("globo", 2), result("globo", 3, cid=OTHER)),
+    # Another command's result for a target node, written during the wait: not this command's.
+    clock.steps = [lambda: write(path, result("globo", 2), result("globo", 1, "FAILED", cid=OTHER)),
                    lambda: write(path, result("globo", 1, "ALREADY_STOPPED", detail="not running"))]
 
     out = stop()
