@@ -80,6 +80,20 @@ def no_sleep(_s: float) -> None:
     pass
 
 
+def stop_if_it_consumes(ck: Any) -> None:
+    """A guard for the tests that expect startup to refuse: if the agent gets as far
+    as consuming, SIGTERM it at its first idle poll, so run() returns 0 and the
+    test fails on its status instead of hanging (Task B mutation B30)."""
+    real_consumer = ck.Consumer
+
+    def consumer(conf: dict[str, Any]) -> Any:
+        c = real_consumer(conf)
+        c.on_idle = lambda: signal.raise_signal(signal.SIGTERM)
+        return c
+
+    ck.Consumer = consumer
+
+
 # --- exit statuses -------------------------------------------------------------------
 
 
@@ -137,6 +151,7 @@ def test_an_unreachable_broker_exits_69_and_consumes_nothing(agent_account: stor
 def test_a_results_subject_missing_from_the_registry_exits_78_and_consumes_nothing(
         agent_account: store.Identity, ck: Any, stub: ControlPlaneStub) -> None:
     fk.REGISTRY.subjects.clear()
+    stop_if_it_consumes(ck)
     assert runner.run(["--as", "globo-agent", "--host", "h"], sleep=no_sleep) == EXIT_CONFIG
     assert fk.BROKER.consumers == []
 
@@ -144,6 +159,7 @@ def test_a_results_subject_missing_from_the_registry_exits_78_and_consumes_nothi
 def test_an_unreachable_schema_registry_exits_69_and_consumes_nothing(
         agent_account: store.Identity, ck: Any, stub: ControlPlaneStub) -> None:
     fk.REGISTRY.down = True
+    stop_if_it_consumes(ck)
     assert runner.run(["--as", "globo-agent", "--host", "h"], sleep=no_sleep) == EXIT_UNAVAILABLE
     assert len(fk.REGISTRY.lookups) == 8  # the first try and seven retries
     assert fk.BROKER.consumers == []

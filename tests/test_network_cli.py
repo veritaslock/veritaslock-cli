@@ -24,6 +24,16 @@ from vl.commands import network
 from vl.lib import store
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def every_node_is_local(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests are about the local loops: the control plane's listing, which
+    decides local or remote (vl-agent-cli-spec.md §2), knows none of these nodes, so
+    every one of them is local. Scope resolution is tested in test_scope.py and
+    test_remote_verbs.py."""
+    from vl.commands import scope as scope_mod
+    monkeypatch.setattr(scope_mod, "fetch_cp_nodes", lambda environment, caller: [])
 CP = "http://localhost:8082"
 RESET_URL = f"{CP}/v1/network/reset"
 WIDE = {"COLUMNS": "200"}  # keep Rich from wrapping long error lines
@@ -351,7 +361,8 @@ def test_platform_admin_runs_network_start_and_stop_down_every_org(
 
     assert result.exit_code == 0, result.output
     assert [name for _, name, _ in org_calls] == order
-    assert all(v == verb and kw == {"env": "local", "as_": "ops"} for v, _, kw in org_calls)
+    # local=True: the network loop resolved the scope once; each org must not do it again.
+    assert all(v == verb and kw == {"local": True, "env": "local", "as_": "ops"} for v, _, kw in org_calls)
 
 
 def test_network_start_passes_the_as_identity(org_calls: list) -> None:

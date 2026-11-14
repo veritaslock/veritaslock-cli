@@ -13,10 +13,14 @@ from typing import Annotated, Any
 import typer
 from rich.markup import escape
 
+from vl.commands import remote as remote_mod
+from vl.commands import scope as scope_mod
 from vl.commands import svc_acct
 from vl.commands._shared import (
     AsOption,
     EnvOption,
+    NoWaitOption,
+    RemoteOption,
     report_errors,
     resolve_org, assert_label_free, CliError, require_operator,
 )
@@ -146,20 +150,44 @@ def start_failure_error(org: str, org_node: int, result: nodeops.NodeResult) -> 
     return CliError(f"{label}: {result.detail}")
 
 
+def _maybe_remote(environment: store.Environment, caller: store.Identity, org_name: str, org_node: int,
+                  verb: str, *, remote: bool, no_wait: bool, yes: bool = False,
+                  include_snapshots: bool = False) -> None:
+    """A node with a row in this store is local, with no lookup (vl-agent-cli-spec.md §2);
+    one without a row, or ``--remote``, is a node-scope command through the control plane.
+    Returns for the local path; exits for the remote one."""
+    try:
+        store.get_node(environment.name, org_name, org_node)
+        has_row = True
+    except store.NodeNotFoundError:
+        has_row = False
+    if has_row and not remote:
+        return
+    why = ("--remote: sending the command through the control plane." if remote else
+           f"Node {org_name}/{org_node} is not on this machine: sending the command through the control plane.")
+    if verb == "reset" and not yes and not remote_mod.confirm_reset(f"{org_name}/node{org_node}", include_snapshots):
+        raise typer.Exit(0)
+    organization = store.get_organization(environment.name, org_name)
+    raise typer.Exit(remote_mod.run(environment, caller, "NODE", verb, organization, org_node, why=why,
+                                    no_wait=no_wait, include_snapshots=include_snapshots))
+
+
 @app.command("start")
 def start(
     org: Annotated[str, typer.Argument(help="Organization name.")],
     org_node: Annotated[int, typer.Argument(help="Node number to start")],
     *,
+    remote: RemoteOption = False,
+    no_wait: NoWaitOption = False,
     env: EnvOption = None,
     as_: AsOption = None,
 ) -> None:
     """Start the node. Needs ORG_ADMIN of the node's org, or PLATFORM_ADMIN."""
     with report_errors():
         environment = store.get_environment(env)
-        require_operator(environment, as_, org)
+        caller = require_operator(environment, as_, org)
         org_name = store.get_organization(environment.name, org).name
-        store.get_node(environment.name, org_name, org_node)  # no such node: the store's error
+        _maybe_remote(environment, caller, org_name, org_node, "start", remote=remote, no_wait=no_wait)
         result = nodeops.start_node(environment, org_name, org_node, note)
         if result.outcome is nodeops.Outcome.FAILED:
             raise start_failure_error(org_name, org_node, result)
@@ -170,15 +198,17 @@ def stop(
     org: Annotated[str, typer.Argument(help="Organization name.")],
     org_node: Annotated[int, typer.Argument(help="Node number to stop")],
     *,
+    remote: RemoteOption = False,
+    no_wait: NoWaitOption = False,
     env: EnvOption = None,
     as_: AsOption = None,
 ) -> None:
     """Stop the node. Needs ORG_ADMIN of the node's org, or PLATFORM_ADMIN."""
     with report_errors():
         environment = store.get_environment(env)
-        require_operator(environment, as_, org)
+        caller = require_operator(environment, as_, org)
         org_name = store.get_organization(environment.name, org).name
-        store.get_node(environment.name, org_name, org_node)
+        _maybe_remote(environment, caller, org_name, org_node, "stop", remote=remote, no_wait=no_wait)
         result = nodeops.stop_node(environment, org_name, org_node, note)
         # A node that would not die has had its own line ("Failure to shutdown …"),
         # and exits 0 as it always has; a busy node is an error.
@@ -199,14 +229,18 @@ def reset(
         bool | None,
         typer.Option("--yes", help="Skip the confirmation prompt."),
     ] = None,
+    remote: RemoteOption = False,
+    no_wait: NoWaitOption = False,
     env: EnvOption = None,
     as_: AsOption = None,
 ) -> bool:
     """Reset the node. Needs ORG_ADMIN of the node's org, or PLATFORM_ADMIN."""
     with report_errors():
         environment = store.get_environment(env)
-        require_operator(environment, as_, org)
+        caller = require_operator(environment, as_, org)
         org_name = store.get_organization(environment.name, org).name
+        _maybe_remote(environment, caller, org_name, org_node, "reset", remote=remote, no_wait=no_wait,
+                      yes=bool(yes), include_snapshots=include_snapshots)
         node = store.get_node(environment.name, org_name, org_node)
         if yes is None:
             # The check comes before the prompt, so an up node is reported without
@@ -348,22 +382,35 @@ def list_(
             help="Filter to nodes based on org."
         ),
     ] = None,
+    remote: Annotated[
+        bool, typer.Option("--remote", help="The control plane's nodes for your scope, on any host, "
+                                            "and nothing local.")
+    ] = False,
+    all_: Annotated[
+        bool, typer.Option("--all", help="This machine's nodes and the remote ones, with the host of each: "
+                                         "the scope the org and network verbs resolve.")
+    ] = False,
     env: EnvOption = None,
     as_: AsOption = None,
 ) -> None:
     """List this machine's nodes, reconciled with the control plane's view."""
+    if remote and all_:
+        raise typer.BadParameter("--remote and --all cannot be combined", param_hint="--remote")
     with report_errors():
         environment = store.get_environment(env)
         caller = store.resolve_identity(environment.name, as_)
         scope = _scope_org_names(environment, caller)
-        if org is not None:
-            organization = store.get_organization(environment.name, org)
+        organization = store.get_organization(environment.name, org) if org is not None else None
+        if organization is not None:
             local = store.get_nodes(environment, organization)
             title = f"nodes in {environment.name}-{organization.name}"
         else:
             local = store.get_nodes(environment)
             title = f"nodes in {environment.name}"
         nodes = [nodeops.repair(n) for n in local if _in_scope(n, scope)]
+        if remote or all_:
+            _list_scope(environment, caller, organization, nodes, title, remote_only=remote)
+            return
 
         overlay = _Overlay(_cp_by_node(environment, _fetch_cp_nodes(environment, caller)))
         rows = [
@@ -378,6 +425,49 @@ def list_(
             for n in nodes
         ]
         render(rows, title=title)
+
+
+def _list_scope(environment: store.Environment, caller: store.Identity,
+                organization: store.Organization | None, rows: list[store.Node], title: str,
+                *, remote_only: bool) -> None:
+    """`vl node list --remote` and `--all` (vl-agent-cli-spec.md §2.1), from the same
+    resolution the fleet verbs make, so ``--all --org <org>`` is what `vl org stop
+    <org>` would act on."""
+    try:
+        resolved = scope_mod.resolve_scope(environment, caller, organization=organization, rows=rows)
+    except scope_mod.ScopeUnreachable as exc:
+        if remote_only:
+            raise CliError(f"The control plane could not be reached ({exc.cause}).") from exc
+        warn(CP_UNREACHABLE_WARNING)
+        render([{"org": n.org_name, "node": n.org_node, "where": "local", "host": None, "port": n.port,
+                 "state": n.node_state, "pid": n.pid} for n in rows], title=title)
+        return
+    moved = resolved.moved_note()
+    if moved:
+        note(moved)
+    if remote_only:
+        render([
+            {"org": n.org_name, "node": n.org_node, "host": n.host, "port": (n.cp or {}).get("port"),
+             "state": (n.cp or {}).get("state"), "local_row": "yes" if n.row is not None else "no"}
+            for n in resolved.nodes if n.cp is not None
+        ], title=f"{title} (control plane)")
+        return
+    here = resolved.here.address if resolved.here is not None else None
+    overlay = _Overlay(_cp_by_node(environment, [n.cp for n in resolved.nodes if n.cp is not None]))
+    rendered: list[dict[str, Any]] = []
+    for n in resolved.nodes:
+        row = n.row
+        where = "local" if n.local else ("remote (copied row)" if row is not None else "remote")
+        rendered.append({
+            "org": n.org_name,
+            "node": n.org_node,
+            "where": where,
+            "host": n.host if n.host is not None else (here if n.local else None),
+            "port": row.port if row is not None else (n.cp or {}).get("port"),
+            "state": overlay.state(row) if (row is not None and n.local) else (n.cp or {}).get("state"),
+            "pid": row.pid if (row is not None and n.local) else None,
+        })
+    render(rendered, title=f"{title}, local and remote")
 
 
 @app.command("show")
